@@ -8,8 +8,8 @@ namespace MelonDSAndroid
     enum RomGbaSlotConfigType {
         NONE = 0,
         GBA_ROM = 1,
-        MEMORY_EXPANSION = 2,
-        RUMBLE_PAK = 3,
+        RUMBLE_PAK = 2,
+        MEMORY_EXPANSION = 3
     } ;
 
     struct RomGbaSlotConfig {
@@ -26,12 +26,12 @@ namespace MelonDSAndroid
         std::string savePath;
     };
 
-    struct RomGbaSlotConfigMemoryExpansion {
-        RomGbaSlotConfig _base = { .type = RomGbaSlotConfigType::MEMORY_EXPANSION };
+    struct RomGbaSlotRumblePak {
+        RomGbaSlotConfig _base = { .type = RomGbaSlotConfigType::RUMBLE_PAK };
     };
 
-    struct RomGbaSlotConfigRumblePak {
-        RomGbaSlotConfig _base = { .type = RomGbaSlotConfigType::RUMBLE_PAK };
+    struct RomGbaSlotConfigMemoryExpansion {
+        RomGbaSlotConfig _base = { .type = RomGbaSlotConfigType::MEMORY_EXPANSION };
     };
 }
 

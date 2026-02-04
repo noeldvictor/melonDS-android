@@ -30,6 +30,7 @@ public:
 
     bool loadRom(std::string romPath, std::string sramPath);
     bool loadGbaRom(std::string romPath, std::string sramPath);
+    void loadRumblePak();
     void loadGbaMemoryExpansion();
     void loadGbaRumblePak();
     bool bootFirmware();
@@ -58,8 +59,12 @@ public:
     bool loadState(Savestate* state);
     RewindWindow getRewindWindow();
     bool loadRewindState(RewindSaveState rewindSaveState);
-    void setupAchievements(std::list<RetroAchievements::RAAchievement> achievements, std::optional<std::string> richPresenceScript);
-    void unloadAchievements(std::list<RetroAchievements::RAAchievement> achievements);
+    void setupAchievements(
+        std::list<RetroAchievements::RAAchievement> achievements,
+        std::list<RetroAchievements::RALeaderboard> leaderboards,
+        std::optional<std::string> richPresenceScript
+    );
+    void unloadRetroAchievementsData();
     std::string getRichPresenceStatus();
 
 private:

@@ -216,6 +216,12 @@ bool MelonInstance::loadGbaRom(std::string romPath, std::string sramPath)
     return true;
 }
 
+void MelonInstance::loadRumblePak()
+{
+    auto rumblePakCart = GBACart::LoadAddon(GBAAddon_RumblePak, this);
+    nds->SetGBACart(std::move(rumblePakCart));
+}
+
 void MelonInstance::loadGbaMemoryExpansion()
 {
     auto memoryExpansionCart = GBACart::LoadAddon(GBAAddon_RAMExpansion, this);
@@ -558,19 +564,24 @@ bool MelonInstance::loadRewindState(RewindSaveState rewindSaveState)
     return result;
 }
 
-void MelonInstance::setupAchievements(std::list<RetroAchievements::RAAchievement> achievements, std::optional<std::string> richPresenceScript)
+void MelonInstance::setupAchievements(
+    std::list<RetroAchievements::RAAchievement> achievements,
+    std::list<RetroAchievements::RALeaderboard> leaderboards,
+    std::optional<std::string> richPresenceScript
+)
 {
     if (instanceId == 0)
     {
         retroAchievementsManager->LoadAchievements(achievements);
+        retroAchievementsManager->LoadLeaderboards(leaderboards);
         if (richPresenceScript)
             retroAchievementsManager->SetupRichPresence(*richPresenceScript);
     }
 }
 
-void MelonInstance::unloadAchievements(std::list<RetroAchievements::RAAchievement> achievements)
+void MelonInstance::unloadRetroAchievementsData()
 {
-    retroAchievementsManager->UnloadAchievements(achievements);
+    retroAchievementsManager->UnloadEverything();
 }
 
 std::string MelonInstance::getRichPresenceStatus()
