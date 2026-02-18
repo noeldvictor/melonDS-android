@@ -66,6 +66,7 @@ public:
     );
     void unloadRetroAchievementsData();
     std::string getRichPresenceStatus();
+    std::vector<RetroAchievements::RARuntimeAchievement> getRuntimeAchievements();
 
 private:
     void updateRenderer();
