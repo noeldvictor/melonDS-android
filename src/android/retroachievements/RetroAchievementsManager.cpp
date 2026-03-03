@@ -1,10 +1,19 @@
 #include "NDS.h"
 #include "rcheevos.h"
 #include "RetroAchievementsManager.h"
+#include "Platform.h"
+#include "rc_consoles.h"
 #include "types.h"
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstring>
+#include <jni.h>
+#include <sstream>
+#include <vector>
 
 using namespace melonDS;
-
 
 namespace MelonDSAndroid
 {
@@ -14,18 +23,519 @@ namespace RetroAchievements
 std::weak_ptr<MelonEventMessenger> RetroAchievementsManager::EventMessenger;
 RetroAchievementsManager* RetroAchievementsManager::activeInstance = nullptr;
 std::mutex RetroAchievementsManager::activeInstanceLock;
+JavaVM* RetroAchievementsManager::javaVm = nullptr;
 
 unsigned PeekMemory(unsigned address, unsigned numBytes, void* ud);
+
+namespace {
+
+constexpr u32 RA_DS_MAIN_RAM_BASE = 0x02000000;
+constexpr u32 RA_DS_MAIN_RAM_END = 0x02FFFFFF;
+constexpr u32 RA_DS_SHARED_WRAM_BASE = 0x03000000;
+constexpr u32 RA_DS_SHARED_WRAM_END = 0x03FFFFFF;
+constexpr u32 RA_DS_DTCM_PSEUDO_BASE = 0x0E000000;
+constexpr u32 RA_DS_DTCM_PSEUDO_SIZE = 0x4000;
+constexpr auto RC_CLIENT_LOGIN_TIMEOUT = std::chrono::milliseconds(3000);
+constexpr auto RC_CLIENT_LOAD_TIMEOUT = std::chrono::milliseconds(3000);
+constexpr int RC_CLIENT_PERF_WINDOW_FRAMES = 180;
+constexpr long long RC_CLIENT_PERF_WINDOW_AVG_US_LIMIT = 2000;
+constexpr long long RC_CLIENT_PERF_WINDOW_PEAK_US_LIMIT = 7000;
+constexpr int RC_CLIENT_PERF_CONSECUTIVE_SLOW_WINDOWS_FOR_FALLBACK = 2;
+constexpr const char* RC_CLIENT_DEFAULT_IMAGE = "https://media.retroachievements.org/Images/000001.png";
+constexpr const char* RC_CLIENT_DEFAULT_USER_AGENT = "melonDualDS-android/unknown";
+constexpr int RC_CLIENT_HTTP_CONNECT_TIMEOUT_MS = 10000;
+constexpr int RC_CLIENT_HTTP_READ_TIMEOUT_MS = 15000;
+
+struct RcClientAsyncResult
+{
+    std::mutex lock;
+    std::condition_variable condition;
+    bool isCompleted = false;
+    int result = RC_OK;
+    std::string errorMessage;
+};
+
+uint32_t ReadFromMirroredRegion(
+    const uint8_t* memory,
+    uint32_t memoryMask,
+    uint32_t regionBase,
+    uint32_t regionEnd,
+    uint32_t address,
+    uint8_t* buffer,
+    uint32_t numBytes
+)
+{
+    if (!memory || !buffer || numBytes == 0 || address < regionBase || address > regionEnd)
+        return 0;
+
+    uint32_t currentAddress = address;
+    uint32_t readBytes = 0;
+    while (readBytes < numBytes && currentAddress <= regionEnd)
+    {
+        const uint32_t regionOffset = currentAddress - regionBase;
+        const uint32_t maskedOffset = regionOffset & memoryMask;
+        const uint32_t bytesUntilRegionEnd = (regionEnd - currentAddress) + 1;
+        uint32_t bytesUntilMirrorWrap = bytesUntilRegionEnd;
+        if (memoryMask != 0xFFFFFFFFu)
+            bytesUntilMirrorWrap = (memoryMask + 1u) - maskedOffset;
+
+        const uint32_t chunkSize = std::min(
+            std::min(numBytes - readBytes, bytesUntilRegionEnd),
+            bytesUntilMirrorWrap
+        );
+        if (chunkSize == 0)
+            break;
+
+        std::memcpy(buffer + readBytes, memory + maskedOffset, chunkSize);
+        readBytes += chunkSize;
+        currentAddress += chunkSize;
+    }
+
+    return readBytes;
+}
+
+uint32_t ReadFromDtcmPseudoRegion(const NDS* nds, uint32_t address, uint8_t* buffer, uint32_t numBytes)
+{
+    if (!nds || !buffer || numBytes == 0)
+        return 0;
+
+    if (!nds->ARM9.DTCM || nds->ARM9.DTCMMask == 0 || nds->ARM9.DTCMBase == 0xFFFFFFFF)
+        return 0;
+
+    if (address < RA_DS_DTCM_PSEUDO_BASE || address >= (RA_DS_DTCM_PSEUDO_BASE + RA_DS_DTCM_PSEUDO_SIZE))
+        return 0;
+
+    u32 dtcmSize = ((~nds->ARM9.DTCMMask) & 0xFFFFF000) + 0x1000;
+    if (dtcmSize == 0)
+        return 0;
+
+    u32 dtcmMask = dtcmSize - 1;
+    return ReadFromMirroredRegion(
+        nds->ARM9.DTCM,
+        dtcmMask,
+        RA_DS_DTCM_PSEUDO_BASE,
+        (RA_DS_DTCM_PSEUDO_BASE + RA_DS_DTCM_PSEUDO_SIZE - 1),
+        address,
+        buffer,
+        numBytes
+    );
+}
+
+uint32_t ReadMemoryRange(const NDS* nds, uint32_t address, uint8_t* buffer, uint32_t numBytes)
+{
+    if (!nds || !buffer || numBytes == 0)
+        return 0;
+
+    if (address >= RA_DS_MAIN_RAM_BASE && address <= RA_DS_MAIN_RAM_END && nds->MainRAM)
+    {
+        return ReadFromMirroredRegion(
+            nds->MainRAM,
+            nds->MainRAMMask,
+            RA_DS_MAIN_RAM_BASE,
+            RA_DS_MAIN_RAM_END,
+            address,
+            buffer,
+            numBytes
+        );
+    }
+
+    if (address >= RA_DS_SHARED_WRAM_BASE && address <= RA_DS_SHARED_WRAM_END && nds->SWRAM_ARM9.Mem)
+    {
+        return ReadFromMirroredRegion(
+            nds->SWRAM_ARM9.Mem,
+            nds->SWRAM_ARM9.Mask,
+            RA_DS_SHARED_WRAM_BASE,
+            RA_DS_SHARED_WRAM_END,
+            address,
+            buffer,
+            numBytes
+        );
+    }
+
+    return ReadFromDtcmPseudoRegion(nds, address, buffer, numBytes);
+}
+
+void RC_CCONV OnRcClientAsyncCompleted(int result, const char* errorMessage, rc_client_t* client, void* userdata)
+{
+    (void) client;
+    if (!userdata)
+        return;
+
+    auto* asyncResult = static_cast<RcClientAsyncResult*>(userdata);
+    std::lock_guard lock(asyncResult->lock);
+    asyncResult->isCompleted = true;
+    asyncResult->result = result;
+    asyncResult->errorMessage = errorMessage ? errorMessage : "";
+    asyncResult->condition.notify_all();
+}
+
+bool WaitForRcClientResult(RcClientAsyncResult* asyncResult, std::chrono::milliseconds timeout)
+{
+    if (!asyncResult)
+        return false;
+
+    std::unique_lock lock(asyncResult->lock);
+    if (!asyncResult->condition.wait_for(lock, timeout, [=] { return asyncResult->isCompleted; }))
+        return false;
+
+    return asyncResult->result == RC_OK;
+}
+
+bool LogAndClearJavaException(JNIEnv* env, const char* context, int* httpStatusCode)
+{
+    if (!env || !env->ExceptionCheck())
+        return false;
+
+    env->ExceptionClear();
+    melonDS::Platform::Log(
+        melonDS::Platform::LogLevel::Error,
+        "[RAClient] Java exception while handling %s\n",
+        context ? context : "unknown context"
+    );
+    if (httpStatusCode)
+        *httpStatusCode = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+    return true;
+}
+
+bool ReadJavaInputStream(JNIEnv* env, jobject inputStream, std::string* responseBody, int* httpStatusCode)
+{
+    if (!env || !inputStream || !responseBody)
+        return false;
+
+    jclass inputStreamClass = env->FindClass("java/io/InputStream");
+    if (!inputStreamClass || LogAndClearJavaException(env, "FindClass(InputStream)", httpStatusCode))
+        return false;
+
+    jmethodID readMethod = env->GetMethodID(inputStreamClass, "read", "([B)I");
+    jmethodID closeMethod = env->GetMethodID(inputStreamClass, "close", "()V");
+    if (!readMethod || !closeMethod || LogAndClearJavaException(env, "GetMethodID(InputStream)", httpStatusCode))
+    {
+        env->DeleteLocalRef(inputStreamClass);
+        return false;
+    }
+
+    jbyteArray buffer = env->NewByteArray(8192);
+    if (!buffer || LogAndClearJavaException(env, "NewByteArray(InputStream)", httpStatusCode))
+    {
+        env->DeleteLocalRef(inputStreamClass);
+        return false;
+    }
+
+    bool readOk = true;
+    while (true)
+    {
+        jint bytesRead = env->CallIntMethod(inputStream, readMethod, buffer);
+        if (LogAndClearJavaException(env, "InputStream.read", httpStatusCode))
+        {
+            readOk = false;
+            break;
+        }
+
+        if (bytesRead <= 0)
+            break;
+
+        std::vector<jbyte> chunk((size_t) bytesRead);
+        env->GetByteArrayRegion(buffer, 0, bytesRead, chunk.data());
+        if (LogAndClearJavaException(env, "GetByteArrayRegion(InputStream)", httpStatusCode))
+        {
+            readOk = false;
+            break;
+        }
+
+        responseBody->append(reinterpret_cast<const char*>(chunk.data()), (size_t) bytesRead);
+    }
+
+    env->CallVoidMethod(inputStream, closeMethod);
+    LogAndClearJavaException(env, "InputStream.close", httpStatusCode);
+
+    env->DeleteLocalRef(buffer);
+    env->DeleteLocalRef(inputStreamClass);
+    return readOk;
+}
+
+bool ExecuteRcClientHttpRequest(
+    JavaVM* bridgeVm,
+    const rc_api_request_t* request,
+    const char* userAgent,
+    std::string* responseBody,
+    int* httpStatusCode
+)
+{
+    if (!request || !request->url || !responseBody || !httpStatusCode)
+        return false;
+
+    if (!bridgeVm)
+    {
+        *httpStatusCode = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+        return false;
+    }
+
+    JNIEnv* env = nullptr;
+    bool attachedCurrentThread = false;
+    jint getEnvResult = bridgeVm->GetEnv((void**) &env, JNI_VERSION_1_6);
+    if (getEnvResult == JNI_EDETACHED)
+    {
+        if (bridgeVm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+        {
+            *httpStatusCode = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+            return false;
+        }
+        attachedCurrentThread = true;
+    }
+    else if (getEnvResult != JNI_OK)
+    {
+        *httpStatusCode = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+        return false;
+    }
+
+    if (!env)
+    {
+        *httpStatusCode = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+        if (attachedCurrentThread)
+            bridgeVm->DetachCurrentThread();
+        return false;
+    }
+
+    jclass urlClass = nullptr;
+    jclass urlConnectionClass = nullptr;
+    jclass httpURLConnectionClass = nullptr;
+    jclass outputStreamClass = nullptr;
+    jmethodID urlConstructor = nullptr;
+    jmethodID openConnectionMethod = nullptr;
+    jmethodID setConnectTimeoutMethod = nullptr;
+    jmethodID setReadTimeoutMethod = nullptr;
+    jmethodID setRequestPropertyMethod = nullptr;
+    jmethodID setDoOutputMethod = nullptr;
+    jmethodID getInputStreamMethod = nullptr;
+    jmethodID setRequestMethodMethod = nullptr;
+    jmethodID getOutputStreamMethod = nullptr;
+    jmethodID getResponseCodeMethod = nullptr;
+    jmethodID getErrorStreamMethod = nullptr;
+    jmethodID disconnectMethod = nullptr;
+    jmethodID outputStreamWriteMethod = nullptr;
+    jmethodID outputStreamFlushMethod = nullptr;
+    jmethodID outputStreamCloseMethod = nullptr;
+    jstring urlString = nullptr;
+    jobject urlObject = nullptr;
+    jobject connection = nullptr;
+    jobject inputStream = nullptr;
+    jobject outputStream = nullptr;
+    jbyteArray postDataBytes = nullptr;
+    bool success = false;
+    *httpStatusCode = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+
+    urlClass = env->FindClass("java/net/URL");
+    urlConnectionClass = env->FindClass("java/net/URLConnection");
+    httpURLConnectionClass = env->FindClass("java/net/HttpURLConnection");
+    outputStreamClass = env->FindClass("java/io/OutputStream");
+    if (!urlClass || !urlConnectionClass || !httpURLConnectionClass || !outputStreamClass ||
+        LogAndClearJavaException(env, "FindClass(URL/URLConnection)", httpStatusCode))
+        goto cleanup;
+
+    urlConstructor = env->GetMethodID(urlClass, "<init>", "(Ljava/lang/String;)V");
+    openConnectionMethod = env->GetMethodID(urlClass, "openConnection", "()Ljava/net/URLConnection;");
+    setConnectTimeoutMethod = env->GetMethodID(urlConnectionClass, "setConnectTimeout", "(I)V");
+    setReadTimeoutMethod = env->GetMethodID(urlConnectionClass, "setReadTimeout", "(I)V");
+    setRequestPropertyMethod = env->GetMethodID(urlConnectionClass, "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V");
+    setDoOutputMethod = env->GetMethodID(urlConnectionClass, "setDoOutput", "(Z)V");
+    getInputStreamMethod = env->GetMethodID(urlConnectionClass, "getInputStream", "()Ljava/io/InputStream;");
+    setRequestMethodMethod = env->GetMethodID(httpURLConnectionClass, "setRequestMethod", "(Ljava/lang/String;)V");
+    getOutputStreamMethod = env->GetMethodID(urlConnectionClass, "getOutputStream", "()Ljava/io/OutputStream;");
+    getResponseCodeMethod = env->GetMethodID(httpURLConnectionClass, "getResponseCode", "()I");
+    getErrorStreamMethod = env->GetMethodID(httpURLConnectionClass, "getErrorStream", "()Ljava/io/InputStream;");
+    disconnectMethod = env->GetMethodID(httpURLConnectionClass, "disconnect", "()V");
+    outputStreamWriteMethod = env->GetMethodID(outputStreamClass, "write", "([B)V");
+    outputStreamFlushMethod = env->GetMethodID(outputStreamClass, "flush", "()V");
+    outputStreamCloseMethod = env->GetMethodID(outputStreamClass, "close", "()V");
+    if (!urlConstructor || !openConnectionMethod || !setConnectTimeoutMethod || !setReadTimeoutMethod ||
+        !setRequestPropertyMethod || !setDoOutputMethod || !getInputStreamMethod || !setRequestMethodMethod ||
+        !getOutputStreamMethod || !getResponseCodeMethod || !getErrorStreamMethod || !disconnectMethod ||
+        !outputStreamWriteMethod || !outputStreamFlushMethod || !outputStreamCloseMethod ||
+        LogAndClearJavaException(env, "GetMethodID(URLConnection)", httpStatusCode))
+    {
+        goto cleanup;
+    }
+
+    urlString = env->NewStringUTF(request->url);
+
+    if (!urlString || LogAndClearJavaException(env, "NewStringUTF(url)", httpStatusCode))
+        goto cleanup;
+
+    urlObject = env->NewObject(urlClass, urlConstructor, urlString);
+    if (!urlObject || LogAndClearJavaException(env, "new URL()", httpStatusCode))
+        goto cleanup;
+
+    connection = env->CallObjectMethod(urlObject, openConnectionMethod);
+    if (!connection || LogAndClearJavaException(env, "URL.openConnection", httpStatusCode))
+        goto cleanup;
+
+    env->CallVoidMethod(connection, setConnectTimeoutMethod, RC_CLIENT_HTTP_CONNECT_TIMEOUT_MS);
+    env->CallVoidMethod(connection, setReadTimeoutMethod, RC_CLIENT_HTTP_READ_TIMEOUT_MS);
+    if (LogAndClearJavaException(env, "set timeouts", httpStatusCode))
+        goto cleanup;
+
+    {
+        const char* resolvedUserAgent = (userAgent && userAgent[0] != '\0') ? userAgent : RC_CLIENT_DEFAULT_USER_AGENT;
+        jstring userAgentHeaderName = env->NewStringUTF("User-Agent");
+        jstring userAgentHeaderValue = env->NewStringUTF(resolvedUserAgent);
+        if (!userAgentHeaderName || !userAgentHeaderValue)
+        {
+            LogAndClearJavaException(env, "NewStringUTF(User-Agent)", httpStatusCode);
+            if (userAgentHeaderName) env->DeleteLocalRef(userAgentHeaderName);
+            if (userAgentHeaderValue) env->DeleteLocalRef(userAgentHeaderValue);
+            goto cleanup;
+        }
+
+        env->CallVoidMethod(connection, setRequestPropertyMethod, userAgentHeaderName, userAgentHeaderValue);
+        env->DeleteLocalRef(userAgentHeaderName);
+        env->DeleteLocalRef(userAgentHeaderValue);
+        if (LogAndClearJavaException(env, "setRequestProperty(User-Agent)", httpStatusCode))
+            goto cleanup;
+    }
+
+    if (request->post_data && request->post_data[0] != '\0')
+    {
+        jstring postMethod = env->NewStringUTF("POST");
+        if (!postMethod || LogAndClearJavaException(env, "NewStringUTF(POST)", httpStatusCode))
+            goto cleanup;
+
+        env->CallVoidMethod(connection, setRequestMethodMethod, postMethod);
+        env->DeleteLocalRef(postMethod);
+        env->CallVoidMethod(connection, setDoOutputMethod, JNI_TRUE);
+        if (LogAndClearJavaException(env, "setup POST", httpStatusCode))
+            goto cleanup;
+
+        if (request->content_type && request->content_type[0] != '\0')
+        {
+            jstring contentTypeHeader = env->NewStringUTF("Content-Type");
+            jstring contentTypeValue = env->NewStringUTF(request->content_type);
+            if (!contentTypeHeader || !contentTypeValue)
+            {
+                LogAndClearJavaException(env, "NewStringUTF(Content-Type)", httpStatusCode);
+                if (contentTypeHeader) env->DeleteLocalRef(contentTypeHeader);
+                if (contentTypeValue) env->DeleteLocalRef(contentTypeValue);
+                goto cleanup;
+            }
+            env->CallVoidMethod(connection, setRequestPropertyMethod, contentTypeHeader, contentTypeValue);
+            env->DeleteLocalRef(contentTypeHeader);
+            env->DeleteLocalRef(contentTypeValue);
+            if (LogAndClearJavaException(env, "setRequestProperty(Content-Type)", httpStatusCode))
+                goto cleanup;
+        }
+
+        outputStream = env->CallObjectMethod(connection, getOutputStreamMethod);
+        if (!outputStream || LogAndClearJavaException(env, "getOutputStream", httpStatusCode))
+            goto cleanup;
+
+        const size_t postDataLength = strlen(request->post_data);
+        postDataBytes = env->NewByteArray((jsize) postDataLength);
+        if (!postDataBytes || LogAndClearJavaException(env, "NewByteArray(postData)", httpStatusCode))
+            goto cleanup;
+
+        env->SetByteArrayRegion(postDataBytes, 0, (jsize) postDataLength, reinterpret_cast<const jbyte*>(request->post_data));
+        if (LogAndClearJavaException(env, "SetByteArrayRegion(postData)", httpStatusCode))
+            goto cleanup;
+
+        env->CallVoidMethod(outputStream, outputStreamWriteMethod, postDataBytes);
+        env->CallVoidMethod(outputStream, outputStreamFlushMethod);
+        env->CallVoidMethod(outputStream, outputStreamCloseMethod);
+        if (LogAndClearJavaException(env, "write/flush/close POST body", httpStatusCode))
+            goto cleanup;
+    }
+    else
+    {
+        jstring getMethod = env->NewStringUTF("GET");
+        if (!getMethod || LogAndClearJavaException(env, "NewStringUTF(GET)", httpStatusCode))
+            goto cleanup;
+
+        env->CallVoidMethod(connection, setRequestMethodMethod, getMethod);
+        env->DeleteLocalRef(getMethod);
+        if (LogAndClearJavaException(env, "setRequestMethod(GET)", httpStatusCode))
+            goto cleanup;
+    }
+
+    *httpStatusCode = env->CallIntMethod(connection, getResponseCodeMethod);
+    if (LogAndClearJavaException(env, "getResponseCode", httpStatusCode))
+        goto cleanup;
+
+    if (*httpStatusCode >= 200 && *httpStatusCode < 400)
+    {
+        inputStream = env->CallObjectMethod(connection, getInputStreamMethod);
+    }
+    else
+    {
+        inputStream = env->CallObjectMethod(connection, getErrorStreamMethod);
+        if (inputStream == nullptr)
+            inputStream = env->CallObjectMethod(connection, getInputStreamMethod);
+    }
+    if (LogAndClearJavaException(env, "getInputStream/getErrorStream", httpStatusCode))
+        goto cleanup;
+
+    if (inputStream)
+    {
+        if (!ReadJavaInputStream(env, inputStream, responseBody, httpStatusCode))
+            goto cleanup;
+    }
+
+    success = true;
+
+cleanup:
+    if (connection)
+    {
+        env->CallVoidMethod(connection, disconnectMethod);
+        LogAndClearJavaException(env, "disconnect", httpStatusCode);
+    }
+
+    if (postDataBytes) env->DeleteLocalRef(postDataBytes);
+    if (outputStream) env->DeleteLocalRef(outputStream);
+    if (inputStream) env->DeleteLocalRef(inputStream);
+    if (connection) env->DeleteLocalRef(connection);
+    if (urlObject) env->DeleteLocalRef(urlObject);
+    if (urlString) env->DeleteLocalRef(urlString);
+
+    if (outputStreamClass) env->DeleteLocalRef(outputStreamClass);
+    if (httpURLConnectionClass) env->DeleteLocalRef(httpURLConnectionClass);
+    if (urlConnectionClass) env->DeleteLocalRef(urlConnectionClass);
+    if (urlClass) env->DeleteLocalRef(urlClass);
+
+    if (attachedCurrentThread)
+        bridgeVm->DetachCurrentThread();
+
+    return success;
+}
+
+}
 
 RetroAchievementsManager::RetroAchievementsManager(melonDS::NDS* nds) : nds(nds)
 {
     rc_runtime_init(&rcheevosRuntime);
+    rcClientRuntime = nullptr;
     isRichPresenceEnabled = false;
+    isRcClientRuntimeActive = false;
+    hasRcClientPerformanceFallback = false;
+    rcClientSlowWindowCount = 0;
+    rcClientWindowFrameCount = 0;
+    rcClientWindowAccumulatedUs = 0;
+    rcClientWindowPeakUs = 0;
 }
 
 RetroAchievementsManager::~RetroAchievementsManager()
 {
+    std::unique_lock lock(runtimeLock);
+    DeactivateRcClientRuntimeLocked();
     rc_runtime_destroy(&rcheevosRuntime);
+}
+
+void RetroAchievementsManager::SetJavaVm(JavaVM* javaVm)
+{
+    std::lock_guard lock(activeInstanceLock);
+    RetroAchievementsManager::javaVm = javaVm;
+}
+
+void RetroAchievementsManager::ConfigureRuntimeBridge(std::optional<RARuntimeBridgeConfig> runtimeBridgeConfig)
+{
+    std::unique_lock lock(runtimeLock);
+    this->runtimeBridgeConfig = std::move(runtimeBridgeConfig);
 }
 
 bool RetroAchievementsManager::LoadAchievements(std::list<RAAchievement> achievements)
@@ -61,9 +571,17 @@ bool RetroAchievementsManager::LoadLeaderboards(std::list<RALeaderboard> leaderb
     return true;
 }
 
+bool RetroAchievementsManager::ActivatePreferredRuntime()
+{
+    std::unique_lock lock(runtimeLock);
+    return TryActivateRcClientRuntimeLocked();
+}
+
 void RetroAchievementsManager::UnloadEverything()
 {
     std::unique_lock lock(runtimeLock);
+
+    DeactivateRcClientRuntimeLocked();
 
     for (const auto &achievement : loadedAchievements) {
         rc_runtime_deactivate_achievement(&rcheevosRuntime, achievement.id);
@@ -74,12 +592,17 @@ void RetroAchievementsManager::UnloadEverything()
 
     loadedAchievements.clear();
     loadedLeaderboards.clear();
+    loadedRichPresenceScript.clear();
+    isRichPresenceEnabled = false;
+    hasRcClientPerformanceFallback = false;
+    ResetRcClientPerformanceWindowLocked();
 }
 
 void RetroAchievementsManager::SetupRichPresence(std::string richPresenceScript)
 {
     std::unique_lock lock(runtimeLock);
 
+    loadedRichPresenceScript = richPresenceScript;
     rc_runtime_activate_richpresence(&rcheevosRuntime, richPresenceScript.c_str(), nullptr, 0);
     isRichPresenceEnabled = true;
 }
@@ -87,6 +610,13 @@ void RetroAchievementsManager::SetupRichPresence(std::string richPresenceScript)
 std::string RetroAchievementsManager::GetRichPresenceStatus()
 {
     std::unique_lock lock(runtimeLock);
+
+    if (IsRcClientRuntimeActiveLocked() && rc_client_has_rich_presence(rcClientRuntime))
+    {
+        char buffer[512];
+        rc_client_get_rich_presence_message(rcClientRuntime, buffer, sizeof(buffer));
+        return buffer;
+    }
 
     if (!isRichPresenceEnabled)
         return "";
@@ -99,16 +629,91 @@ std::string RetroAchievementsManager::GetRichPresenceStatus()
 
 std::vector<RARuntimeAchievement> RetroAchievementsManager::GetRuntimeAchievements()
 {
+    std::unique_lock lock(runtimeLock, std::try_to_lock);
+    if (!lock.owns_lock())
+        return {};
+
     std::vector<RARuntimeAchievement> achievements(loadedAchievements.size());
     int index = 0;
     for (const auto &item: loadedAchievements)
     {
         RARuntimeAchievement& runtimeAchievement = achievements[index++];
         runtimeAchievement.id = item.id;
-        rc_runtime_get_achievement_measured(&rcheevosRuntime, item.id, &runtimeAchievement.value, &runtimeAchievement.target);
+        runtimeAchievement.value = 0;
+        runtimeAchievement.target = 0;
+
+        if (IsRcClientRuntimeActiveLocked())
+        {
+            const rc_client_achievement_t* achievementInfo = rc_client_get_achievement_info(rcClientRuntime, item.id);
+            if (achievementInfo)
+                ParseMeasuredProgress(achievementInfo->measured_progress, &runtimeAchievement.value, &runtimeAchievement.target);
+        }
+        else
+        {
+            rc_runtime_get_achievement_measured(&rcheevosRuntime, item.id, &runtimeAchievement.value, &runtimeAchievement.target);
+        }
     }
 
     return achievements;
+}
+
+std::vector<RARuntimeAchievementBucketEntry> RetroAchievementsManager::GetRuntimeAchievementBuckets()
+{
+    std::unique_lock lock(runtimeLock, std::try_to_lock);
+    if (!lock.owns_lock() || !IsRcClientRuntimeActiveLocked())
+        return {};
+
+    auto* achievementList = rc_client_create_achievement_list(
+        rcClientRuntime,
+        RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE_AND_UNOFFICIAL,
+        RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_PROGRESS
+    );
+    if (!achievementList)
+        return {};
+
+    std::vector<RARuntimeAchievementBucketEntry> entries;
+    for (uint32_t bucketIndex = 0; bucketIndex < achievementList->num_buckets; bucketIndex++)
+    {
+        const rc_client_achievement_bucket_t& bucket = achievementList->buckets[bucketIndex];
+        for (uint32_t achievementIndex = 0; achievementIndex < bucket.num_achievements; achievementIndex++)
+        {
+            const rc_client_achievement_t* achievement = bucket.achievements[achievementIndex];
+            if (!achievement)
+                continue;
+
+            RARuntimeAchievementBucketEntry entry;
+            entry.achievementId = (long) achievement->id;
+            entry.subsetId = (long) bucket.subset_id;
+            entry.bucketType = bucket.bucket_type;
+            entries.push_back(entry);
+        }
+    }
+
+    rc_client_destroy_achievement_list(achievementList);
+    return entries;
+}
+
+std::vector<long> RetroAchievementsManager::GetRuntimeSubsetIds()
+{
+    std::unique_lock lock(runtimeLock, std::try_to_lock);
+    if (!lock.owns_lock() || !IsRcClientRuntimeActiveLocked())
+        return {};
+
+    auto* subsetList = rc_client_create_subset_list(rcClientRuntime);
+    if (!subsetList)
+        return {};
+
+    std::vector<long> subsetIds;
+    subsetIds.reserve(subsetList->num_subsets);
+    for (uint32_t subsetIndex = 0; subsetIndex < subsetList->num_subsets; subsetIndex++)
+    {
+        const rc_client_subset_t* subset = subsetList->subsets[subsetIndex];
+        if (subset)
+            subsetIds.push_back((long) subset->id);
+    }
+
+    rc_client_destroy_subset_list(subsetList);
+    return subsetIds;
 }
 
 bool RetroAchievementsManager::DoSavestate(Savestate* savestate)
@@ -118,9 +723,13 @@ bool RetroAchievementsManager::DoSavestate(Savestate* savestate)
     savestate->Section("RCHV");
     if (savestate->Saving)
     {
-        u32 rcheevosStateSize = (u32) rc_runtime_progress_size(&rcheevosRuntime, nullptr);
+        u32 rcheevosStateSize = IsRcClientRuntimeActiveLocked() ?
+            (u32) rc_client_progress_size(rcClientRuntime) :
+            (u32) rc_runtime_progress_size(&rcheevosRuntime, nullptr);
         u8* rcheevosStateBuffer = new u8[rcheevosStateSize];
-        int result = rc_runtime_serialize_progress_sized(rcheevosStateBuffer, rcheevosStateSize, &rcheevosRuntime, nullptr);
+        int result = IsRcClientRuntimeActiveLocked() ?
+            rc_client_serialize_progress_sized(rcClientRuntime, rcheevosStateBuffer, rcheevosStateSize) :
+            rc_runtime_serialize_progress_sized(rcheevosStateBuffer, rcheevosStateSize, &rcheevosRuntime, nullptr);
         if (result != RC_OK)
         {
             delete[] rcheevosStateBuffer;
@@ -143,7 +752,9 @@ bool RetroAchievementsManager::DoSavestate(Savestate* savestate)
         u8* rcheevosStateBuffer = new u8[rcheevosStateSize];
         savestate->VarArray(rcheevosStateBuffer, rcheevosStateSize);
 
-        int result = rc_runtime_deserialize_progress(&rcheevosRuntime, rcheevosStateBuffer, nullptr);
+        int result = IsRcClientRuntimeActiveLocked() ?
+            rc_client_deserialize_progress_sized(rcClientRuntime, rcheevosStateBuffer, rcheevosStateSize) :
+            rc_runtime_deserialize_progress(&rcheevosRuntime, rcheevosStateBuffer, nullptr);
         delete[] rcheevosStateBuffer;
 
         if (result != RC_OK)
@@ -156,17 +767,65 @@ bool RetroAchievementsManager::DoSavestate(Savestate* savestate)
 void RetroAchievementsManager::Reset()
 {
     std::unique_lock lock(runtimeLock);
-    rc_runtime_reset(&rcheevosRuntime);
+    if (IsRcClientRuntimeActiveLocked())
+        rc_client_reset(rcClientRuntime);
+    else
+        rc_runtime_reset(&rcheevosRuntime);
 }
 
 void RetroAchievementsManager::FrameUpdate()
 {
-    std::unique_lock lock(runtimeLock);
-    std::unique_lock instanceLock(activeInstanceLock);
+    std::unique_lock lock(runtimeLock, std::try_to_lock);
+    if (!lock.owns_lock())
+        return;
 
-    activeInstance = this;
-    rc_runtime_do_frame(&rcheevosRuntime, &CheevosEventHandler, &PeekMemory, nds, nullptr);
-    activeInstance = nullptr;
+    if (IsRcClientRuntimeActiveLocked())
+    {
+        const auto frameStart = std::chrono::steady_clock::now();
+        rc_client_do_frame(rcClientRuntime);
+
+        const auto frameElapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - frameStart
+        ).count();
+        rcClientWindowFrameCount++;
+        rcClientWindowAccumulatedUs += frameElapsedUs;
+        rcClientWindowPeakUs = std::max(rcClientWindowPeakUs, frameElapsedUs);
+
+        if (rcClientWindowFrameCount >= RC_CLIENT_PERF_WINDOW_FRAMES)
+        {
+            const long long avgUs = rcClientWindowAccumulatedUs / rcClientWindowFrameCount;
+            const bool isSlowWindow =
+                avgUs > RC_CLIENT_PERF_WINDOW_AVG_US_LIMIT ||
+                rcClientWindowPeakUs > RC_CLIENT_PERF_WINDOW_PEAK_US_LIMIT;
+
+            if (isSlowWindow)
+                rcClientSlowWindowCount++;
+            else
+                rcClientSlowWindowCount = 0;
+
+            if (rcClientSlowWindowCount >= RC_CLIENT_PERF_CONSECUTIVE_SLOW_WINDOWS_FOR_FALLBACK)
+            {
+                melonDS::Platform::Log(
+                    melonDS::Platform::LogLevel::Warn,
+                    "[RAClient] Falling back to legacy runtime due to frame cost (avg=%lldus peak=%lldus)\n",
+                    avgUs,
+                    rcClientWindowPeakUs
+                );
+                hasRcClientPerformanceFallback = true;
+                DeactivateRcClientRuntimeLocked();
+            }
+
+            ResetRcClientPerformanceWindowLocked();
+        }
+    }
+
+    if (!IsRcClientRuntimeActiveLocked())
+    {
+        std::unique_lock instanceLock(activeInstanceLock);
+        activeInstance = this;
+        rc_runtime_do_frame(&rcheevosRuntime, &CheevosEventHandler, &PeekMemory, nds, nullptr);
+        activeInstance = nullptr;
+    }
 }
 
 void RetroAchievementsManager::CheevosEventHandler(const rc_runtime_event_t* runtime_event)
@@ -220,32 +879,435 @@ void RetroAchievementsManager::CheevosEventHandler(const rc_runtime_event_t* run
     }
 }
 
+void RetroAchievementsManager::RcClientEventHandler(const rc_client_event_t* event, rc_client_t* client)
+{
+    if (!event || !client)
+        return;
+
+    auto* manager = static_cast<RetroAchievementsManager*>(rc_client_get_userdata(client));
+    if (!manager)
+        return;
+
+    auto eventMessenger = RetroAchievementsManager::EventMessenger.lock();
+    if (!eventMessenger)
+        return;
+
+    switch (event->type)
+    {
+        case RC_CLIENT_EVENT_ACHIEVEMENT_TRIGGERED:
+            if (event->achievement)
+                eventMessenger->onAchievementTriggered(event->achievement->id);
+            break;
+        case RC_CLIENT_EVENT_ACHIEVEMENT_CHALLENGE_INDICATOR_SHOW:
+            if (event->achievement)
+                eventMessenger->onAchievementPrimed(event->achievement->id);
+            break;
+        case RC_CLIENT_EVENT_ACHIEVEMENT_CHALLENGE_INDICATOR_HIDE:
+            if (event->achievement)
+                eventMessenger->onAchievementUnprimed(event->achievement->id);
+            break;
+        case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_SHOW:
+        case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_UPDATE:
+            if (event->achievement)
+            {
+                unsigned int value = 0;
+                unsigned int target = 0;
+                ParseMeasuredProgress(event->achievement->measured_progress, &value, &target);
+                if (value > 0)
+                    eventMessenger->onAchievementProgressUpdated(event->achievement->id, value, target, event->achievement->measured_progress);
+            }
+            break;
+        case RC_CLIENT_EVENT_LEADERBOARD_STARTED:
+            if (event->leaderboard)
+                eventMessenger->onLeaderboardAttemptStarted(event->leaderboard->id);
+            break;
+        case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_SHOW:
+        case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_UPDATE:
+            if (event->leaderboard_tracker)
+                eventMessenger->onLeaderboardAttemptUpdated(event->leaderboard_tracker->id, event->leaderboard_tracker->display);
+            break;
+        case RC_CLIENT_EVENT_LEADERBOARD_FAILED:
+            if (event->leaderboard)
+                eventMessenger->onLeaderboardAttemptCanceled(event->leaderboard->id);
+            break;
+        case RC_CLIENT_EVENT_LEADERBOARD_SUBMITTED:
+            if (event->leaderboard)
+            {
+                int submittedValue = 0;
+                if (event->leaderboard_scoreboard)
+                    submittedValue = ParseIntegerOrDefault(event->leaderboard_scoreboard->submitted_score, 0);
+                eventMessenger->onLeaderboardAttemptCompleted(event->leaderboard->id, submittedValue);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+uint32_t RetroAchievementsManager::RcClientReadMemory(uint32_t address, uint8_t* buffer, uint32_t numBytes, rc_client_t* client)
+{
+    if (!client)
+        return 0;
+
+    auto* manager = static_cast<RetroAchievementsManager*>(rc_client_get_userdata(client));
+    if (!manager)
+        return 0;
+
+    return ReadMemoryRange(manager->nds, address, buffer, numBytes);
+}
+
+void RetroAchievementsManager::RcClientServerCall(const rc_api_request_t* request, rc_client_server_callback_t callback, void* callbackData, rc_client_t* client)
+{
+    if (!callback || !client)
+        return;
+
+    auto* manager = static_cast<RetroAchievementsManager*>(rc_client_get_userdata(client));
+    if (!manager)
+        return;
+
+    std::string responseBody;
+    int httpStatus = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+    const std::string runtimeUserAgent = (manager->runtimeBridgeConfig.has_value() && !manager->runtimeBridgeConfig->userAgent.empty()) ?
+        manager->runtimeBridgeConfig->userAgent :
+        std::string();
+    const bool requestSucceeded = ExecuteRcClientHttpRequest(
+        javaVm,
+        request,
+        runtimeUserAgent.empty() ? nullptr : runtimeUserAgent.c_str(),
+        &responseBody,
+        &httpStatus
+    );
+    if (!requestSucceeded)
+    {
+        if (responseBody.empty())
+            responseBody = BuildRcClientErrorResponse("Native rc_client transport failed");
+    }
+
+    rc_api_server_response_t serverResponse = {
+        .body = responseBody.c_str(),
+        .body_length = responseBody.length(),
+        .http_status_code = httpStatus,
+    };
+
+    callback(&serverResponse, callbackData);
+}
+
+void RetroAchievementsManager::RcClientLogCallback(const char* message, const rc_client_t* client)
+{
+    (void) client;
+    if (!message)
+        return;
+
+    melonDS::Platform::Log(melonDS::Platform::LogLevel::Info, "[RAClient] %s\n", message);
+}
+
+bool RetroAchievementsManager::TryActivateRcClientRuntimeLocked()
+{
+    DeactivateRcClientRuntimeLocked();
+
+    if (hasRcClientPerformanceFallback)
+        return false;
+
+    if (!IsRcClientConfiguredLocked())
+        return false;
+
+    rcClientRuntime = rc_client_create(&RcClientReadMemory, &RcClientServerCall);
+    if (!rcClientRuntime)
+        return false;
+
+    rc_client_set_userdata(rcClientRuntime, this);
+    rc_client_set_event_handler(rcClientRuntime, &RcClientEventHandler);
+#ifdef NDEBUG
+    rc_client_enable_logging(rcClientRuntime, RC_CLIENT_LOG_LEVEL_ERROR, &RcClientLogCallback);
+#else
+    rc_client_enable_logging(rcClientRuntime, RC_CLIENT_LOG_LEVEL_WARN, &RcClientLogCallback);
+#endif
+    rc_client_set_allow_background_memory_reads(rcClientRuntime, 0);
+    rc_client_set_spectator_mode_enabled(rcClientRuntime, 1);
+
+    const auto& config = *runtimeBridgeConfig;
+    rc_client_set_hardcore_enabled(rcClientRuntime, config.hardcoreEnabled ? 1 : 0);
+    rc_client_set_unofficial_enabled(rcClientRuntime, config.unofficialEnabled ? 1 : 0);
+    rc_client_set_encore_mode_enabled(rcClientRuntime, config.encoreEnabled ? 1 : 0);
+
+    RcClientAsyncResult loginResult;
+    rc_client_begin_login_with_token(
+        rcClientRuntime,
+        config.username.c_str(),
+        config.apiToken.c_str(),
+        &OnRcClientAsyncCompleted,
+        &loginResult
+    );
+    if (!WaitForRcClientResult(&loginResult, RC_CLIENT_LOGIN_TIMEOUT))
+    {
+        hasRcClientPerformanceFallback = true;
+        DeactivateRcClientRuntimeLocked();
+        return false;
+    }
+
+    RcClientAsyncResult loadResult;
+    rc_client_begin_load_game(
+        rcClientRuntime,
+        config.gameHash.c_str(),
+        &OnRcClientAsyncCompleted,
+        &loadResult
+    );
+    if (!WaitForRcClientResult(&loadResult, RC_CLIENT_LOAD_TIMEOUT))
+    {
+        hasRcClientPerformanceFallback = true;
+        DeactivateRcClientRuntimeLocked();
+        return false;
+    }
+
+    isRcClientRuntimeActive = rc_client_is_game_loaded(rcClientRuntime) != 0;
+    return isRcClientRuntimeActive;
+}
+
+void RetroAchievementsManager::DeactivateRcClientRuntimeLocked()
+{
+    if (rcClientRuntime)
+    {
+        rc_client_set_event_handler(rcClientRuntime, nullptr);
+        rc_client_unload_game(rcClientRuntime);
+        rc_client_logout(rcClientRuntime);
+        rc_client_destroy(rcClientRuntime);
+        rcClientRuntime = nullptr;
+    }
+
+    isRcClientRuntimeActive = false;
+    rcClientSlowWindowCount = 0;
+    ResetRcClientPerformanceWindowLocked();
+}
+
+void RetroAchievementsManager::ResetRcClientPerformanceWindowLocked()
+{
+    rcClientWindowFrameCount = 0;
+    rcClientWindowAccumulatedUs = 0;
+    rcClientWindowPeakUs = 0;
+}
+
+std::string RetroAchievementsManager::BuildRcClientLoginResponse() const
+{
+    const auto username = runtimeBridgeConfig ? runtimeBridgeConfig->username : "";
+    const auto token = runtimeBridgeConfig ? runtimeBridgeConfig->apiToken : "";
+
+    std::ostringstream response;
+    response << "{\"Success\":true,"
+             << "\"User\":\"" << EscapeJson(username) << "\","
+             << "\"Token\":\"" << EscapeJson(token) << "\","
+             << "\"Score\":0,"
+             << "\"SoftcoreScore\":0,"
+             << "\"Messages\":0,"
+             << "\"AvatarUrl\":\"\"}";
+    return response.str();
+}
+
+std::string RetroAchievementsManager::BuildRcClientAchievementSetsResponse() const
+{
+    const auto gameId = (runtimeBridgeConfig && runtimeBridgeConfig->gameId > 0) ? runtimeBridgeConfig->gameId : 1;
+    const auto username = runtimeBridgeConfig ? runtimeBridgeConfig->username : "melonDualDS";
+
+    std::ostringstream response;
+    response << "{\"Success\":true,"
+             << "\"GameId\":" << gameId << ","
+             << "\"Title\":\"melonDualDS\","
+             << "\"ConsoleId\":" << RC_CONSOLE_NINTENDO_DS << ","
+             << "\"ImageIconUrl\":\"" << RC_CLIENT_DEFAULT_IMAGE << "\","
+             << "\"RichPresenceGameId\":" << gameId << ","
+             << "\"RichPresencePatch\":\"" << EscapeJson(loadedRichPresenceScript) << "\","
+             << "\"Sets\":[{"
+             << "\"AchievementSetId\":" << gameId << ","
+             << "\"GameId\":" << gameId << ","
+             << "\"Title\":\"Core\","
+             << "\"Type\":\"core\","
+             << "\"ImageIconUrl\":\"" << RC_CLIENT_DEFAULT_IMAGE << "\","
+             << "\"Achievements\":[";
+
+    bool firstAchievement = true;
+    for (const auto& achievement : loadedAchievements)
+    {
+        if (!firstAchievement)
+            response << ",";
+        firstAchievement = false;
+
+        response << "{"
+                 << "\"ID\":" << achievement.id << ","
+                 << "\"Title\":\"Achievement " << achievement.id << "\","
+                 << "\"Description\":\"\","
+                 << "\"Flags\":3,"
+                 << "\"Points\":5,"
+                 << "\"MemAddr\":\"" << EscapeJson(achievement.memoryAddress) << "\","
+                 << "\"Author\":\"" << EscapeJson(username) << "\","
+                 << "\"BadgeName\":\"000000\","
+                 << "\"Created\":0,"
+                 << "\"Modified\":0,"
+                 << "\"Type\":\"\","
+                 << "\"Rarity\":100.0,"
+                 << "\"RarityHardcore\":100.0,"
+                 << "\"BadgeURL\":\"\","
+                 << "\"BadgeLockedURL\":\"\""
+                 << "}";
+    }
+
+    response << "],\"Leaderboards\":[";
+
+    bool firstLeaderboard = true;
+    for (const auto& leaderboard : loadedLeaderboards)
+    {
+        if (!firstLeaderboard)
+            response << ",";
+        firstLeaderboard = false;
+
+        response << "{"
+                 << "\"ID\":" << leaderboard.id << ","
+                 << "\"Title\":\"Leaderboard " << leaderboard.id << "\","
+                 << "\"Description\":\"\","
+                 << "\"Mem\":\"" << EscapeJson(leaderboard.memoryAddress) << "\","
+                 << "\"Format\":\"" << EscapeJson(leaderboard.format) << "\","
+                 << "\"LowerIsBetter\":false,"
+                 << "\"Hidden\":false"
+                 << "}";
+    }
+
+    response << "]}]}";
+    return response.str();
+}
+
+std::string RetroAchievementsManager::BuildRcClientSuccessResponse()
+{
+    return "{\"Success\":true}";
+}
+
+std::string RetroAchievementsManager::BuildRcClientStartSessionResponse()
+{
+    return "{\"Success\":true,\"Unlocks\":[],\"HardcoreUnlocks\":[],\"ServerNow\":0}";
+}
+
+std::string RetroAchievementsManager::BuildRcClientErrorResponse(const std::string& message)
+{
+    return "{\"Success\":false,\"Error\":\"" + EscapeJson(message) + "\"}";
+}
+
+bool RetroAchievementsManager::IsRcClientConfiguredLocked() const
+{
+    return runtimeBridgeConfig.has_value() &&
+        runtimeBridgeConfig->useRcClientRuntime &&
+        !runtimeBridgeConfig->username.empty() &&
+        !runtimeBridgeConfig->apiToken.empty() &&
+        !runtimeBridgeConfig->gameHash.empty();
+}
+
+bool RetroAchievementsManager::IsRcClientRuntimeActiveLocked() const
+{
+    return isRcClientRuntimeActive && rcClientRuntime && rc_client_is_game_loaded(rcClientRuntime);
+}
+
+const char* RetroAchievementsManager::GetRequestAction(const char* postData)
+{
+    if (!postData)
+        return nullptr;
+
+    static thread_local char actionBuffer[64];
+    const char* actionStart = strstr(postData, "r=");
+    if (!actionStart)
+        return nullptr;
+
+    actionStart += 2;
+    int index = 0;
+    while (actionStart[index] != '\0' && actionStart[index] != '&' && index < (int) sizeof(actionBuffer) - 1)
+    {
+        actionBuffer[index] = actionStart[index];
+        index++;
+    }
+    actionBuffer[index] = '\0';
+
+    return actionBuffer;
+}
+
+std::string RetroAchievementsManager::EscapeJson(const std::string& value)
+{
+    std::string escaped;
+    escaped.reserve(value.size() + 16);
+
+    for (char character : value)
+    {
+        switch (character)
+        {
+            case '\"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                escaped += character;
+                break;
+        }
+    }
+
+    return escaped;
+}
+
+void RetroAchievementsManager::ParseMeasuredProgress(const char* measuredProgress, unsigned int* value, unsigned int* target)
+{
+    if (!value || !target)
+        return;
+
+    *value = 0;
+    *target = 0;
+
+    if (!measuredProgress || measuredProgress[0] == '\0')
+        return;
+
+    const char* separator = strchr(measuredProgress, '/');
+    if (separator)
+    {
+        std::string currentString(measuredProgress, separator - measuredProgress);
+        std::string targetString(separator + 1);
+
+        *value = ParseIntegerOrDefault(currentString.c_str(), 0);
+        *target = ParseIntegerOrDefault(targetString.c_str(), 0);
+        return;
+    }
+
+    const size_t measuredLength = strlen(measuredProgress);
+    if (measuredLength > 1 && measuredProgress[measuredLength - 1] == '%')
+    {
+        std::string percentString(measuredProgress, measuredLength - 1);
+        *value = ParseIntegerOrDefault(percentString.c_str(), 0);
+        *target = 100;
+    }
+}
+
+int RetroAchievementsManager::ParseIntegerOrDefault(const char* value, int fallbackValue)
+{
+    if (!value || value[0] == '\0')
+        return fallbackValue;
+
+    char* end = nullptr;
+    long parsedValue = strtol(value, &end, 10);
+    if (end == value || (end && *end != '\0'))
+        return fallbackValue;
+
+    return (int) parsedValue;
+}
+
 unsigned PeekMemory(unsigned address, unsigned numBytes, void* ud)
 {
     NDS* nds = (NDS*) ud;
-    u8* mainRam = nds->MainRAM;
-    u32 mainRamMask = nds->MainRAMMask;
 
-    switch (numBytes)
-    {
-        case 1:
-        {
-            u8 value = *(u8*) &mainRam[address & mainRamMask];
-            return value;
-        }
-        case 2:
-        {
-            u16 value  = *(u16*) &mainRam[address & mainRamMask];
-            return value;
-        }
-        case 4:
-        {
-            u32 value = *(u32*) &mainRam[address & mainRamMask];
-            return value;
-        }
-        default:
-            return 0;
-    }
+    if (!nds)
+        return 0;
+
+    uint8_t bytes[4] = { 0 };
+    unsigned bytesRead = ReadMemoryRange(nds, address, bytes, std::min(numBytes, 4u));
+
+    unsigned value = 0;
+    for (unsigned i = 0; i < bytesRead; i++)
+        value |= (unsigned(bytes[i]) << (i * 8));
+
+    return value;
 }
 
 }

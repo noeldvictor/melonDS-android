@@ -21,6 +21,13 @@ typedef struct RARuntimeAchievement
     unsigned int target;
 } RARuntimeAchievement;
 
+typedef struct RARuntimeAchievementBucketEntry
+{
+    long achievementId;
+    long subsetId;
+    int bucketType;
+} RARuntimeAchievementBucketEntry;
+
 }
 }
 

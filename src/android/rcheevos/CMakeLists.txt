@@ -10,6 +10,11 @@ add_library(rcheevos
         src/rc_compat.c
         src/rc_util.c
         src/rc_version.c
+        src/rapi/rc_api_common.c
+        src/rapi/rc_api_editor.c
+        src/rapi/rc_api_info.c
+        src/rapi/rc_api_runtime.c
+        src/rapi/rc_api_user.c
         src/rcheevos/alloc.c
         src/rcheevos/condition.c
         src/rcheevos/condset.c

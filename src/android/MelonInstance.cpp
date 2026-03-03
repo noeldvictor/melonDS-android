@@ -561,15 +561,18 @@ bool MelonInstance::loadRewindState(RewindSaveState rewindSaveState)
 void MelonInstance::setupAchievements(
     std::list<RetroAchievements::RAAchievement> achievements,
     std::list<RetroAchievements::RALeaderboard> leaderboards,
-    std::optional<std::string> richPresenceScript
+    std::optional<std::string> richPresenceScript,
+    std::optional<RetroAchievements::RARuntimeBridgeConfig> runtimeBridgeConfig
 )
 {
     if (instanceId == 0)
     {
+        retroAchievementsManager->ConfigureRuntimeBridge(std::move(runtimeBridgeConfig));
         retroAchievementsManager->LoadAchievements(achievements);
         retroAchievementsManager->LoadLeaderboards(leaderboards);
         if (richPresenceScript)
             retroAchievementsManager->SetupRichPresence(*richPresenceScript);
+        retroAchievementsManager->ActivatePreferredRuntime();
     }
 }
 
@@ -590,6 +593,22 @@ std::vector<RetroAchievements::RARuntimeAchievement> MelonInstance::getRuntimeAc
 {
     if (instanceId == 0 && retroAchievementsManager)
         return retroAchievementsManager->GetRuntimeAchievements();
+    else
+        return { };
+}
+
+std::vector<RetroAchievements::RARuntimeAchievementBucketEntry> MelonInstance::getRuntimeAchievementBuckets()
+{
+    if (instanceId == 0 && retroAchievementsManager)
+        return retroAchievementsManager->GetRuntimeAchievementBuckets();
+    else
+        return { };
+}
+
+std::vector<long> MelonInstance::getRuntimeSubsetIds()
+{
+    if (instanceId == 0 && retroAchievementsManager)
+        return retroAchievementsManager->GetRuntimeSubsetIds();
     else
         return { };
 }

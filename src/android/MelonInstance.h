@@ -61,11 +61,14 @@ public:
     void setupAchievements(
         std::list<RetroAchievements::RAAchievement> achievements,
         std::list<RetroAchievements::RALeaderboard> leaderboards,
-        std::optional<std::string> richPresenceScript
+        std::optional<std::string> richPresenceScript,
+        std::optional<RetroAchievements::RARuntimeBridgeConfig> runtimeBridgeConfig
     );
     void unloadRetroAchievementsData();
     std::string getRichPresenceStatus();
     std::vector<RetroAchievements::RARuntimeAchievement> getRuntimeAchievements();
+    std::vector<RetroAchievements::RARuntimeAchievementBucketEntry> getRuntimeAchievementBuckets();
+    std::vector<long> getRuntimeSubsetIds();
 
 private:
     void updateRenderer();

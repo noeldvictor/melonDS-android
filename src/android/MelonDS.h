@@ -3,6 +3,7 @@
 
 #include <list>
 #include <vector>
+#include <optional>
 #include "AndroidFileHandler.h"
 #include "AndroidCameraHandler.h"
 #include "Configuration.h"
@@ -11,6 +12,7 @@
 #include "RomGbaSlotConfig.h"
 #include "retroachievements/RAAchievement.h"
 #include "retroachievements/RALeaderboard.h"
+#include "retroachievements/RARuntimeBridgeConfig.h"
 #include "renderer/FrameQueue.h"
 #include "types.h"
 #include "../GPU.h"
@@ -37,10 +39,17 @@ namespace MelonDSAndroid {
     extern void setConfiguration(EmulatorConfiguration emulatorConfiguration);
     extern void setup(AndroidCameraHandler* androidCameraHandler, std::shared_ptr<MelonEventMessenger> androidEventMessenger, u32* screenshotBufferPointer, int instanceId);
     extern void setCodeList(std::list<Cheat> cheats);
-    extern void setupAchievements(std::list<RetroAchievements::RAAchievement> achievements, std::list<RetroAchievements::RALeaderboard> leaderboards, std::optional<std::string> richPresenceScript);
+    extern void setupAchievements(
+        std::list<RetroAchievements::RAAchievement> achievements,
+        std::list<RetroAchievements::RALeaderboard> leaderboards,
+        std::optional<std::string> richPresenceScript,
+        std::optional<RetroAchievements::RARuntimeBridgeConfig> runtimeBridgeConfig
+    );
     extern void unloadRetroAchievementsData();
     extern std::string getRichPresenceStatus();
     extern std::vector<RetroAchievements::RARuntimeAchievement> getRuntimeAchievements();
+    extern std::vector<RetroAchievements::RARuntimeAchievementBucketEntry> getRuntimeAchievementBuckets();
+    extern std::vector<long> getRuntimeSubsetIds();
     extern void updateEmulatorConfiguration(std::unique_ptr<EmulatorConfiguration> emulatorConfiguration);
 
     /**

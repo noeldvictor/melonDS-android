@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cstdlib>
 #include <utility>
 #include <android/asset_manager.h>
 #include <oboe/Oboe.h>
@@ -30,6 +31,58 @@
 
 namespace MelonDSAndroid
 {
+    namespace
+    {
+        void ReleaseConfigurationPath(char*& path)
+        {
+            if (path != nullptr)
+            {
+                std::free(path);
+                path = nullptr;
+            }
+        }
+
+        void DestroyEmulatorConfiguration(MelonDSAndroid::EmulatorConfiguration* configuration)
+        {
+            if (configuration == nullptr)
+                return;
+
+            ReleaseConfigurationPath(configuration->dsBios7Path);
+            ReleaseConfigurationPath(configuration->dsBios9Path);
+            ReleaseConfigurationPath(configuration->dsFirmwarePath);
+            ReleaseConfigurationPath(configuration->dsiBios7Path);
+            ReleaseConfigurationPath(configuration->dsiBios9Path);
+            ReleaseConfigurationPath(configuration->dsiFirmwarePath);
+            ReleaseConfigurationPath(configuration->dsiNandPath);
+            ReleaseConfigurationPath(configuration->internalFilesDir);
+            ReleaseConfigurationPath(configuration->dsiSdCardSettings.imagePath);
+            ReleaseConfigurationPath(configuration->dsiSdCardSettings.folderPath);
+            ReleaseConfigurationPath(configuration->dldiSdCardSettings.imagePath);
+            ReleaseConfigurationPath(configuration->dldiSdCardSettings.folderPath);
+            delete configuration;
+        }
+
+        std::shared_ptr<MelonDSAndroid::EmulatorConfiguration> ShareConfiguration(MelonDSAndroid::EmulatorConfiguration configuration)
+        {
+            return std::shared_ptr<MelonDSAndroid::EmulatorConfiguration>(
+                new MelonDSAndroid::EmulatorConfiguration(std::move(configuration)),
+                [](MelonDSAndroid::EmulatorConfiguration* config) {
+                    DestroyEmulatorConfiguration(config);
+                }
+            );
+        }
+
+        std::shared_ptr<MelonDSAndroid::EmulatorConfiguration> ShareConfiguration(std::unique_ptr<MelonDSAndroid::EmulatorConfiguration> configuration)
+        {
+            MelonDSAndroid::EmulatorConfiguration* rawConfiguration = configuration.release();
+            return std::shared_ptr<MelonDSAndroid::EmulatorConfiguration>(
+                rawConfiguration,
+                [](MelonDSAndroid::EmulatorConfiguration* config) {
+                    DestroyEmulatorConfiguration(config);
+                }
+            );
+        }
+    }
     OpenGLContext *openGlContext;
     AndroidFileHandler* fileHandler;
     AndroidCameraHandler* cameraHandler;
@@ -49,7 +102,7 @@ namespace MelonDSAndroid
      * @param emulatorConfiguration The emulator configuration during the next emulator run
      */
     void setConfiguration(EmulatorConfiguration emulatorConfiguration) {
-        currentConfiguration = std::make_shared<EmulatorConfiguration>(std::move(emulatorConfiguration));
+        currentConfiguration = ShareConfiguration(std::move(emulatorConfiguration));
         internalFilesDir = currentConfiguration->internalFilesDir;
 
         net = std::make_shared<Net>();
@@ -86,31 +139,61 @@ namespace MelonDSAndroid
 
     void setCodeList(std::list<Cheat> cheats)
     {
+        if (instance == nullptr)
+            return;
         instance->loadCheats(std::move(cheats));
     }
 
     void setupAchievements(
         std::list<RetroAchievements::RAAchievement> achievements,
         std::list<RetroAchievements::RALeaderboard> leaderboards,
-        std::optional<std::string> richPresenceScript
+        std::optional<std::string> richPresenceScript,
+        std::optional<RetroAchievements::RARuntimeBridgeConfig> runtimeBridgeConfig
     )
     {
-        instance->setupAchievements(std::move(achievements), std::move(leaderboards), std::move(richPresenceScript));
+        if (instance == nullptr)
+            return;
+        instance->setupAchievements(
+            std::move(achievements),
+            std::move(leaderboards),
+            std::move(richPresenceScript),
+            std::move(runtimeBridgeConfig)
+        );
     }
 
     void unloadRetroAchievementsData()
     {
+        if (instance == nullptr)
+            return;
         instance->unloadRetroAchievementsData();
     }
 
     std::string getRichPresenceStatus()
     {
+        if (instance == nullptr)
+            return "";
         return instance->getRichPresenceStatus();
     }
 
     std::vector<RetroAchievements::RARuntimeAchievement> getRuntimeAchievements()
     {
+        if (instance == nullptr)
+            return { };
         return instance->getRuntimeAchievements();
+    }
+
+    std::vector<RetroAchievements::RARuntimeAchievementBucketEntry> getRuntimeAchievementBuckets()
+    {
+        if (instance == nullptr)
+            return { };
+        return instance->getRuntimeAchievementBuckets();
+    }
+
+    std::vector<long> getRuntimeSubsetIds()
+    {
+        if (instance == nullptr)
+            return { };
+        return instance->getRuntimeSubsetIds();
     }
 
     /**
@@ -119,7 +202,7 @@ namespace MelonDSAndroid
      * @param emulatorConfiguration The new emulator configuration
      */
     void updateEmulatorConfiguration(std::unique_ptr<EmulatorConfiguration> emulatorConfiguration) {
-        std::shared_ptr<EmulatorConfiguration> sharedConfig = std::move(emulatorConfiguration);
+        std::shared_ptr<EmulatorConfiguration> sharedConfig = ShareConfiguration(std::move(emulatorConfiguration));
         instance->updateConfiguration(sharedConfig);
         updateAudioSettings(sharedConfig->audioSettings);
 
@@ -374,4 +457,3 @@ namespace MelonDSAndroid
         openGlContext->Release();
     }
 }
-

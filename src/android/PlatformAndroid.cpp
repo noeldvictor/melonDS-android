@@ -297,6 +297,11 @@ namespace Platform
         if (fmt == nullptr)
             return;
 
+#ifdef NDEBUG
+        if (level == LogLevel::Debug || level == LogLevel::Info)
+            return;
+#endif
+
         va_list args;
         va_start(args, fmt);
 
