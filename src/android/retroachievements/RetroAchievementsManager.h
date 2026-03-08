@@ -50,6 +50,7 @@ public:
 private:
     bool TryActivateRcClientRuntimeLocked();
     void DeactivateRcClientRuntimeLocked();
+    void NotifyRcClientRuntimeFallbackLocked(RetroAchievementsRuntimeFallbackReason reason);
     void ResetRcClientPerformanceWindowLocked();
     std::string BuildRcClientLoginResponse() const;
     std::string BuildRcClientAchievementSetsResponse() const;
@@ -58,7 +59,6 @@ private:
     static std::string BuildRcClientErrorResponse(const std::string& message);
     bool IsRcClientConfiguredLocked() const;
     bool IsRcClientRuntimeActiveLocked() const;
-    static const char* GetRequestAction(const char* postData);
     static std::string EscapeJson(const std::string& value);
     static void ParseMeasuredProgress(const char* measuredProgress, unsigned int* value, unsigned int* target);
     static int ParseIntegerOrDefault(const char* value, int fallbackValue);
