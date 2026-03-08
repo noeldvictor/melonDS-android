@@ -433,9 +433,7 @@ std::optional<std::unique_ptr<NDSArgs>> BuildArgsFromConfiguration(const Emulato
 #ifdef JIT_ENABLED
     JITArgs _jitArgs {
         .MaxBlockSize = 32,
-        .LiteralOptimizations = true,
-        .BranchOptimizations = true,
-        .FastMemory = true,
+        .HgEngineFix = configuration.hgEngineFixEnabled,
     };
     auto jitArgs = configuration.useJit ? std::make_optional(_jitArgs) : std::nullopt;
 #else

@@ -67,6 +67,7 @@ struct JITArgs
     /// Enabled by default, but frontends should disable this when debugging
     /// so the constants segfaults don't hinder debugging.
     bool FastMemory = true;
+    bool HgEngineFix = false;
 };
 
 using ARM9BIOSImage = std::array<u8, ARM9BIOSSize>;

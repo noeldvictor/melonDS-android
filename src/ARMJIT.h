@@ -72,6 +72,7 @@ private:
     bool LiteralOptimizations = false;
     bool BranchOptimizations = false;
     bool FastMemory = false;
+    bool HgEngineFix = false;
 
 public:
     melonDS::NDS& NDS;
@@ -84,6 +85,7 @@ public:
     bool LiteralOptimizationsEnabled() const noexcept { return LiteralOptimizations; }
     bool BranchOptimizationsEnabled() const noexcept { return BranchOptimizations; }
     bool FastMemoryEnabled() const noexcept { return FastMemory; }
+    bool ShouldFoldLiteralPoolAddress(u32 cpuNum, u32 literalAddr) const noexcept;
 
     void SetJITArgs(JITArgs args) noexcept;
     void SetMaxBlockSize(int size) noexcept;
@@ -196,6 +198,7 @@ public:
     void ResetBlockCache() noexcept {}
     template <u32, int>
     void CheckAndInvalidate(u32 addr) noexcept {}
+    bool ShouldFoldLiteralPoolAddress(u32, u32) const noexcept { return true; }
 
     ARMJIT_Memory Memory;
 };
@@ -203,4 +206,3 @@ public:
 #endif // JIT_ENABLED
 
 #endif // ARMJIT_H
-

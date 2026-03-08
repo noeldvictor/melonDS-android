@@ -475,8 +475,34 @@ ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
         MaxBlockSize(jit.has_value() ? std::clamp(jit->MaxBlockSize, 1u, 32u) : 32),
         LiteralOptimizations(jit.has_value() ? jit->LiteralOptimizations : false),
         BranchOptimizations(jit.has_value() ? jit->BranchOptimizations : false),
-        FastMemory((jit.has_value() ? jit->FastMemory : false) && ARMJIT_Memory::IsFastMemSupported())
+        FastMemory((jit.has_value() ? jit->FastMemory : false) && ARMJIT_Memory::IsFastMemSupported()),
+        HgEngineFix(jit.has_value() ? jit->HgEngineFix : false)
 {}
+
+bool ARMJIT::ShouldFoldLiteralPoolAddress(u32 cpuNum, u32 literalAddr) const noexcept
+{
+    if (!HgEngineFix)
+        return true;
+
+    int region = cpuNum == 0 ? Memory.ClassifyAddress9(literalAddr) : Memory.ClassifyAddress7(literalAddr);
+
+    switch (region)
+    {
+    case ARMJIT_Memory::memregion_ITCM:
+    case ARMJIT_Memory::memregion_MainRAM:
+    case ARMJIT_Memory::memregion_SharedWRAM:
+    case ARMJIT_Memory::memregion_DTCM:
+    case ARMJIT_Memory::memregion_VRAM:
+    case ARMJIT_Memory::memregion_WRAM7:
+    case ARMJIT_Memory::memregion_VWRAM:
+    case ARMJIT_Memory::memregion_NewSharedWRAM_A:
+    case ARMJIT_Memory::memregion_NewSharedWRAM_B:
+    case ARMJIT_Memory::memregion_NewSharedWRAM_C:
+        return false;
+    default:
+        return true;
+    }
+}
 
 void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
 {
@@ -500,33 +526,35 @@ void ARMJIT::SetJITArgs(JITArgs args) noexcept
     if (MaxBlockSize != args.MaxBlockSize
         || LiteralOptimizations != args.LiteralOptimizations
         || BranchOptimizations != args.BranchOptimizations
-        || FastMemory != args.FastMemory)
+        || FastMemory != args.FastMemory
+        || HgEngineFix != args.HgEngineFix)
         ResetBlockCache();
 
     MaxBlockSize = args.MaxBlockSize;
     LiteralOptimizations = args.LiteralOptimizations;
     BranchOptimizations = args.BranchOptimizations;
     FastMemory = args.FastMemory;
+    HgEngineFix = args.HgEngineFix;
 }
 
 void ARMJIT::SetMaxBlockSize(int size) noexcept
 {
-    SetJITArgs(JITArgs{static_cast<unsigned>(size), LiteralOptimizations, LiteralOptimizations, FastMemory});
+    SetJITArgs(JITArgs{static_cast<unsigned>(size), LiteralOptimizations, BranchOptimizations, FastMemory, HgEngineFix});
 }
 
 void ARMJIT::SetLiteralOptimizations(bool enabled) noexcept
 {
-    SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), enabled, BranchOptimizations, FastMemory});
+    SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), enabled, BranchOptimizations, FastMemory, HgEngineFix});
 }
 
 void ARMJIT::SetBranchOptimizations(bool enabled) noexcept
 {
-    SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), LiteralOptimizations, enabled, FastMemory});
+    SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), LiteralOptimizations, enabled, FastMemory, HgEngineFix});
 }
 
 void ARMJIT::SetFastMemory(bool enabled) noexcept
 {
-    SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), LiteralOptimizations, BranchOptimizations, enabled});
+    SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), LiteralOptimizations, BranchOptimizations, enabled, HgEngineFix});
 }
 
 void ARMJIT::CompileBlock(ARM* cpu) noexcept
@@ -703,7 +731,8 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         u32 literalAddr;
         if (LiteralOptimizations
             && instrs[i].Info.SpecialKind == ARMInstrInfo::special_LoadLiteral
-            && DecodeLiteral(thumb, instrs[i], literalAddr))
+            && DecodeLiteral(thumb, instrs[i], literalAddr)
+            && ShouldFoldLiteralPoolAddress(cpu->Num, literalAddr))
         {
             u32 translatedAddr = LocaliseCodeAddress(cpu->Num, literalAddr);
             if (!translatedAddr)
