@@ -63,6 +63,8 @@ private:
     static void ParseMeasuredProgress(const char* measuredProgress, unsigned int* value, unsigned int* target);
     static int ParseIntegerOrDefault(const char* value, int fallbackValue);
 
+    static std::string GetLeaderboardFormattedValue(int leaderboardId, int value);
+
     melonDS::NDS* nds;
     rc_runtime_t rcheevosRuntime;
     rc_client_t* rcClientRuntime;

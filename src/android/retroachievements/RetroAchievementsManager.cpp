@@ -1188,17 +1188,17 @@ void RetroAchievementsManager::CheevosEventHandler(const rc_runtime_event_t* run
             eventMessenger->onLeaderboardAttemptCanceled(runtime_event->id);
             break;
         case RC_RUNTIME_EVENT_LBOARD_TRIGGERED:
-            eventMessenger->onLeaderboardAttemptCompleted(runtime_event->id, runtime_event->value);
+        {
+            std::string formattedValue = GetLeaderboardFormattedValue(runtime_event->id, runtime_event->value);
+            eventMessenger->onLeaderboardAttemptCompleted(runtime_event->id, runtime_event->value, formattedValue);
             break;
+        }
         case RC_RUNTIME_EVENT_LBOARD_UPDATED:
-            auto leaderboard = std::find_if(activeInstance->loadedLeaderboards.begin(), activeInstance->loadedLeaderboards.end(), [=](RALeaderboard l){ return l.id == runtime_event->id; });
-            if (leaderboard != activeInstance->loadedLeaderboards.end())
-            {
-                char buffer[32];
-                rc_runtime_format_lboard_value(buffer, sizeof(buffer), runtime_event->value, leaderboard->rcheevosFormat);
-                eventMessenger->onLeaderboardAttemptUpdated(runtime_event->id, buffer);
-            }
+        {
+            std::string formattedValue = GetLeaderboardFormattedValue(runtime_event->id, runtime_event->value);
+            eventMessenger->onLeaderboardAttemptUpdated(runtime_event->id, formattedValue);
             break;
+        }
     }
 }
 
@@ -1257,9 +1257,13 @@ void RetroAchievementsManager::RcClientEventHandler(const rc_client_event_t* eve
             if (event->leaderboard)
             {
                 int submittedValue = 0;
+                std::string formattedValue;
                 if (event->leaderboard_scoreboard)
+                {
                     submittedValue = ParseIntegerOrDefault(event->leaderboard_scoreboard->submitted_score, 0);
-                eventMessenger->onLeaderboardAttemptCompleted(event->leaderboard->id, submittedValue);
+                    formattedValue = event->leaderboard_scoreboard->submitted_score;
+                }
+                eventMessenger->onLeaderboardAttemptCompleted(event->leaderboard->id, submittedValue, formattedValue);
             }
             break;
         case RC_CLIENT_EVENT_GAME_COMPLETED:
@@ -1697,6 +1701,25 @@ int RetroAchievementsManager::ParseIntegerOrDefault(const char* value, int fallb
         return fallbackValue;
 
     return (int) parsedValue;
+}
+
+std::string RetroAchievementsManager::GetLeaderboardFormattedValue(int leaderboardId, int value)
+{
+    if (!activeInstance)
+        return {};
+
+    auto leaderboard = std::find_if(
+        activeInstance->loadedLeaderboards.begin(),
+        activeInstance->loadedLeaderboards.end(),
+        [=](const RALeaderboard& leaderboard) { return leaderboard.id == leaderboardId; }
+    );
+    char buffer[32];
+    if (leaderboard != activeInstance->loadedLeaderboards.end())
+        rc_runtime_format_lboard_value(buffer, sizeof(buffer), value, leaderboard->rcheevosFormat);
+    else
+        buffer[0] = '\0';
+
+    return buffer;
 }
 
 unsigned PeekMemory(unsigned address, unsigned numBytes, void* ud)

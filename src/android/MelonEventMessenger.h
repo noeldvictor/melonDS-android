@@ -32,7 +32,7 @@ public:
     virtual void onLeaderboardAttemptStarted(long leaderboardId) = 0;
     virtual void onLeaderboardAttemptUpdated(long leaderboardId, std::string formattedValue) = 0;
     virtual void onLeaderboardAttemptCanceled(long leaderboardId) = 0;
-    virtual void onLeaderboardAttemptCompleted(long leaderboardId, int value) = 0;
+    virtual void onLeaderboardAttemptCompleted(long leaderboardId, int value, std::string formattedValue) = 0;
     virtual void onAchievementGameCompleted(long subsetId) = 0;
     virtual void onAchievementSubsetCompleted(long subsetId) = 0;
     virtual void onRetroAchievementsServerError(std::string api, long relatedId, int result, std::string message) = 0;
