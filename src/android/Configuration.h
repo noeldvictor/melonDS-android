@@ -14,12 +14,14 @@ struct RenderSettings
 struct SoftwareRenderSettings : public RenderSettings
 {
     bool threadedRendering;
+    bool rendererDebugToolsEnabled;
 };
 
 struct OpenGlRenderSettings : public RenderSettings
 {
     bool betterPolygons;
     int scale;
+    bool rendererDebugToolsEnabled;
     bool conservativeCoverageEnabled;
     float conservativeCoveragePx;
     float conservativeCoverageDepthBias;
@@ -32,6 +34,20 @@ struct ComputeRenderSettings : public RenderSettings
 {
     int scale;
     bool highResCoordinates;
+};
+
+struct VulkanRenderSettings : public RenderSettings
+{
+    bool threadedRendering;
+    bool betterPolygons;
+    int scale;
+    bool rendererDebugToolsEnabled;
+    bool conservativeCoverageEnabled;
+    float conservativeCoveragePx;
+    float conservativeCoverageDepthBias;
+    bool conservativeCoverageApplyRepeat;
+    bool conservativeCoverageApplyClamp;
+    bool debug3dClearMagenta;
 };
 
 struct AudioSettings

@@ -1,4 +1,5 @@
 #include "ScreenshotRenderer.h"
+#include <algorithm>
 #include "MelonLog.h"
 #include "GPU.h"
 
@@ -13,13 +14,25 @@ ScreenshotRenderer::ScreenshotRenderer(u32* screenshotBuffer)
 
 void ScreenshotRenderer::init()
 {
+    if (initialized)
+        return;
+
     setupFrameBuffers();
     setupShaders();
     setupVertexBuffers();
+    initialized = true;
 }
 
 void ScreenshotRenderer::renderScreenshot(GPU* gpu, Renderer renderer, Frame* renderFrame)
 {
+    if (renderer == Renderer::Vulkan)
+    {
+        constexpr size_t screenshotPixelCount = static_cast<size_t>(256) * static_cast<size_t>(192) * 2;
+        std::fill_n(screenshotBuffer, screenshotPixelCount, 0u);
+        LOG_ERROR("Vulkan", "Vulkan screenshot capture must use VulkanOutput readback path");
+        return;
+    }
+
     if (renderer == Renderer::Software)
     {
         int frontBuffer = gpu->FrontBuffer;
@@ -214,6 +227,9 @@ void ScreenshotRenderer::setupVertexBuffers()
 
 void ScreenshotRenderer::cleanup()
 {
+    if (!initialized)
+        return;
+
     glDeleteShader(screenshotRenderVertexShader);
     glDeleteShader(screenshotRenderFragmentShader);
     glDeleteProgram(screenshotRenderShader);
@@ -221,6 +237,7 @@ void ScreenshotRenderer::cleanup()
     glDeleteFramebuffers(2, frameBuffers);
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
+    initialized = false;
 }
 
 }

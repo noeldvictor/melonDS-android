@@ -30,6 +30,35 @@
 namespace melonDS
 {
 
+namespace
+{
+u32 ConvertBgraToRgba8(u32 packedColor)
+{
+    const u32 rb = packedColor & 0x00FF00FFu;
+    const u32 g = packedColor & 0x0000FF00u;
+    const u32 a = packedColor & 0xFF000000u;
+    return ((rb & 0x000000FFu) << 16) | g | ((rb & 0x00FF0000u) >> 16) | a;
+}
+
+u32 PackOpenGlAttrToLogical(u32 packedColor)
+{
+    const u32 polyIdByte = packedColor & 0xFFu;
+    const u32 edgeByte = (packedColor >> 8) & 0xFFu;
+    const u32 fogByte = (packedColor >> 16) & 0xFFu;
+
+    const u32 polyId = ((polyIdByte * 63u) + 127u) / 255u;
+    u32 attr = (polyId & 0x3Fu) << 24u;
+    if (fogByte >= 0x80u)
+        attr |= 1u << 15u;
+    if (edgeByte >= 0x80u)
+    {
+        attr |= 0xFu;
+        attr |= 0x10u << 8u;
+    }
+    return attr;
+}
+}
+
 bool GLRenderer::BuildRenderShader(u32 flags, const std::string& vs, const std::string& fs)
 {
     char shadername[32];
@@ -1502,6 +1531,62 @@ u32* GLRenderer::GetLine(int line)
 void GLRenderer::SetupAccelFrame()
 {
     glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
+}
+
+std::vector<u32> GLRenderer::CaptureColorTargetForDebug()
+{
+    if (ScreenW <= 0 || ScreenH <= 0)
+        return {};
+
+    std::vector<u32> pixels(static_cast<size_t>(ScreenW) * static_cast<size_t>(ScreenH));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, MainFramebuffer);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0, 0, ScreenW, ScreenH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    for (u32& pixel : pixels)
+        pixel = ConvertBgraToRgba8(pixel);
+    return pixels;
+}
+
+std::vector<u32> GLRenderer::CaptureTopDepthForDebug()
+{
+    if (ScreenW <= 0 || ScreenH <= 0)
+        return {};
+
+    std::vector<u32> depth(static_cast<size_t>(ScreenW) * static_cast<size_t>(ScreenH));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, MainFramebuffer);
+    glReadBuffer(GL_NONE);
+    glReadPixels(0, 0, ScreenW, ScreenH, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, depth.data());
+    for (u32& value : depth)
+        value >>= 8;
+    return depth;
+}
+
+std::vector<u32> GLRenderer::CaptureTopAttrForDebug()
+{
+    if (ScreenW <= 0 || ScreenH <= 0)
+        return {};
+
+    std::vector<u32> rawPixels(static_cast<size_t>(ScreenW) * static_cast<size_t>(ScreenH));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, MainFramebuffer);
+    glReadBuffer(GL_COLOR_ATTACHMENT1);
+    glReadPixels(0, 0, ScreenW, ScreenH, GL_RGBA, GL_UNSIGNED_BYTE, rawPixels.data());
+
+    std::vector<u32> attr(rawPixels.size(), 0u);
+    for (size_t i = 0; i < rawPixels.size(); i++)
+        attr[i] = PackOpenGlAttrToLogical(ConvertBgraToRgba8(rawPixels[i]));
+    return attr;
+}
+
+std::vector<u32> GLRenderer::CaptureTopCoverageForDebug()
+{
+    const std::vector<u32> topAttr = CaptureTopAttrForDebug();
+    if (topAttr.empty())
+        return {};
+
+    std::vector<u32> coverage(topAttr.size(), 0u);
+    for (size_t i = 0; i < topAttr.size(); i++)
+        coverage[i] = (topAttr[i] >> 8u) & 0x1Fu;
+    return coverage;
 }
 
 }

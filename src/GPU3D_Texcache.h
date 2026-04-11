@@ -48,6 +48,9 @@ public:
         : TexLoader(texloader) // probably better if this would be a move constructor???
     {}
 
+    TexLoaderT& GetLoader() { return TexLoader; }
+    const TexLoaderT& GetLoader() const { return TexLoader; }
+
     u64 MaskedHash(u8* vram, u32 vramSize, u32 addr, u32 size)
     {
         u64 hash = 0;

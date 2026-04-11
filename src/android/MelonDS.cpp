@@ -1,7 +1,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <utility>
+#include <atomic>
+#include <cctype>
 #include <android/asset_manager.h>
+#include <sys/system_properties.h>
 #include <oboe/Oboe.h>
 #include "EmulatorArgsBuilder.h"
 #include "MelonDS.h"
@@ -33,6 +36,124 @@ namespace MelonDSAndroid
 {
     namespace
     {
+        bool fastForwardActive = false;
+        std::atomic_bool rendererDebugToolsEnabled = false;
+        std::atomic_uint vulkanDiagnosticFlags = 0;
+
+        bool EqualsIgnoreCase(const char* lhs, const char* rhs)
+        {
+            if (lhs == nullptr || rhs == nullptr)
+                return false;
+
+            while (*lhs != '\0' && *rhs != '\0')
+            {
+                if (std::tolower(static_cast<unsigned char>(*lhs)) != std::tolower(static_cast<unsigned char>(*rhs)))
+                    return false;
+                lhs++;
+                rhs++;
+            }
+
+            return *lhs == '\0' && *rhs == '\0';
+        }
+
+        bool ReadBooleanSystemProperty(const char* key, bool defaultValue = false)
+        {
+            char value[PROP_VALUE_MAX]{};
+            const int length = __system_property_get(key, value);
+            if (length <= 0)
+                return defaultValue;
+
+            if (EqualsIgnoreCase(value, "1")
+                || EqualsIgnoreCase(value, "true")
+                || EqualsIgnoreCase(value, "y")
+                || EqualsIgnoreCase(value, "yes")
+                || EqualsIgnoreCase(value, "on"))
+            {
+                return true;
+            }
+
+            if (EqualsIgnoreCase(value, "0")
+                || EqualsIgnoreCase(value, "false")
+                || EqualsIgnoreCase(value, "n")
+                || EqualsIgnoreCase(value, "no")
+                || EqualsIgnoreCase(value, "off"))
+            {
+                return false;
+            }
+
+            return defaultValue;
+        }
+
+        u32 ResolveVulkanDiagnosticFlags()
+        {
+            u32 flags = 0;
+
+            if (ReadBooleanSystemProperty("debug.melonds.vulkan.disable_passive_repeat_expand"))
+                flags |= VulkanDiagnosticDisablePassiveRepeatCoverageExpand;
+            if (ReadBooleanSystemProperty("debug.melonds.vulkan.legacy_compat_fill_depth"))
+                flags |= VulkanDiagnosticLegacyCompatFillDepth;
+            if (ReadBooleanSystemProperty("debug.melonds.vulkan.legacy_final_aa_mask"))
+                flags |= VulkanDiagnosticLegacyFinalAaMask;
+
+            return flags;
+        }
+
+        bool ResolveRendererDebugToolsEnabled(const EmulatorConfiguration& configuration)
+        {
+            if (!configuration.renderSettings)
+                return false;
+
+            switch (configuration.renderer)
+            {
+                case Renderer::Software:
+                    return static_cast<const SoftwareRenderSettings&>(*configuration.renderSettings).rendererDebugToolsEnabled;
+                case Renderer::OpenGl:
+                    return static_cast<const OpenGlRenderSettings&>(*configuration.renderSettings).rendererDebugToolsEnabled;
+                case Renderer::Vulkan:
+                    return static_cast<const VulkanRenderSettings&>(*configuration.renderSettings).rendererDebugToolsEnabled;
+                case Renderer::Compute:
+                    return false;
+            }
+
+            return false;
+        }
+
+        void LogEffectiveJitConfiguration(const EmulatorConfiguration& configuration, const NDSArgs& args)
+        {
+            if (configuration.renderer != Renderer::Vulkan)
+                return;
+
+#ifdef JIT_ENABLED
+            JITArgs effectiveJit{};
+            effectiveJit.MaxBlockSize = 32;
+            effectiveJit.LiteralOptimizations = true;
+            effectiveJit.BranchOptimizations = true;
+            effectiveJit.FastMemory = true;
+            effectiveJit.HgEngineFix = configuration.hgEngineFixEnabled;
+
+            const bool jitEnabled = args.JIT.has_value();
+            if (jitEnabled)
+                effectiveJit = *args.JIT;
+
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "VulkanRuntime[JIT]: enabled=%d maxBlockSize=%u literalOpt=%d branchOpt=%d fastMemory=%d hgEngineFix=%d",
+                jitEnabled ? 1 : 0,
+                effectiveJit.MaxBlockSize,
+                effectiveJit.LiteralOptimizations ? 1 : 0,
+                effectiveJit.BranchOptimizations ? 1 : 0,
+                effectiveJit.FastMemory ? 1 : 0,
+                effectiveJit.HgEngineFix ? 1 : 0
+            );
+#else
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "VulkanRuntime[JIT]: enabled=0 compiled=0 maxBlockSize=32 literalOpt=1 branchOpt=1 fastMemory=1 hgEngineFix=%d",
+                configuration.hgEngineFixEnabled ? 1 : 0
+            );
+#endif
+        }
+
         void ReleaseConfigurationPath(char*& path)
         {
             if (path != nullptr)
@@ -93,6 +214,23 @@ namespace MelonDSAndroid
 
     std::shared_ptr<MelonInstance> instance;
 
+    bool ensureOpenGlContext()
+    {
+        if (openGlContext != nullptr)
+            return true;
+
+        auto* context = new OpenGLContext();
+        if (!context->InitContext(0))
+        {
+            delete context;
+            Platform::Log(Platform::LogLevel::Error, "Failed to initialize OpenGL context");
+            return false;
+        }
+
+        openGlContext = context;
+        return true;
+    }
+
     bool setupOpenGlContext();
     void cleanupOpenGlContext();
 
@@ -104,6 +242,8 @@ namespace MelonDSAndroid
     void setConfiguration(EmulatorConfiguration emulatorConfiguration) {
         currentConfiguration = ShareConfiguration(std::move(emulatorConfiguration));
         internalFilesDir = currentConfiguration->internalFilesDir;
+        rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*currentConfiguration), std::memory_order_relaxed);
+        vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
 
         net = std::make_shared<Net>();
         net->SetDriver(std::make_unique<Net_Slirp>([](const u8* data, int len) {
@@ -124,10 +264,13 @@ namespace MelonDSAndroid
             instance = nullptr;
             return;
         }
+
+        auto args = std::move(instanceArgs.value());
+        LogEffectiveJitConfiguration(*currentConfiguration, *args);
         instance = std::make_shared<MelonInstance>(
             instanceId,
             currentConfiguration,
-            std::move(instanceArgs.value()),
+            std::move(args),
             net,
             ScreenshotRenderer(screenshotBufferPointer),
             currentConfiguration->consoleType
@@ -196,6 +339,17 @@ namespace MelonDSAndroid
         return instance->getRuntimeSubsetIds();
     }
 
+    Renderer getCurrentRenderer()
+    {
+        if (instance != nullptr)
+            return instance->getCurrentRenderer();
+
+        if (currentConfiguration != nullptr)
+            return currentConfiguration->renderer;
+
+        return Renderer::Software;
+    }
+
     /**
      * Used to update the emulator's configuration during runtime. Will only update the configurations that can actually change during runtime without causing issues,
      *
@@ -207,6 +361,8 @@ namespace MelonDSAndroid
         updateAudioSettings(sharedConfig->audioSettings);
 
         currentConfiguration = sharedConfig;
+        rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*sharedConfig), std::memory_order_relaxed);
+        vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
     }
 
     int loadRom(std::string romPath, std::string sramPath, RomGbaSlotConfig* gbaSlotConfig)
@@ -241,6 +397,14 @@ namespace MelonDSAndroid
             return ROMManager::FIRMWARE_NOT_BOOTABLE;
     }
 
+    bool precompileVulkanPipelines()
+    {
+        if (!instance)
+            return false;
+
+        return instance->precompileVulkanPipelines();
+    }
+
     void touchScreen(u16 x, u16 y)
     {
         if (instance)
@@ -268,7 +432,8 @@ namespace MelonDSAndroid
     void start()
     {
         startAudio();
-        setupOpenGlContext();
+        if (currentConfiguration->renderer != Renderer::Vulkan)
+            setupOpenGlContext();
 
         instance->start();
     }
@@ -276,6 +441,8 @@ namespace MelonDSAndroid
     u32 loop()
     {
         MPInterface::Get().Process();
+        if (currentConfiguration != nullptr && currentConfiguration->renderer != Renderer::Vulkan)
+            setupOpenGlContext();
         return instance->runFrame();
     }
 
@@ -285,6 +452,167 @@ namespace MelonDSAndroid
             return nullptr;
 
         return instance->getPresentationFrame(deadline);
+    }
+
+    bool waitForPresentationFrame(Frame* frame, u64 timeoutNs)
+    {
+        if (!instance)
+            return false;
+
+        return instance->waitForPresentationFrame(frame, timeoutNs);
+    }
+
+    int attachVulkanSurface(ANativeWindow* window, u32 width, u32 height)
+    {
+        if (!instance)
+        {
+            if (window != nullptr)
+                ANativeWindow_release(window);
+            return 0;
+        }
+
+        return instance->attachVulkanSurface(window, width, height);
+    }
+
+    bool resizeVulkanSurface(int surfaceId, u32 width, u32 height)
+    {
+        if (!instance)
+            return false;
+
+        return instance->resizeVulkanSurface(surfaceId, width, height);
+    }
+
+    bool configureVulkanSurface(int surfaceId, const VulkanSurfaceConfig& config, const VulkanBackgroundImage& backgroundImage)
+    {
+        if (!instance)
+            return false;
+
+        return instance->configureVulkanSurface(surfaceId, config, backgroundImage);
+    }
+
+    void detachVulkanSurface(int surfaceId)
+    {
+        if (instance)
+            instance->detachVulkanSurface(surfaceId);
+    }
+
+    bool presentVulkanFrame(
+        std::optional<std::chrono::time_point<std::chrono::steady_clock>> deadline,
+        std::optional<std::chrono::time_point<std::chrono::steady_clock>> budgetDeadline)
+    {
+        if (!instance)
+            return false;
+
+        return instance->presentVulkanFrame(deadline, budgetDeadline);
+    }
+
+    void requestVulkanPresentationResync()
+    {
+        if (instance)
+            instance->requestVulkanPresentationResync();
+    }
+
+    bool areRendererDebugToolsEnabled()
+    {
+        return rendererDebugToolsEnabled.load(std::memory_order_relaxed);
+    }
+
+    u32 getVulkanDiagnosticFlags()
+    {
+        return vulkanDiagnosticFlags.load(std::memory_order_relaxed);
+    }
+
+    bool hasVulkanDiagnosticFlag(VulkanDiagnosticFlag flag)
+    {
+        return (getVulkanDiagnosticFlags() & static_cast<u32>(flag)) != 0u;
+    }
+
+    std::vector<u32> captureCurrentFrameForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentFrameForDebug();
+    }
+
+    std::vector<u32> captureCurrentPackedTopPrimaryForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentPackedTopPrimaryForDebug();
+    }
+
+    std::vector<u32> captureCurrentPackedBottomPrimaryForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentPackedBottomPrimaryForDebug();
+    }
+
+    std::vector<u32> captureCurrent3dDimensionsForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrent3dDimensionsForDebug();
+    }
+
+    std::vector<u32> captureCurrent3dFrameForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrent3dFrameForDebug();
+    }
+
+    std::vector<u32> captureCurrent3dCaptureFrameForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrent3dCaptureFrameForDebug();
+    }
+
+    std::vector<u32> captureCurrent3dDepthForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrent3dDepthForDebug();
+    }
+
+    std::vector<u32> captureCurrent3dAttrForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrent3dAttrForDebug();
+    }
+
+    std::vector<u32> captureCurrent3dCoverageForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrent3dCoverageForDebug();
+    }
+
+    void dumpCurrentRendererDebugSnapshot()
+    {
+        if (instance)
+            instance->dumpDebugSnapshot();
+    }
+
+    void setFastForwardActive(bool enabled)
+    {
+        fastForwardActive = enabled;
+    }
+
+    bool isFastForwardActive()
+    {
+        return fastForwardActive;
     }
 
     void pause()
@@ -316,7 +644,7 @@ namespace MelonDSAndroid
             return false;
         }
 
-        instance->saveState(&state);
+        instance->saveState(&state, true);
 
         if (state.Error)
         {
@@ -352,7 +680,7 @@ namespace MelonDSAndroid
             return false;
         }
 
-        if (!instance->saveState(backup.get()) || backup->Error)
+        if (!instance->saveState(backup.get(), false) || backup->Error)
         {
             Platform::Log(Platform::LogLevel::Error, "Failed to back up state, aborting load (from \"%s\")\n", path);
             Platform::CloseFile(saveStateFile);
@@ -396,7 +724,7 @@ namespace MelonDSAndroid
             return false;
         }
 
-        if (!instance->saveState(backup.get()) || backup->Error)
+        if (!instance->saveState(backup.get(), false) || backup->Error)
         {
             Platform::Log(Platform::LogLevel::Error, "Failed to back up state, aborting rewind state load");
             return false;
@@ -437,7 +765,7 @@ namespace MelonDSAndroid
 
     bool setupOpenGlContext()
     {
-        if (openGlContext == nullptr)
+        if (!ensureOpenGlContext())
             return false;
 
         if (!openGlContext->Use())

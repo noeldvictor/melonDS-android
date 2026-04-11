@@ -38,7 +38,10 @@ add_library(core STATIC
     GPU2D_Soft.cpp
     GPU3D.cpp
     GPU3D_Soft.cpp
+    GPU3D_Vulkan.cpp
+    VulkanContext.cpp
     GPU3D_Texcache.cpp
+    GPU3D_TexcacheVulkan.cpp
     GPU3D_Texcache.h
     melonDLDI.h
     Mic.cpp
@@ -188,6 +191,7 @@ endif()
 # Fix xxhash compile errors when using -Og
 # See https://github.com/Cyan4973/xxHash/blob/136cc1f8fe4d5ea62a7c16c8424d4fa5158f6d68/README.md?plain=1#L159-L163
 target_compile_definitions(core PRIVATE $<$<CONFIG:DEBUG>:XXH_NO_INLINE_HINTS=1>)
+target_compile_definitions(core PRIVATE $<$<CONFIG:DEBUG>:MELONDS_VULKAN_ENABLE_VALIDATION=1>)
 
 find_library(m MATH_LIBRARY)
 
@@ -238,4 +242,3 @@ endif()
 #    BEFORE PUBLIC -fsanitize=undefined PUBLIC -fsanitize=address
 #  )
 #endif()
-

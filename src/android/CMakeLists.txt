@@ -17,6 +17,8 @@ set(ANDROID_SOURCES
         DSiSupport.cpp
         renderer/ScreenshotRenderer.cpp
         renderer/FrameQueue.cpp
+        renderer/VulkanOutput.cpp
+        renderer/VulkanSurfacePresenter.cpp
         retroachievements/RetroAchievementsManager.cpp
 
         ../frontend/RewindManager.cpp
@@ -33,10 +35,11 @@ add_subdirectory(${RCHEEVOS} ./rcheevos)
 add_subdirectory(../net ./net-utils)
 add_library(melonDS-lib SHARED ${ANDROID_SOURCES})
 find_library(android-lib android)
+find_library(vulkan-lib vulkan)
 target_include_directories(${PROJECT_NAME} PUBLIC ${OBOE}/include)
 target_include_directories(${PROJECT_NAME} PUBLIC ${FAAD2}/include)
 target_include_directories(${PROJECT_NAME} PUBLIC ${RCHEEVOS}/include)
 target_include_directories(${PROJECT_NAME} PUBLIC ./)
 target_include_directories(${PROJECT_NAME} PUBLIC ../)
 target_include_directories(${PROJECT_NAME} PUBLIC ../frontend)
-target_link_libraries(melonDS-lib ${android-lib} core net-utils oboe faad rcheevos EGL GLESv3)
+target_link_libraries(melonDS-lib ${android-lib} ${vulkan-lib} core net-utils oboe faad rcheevos EGL GLESv3)

@@ -22,6 +22,7 @@
 #include "GPU3D.h"
 #include "GPU_OpenGL.h"
 #include "OpenGLSupport.h"
+#include <vector>
 
 namespace melonDS
 {
@@ -45,6 +46,12 @@ public:
         bool debug3dClearMagenta) noexcept;
     [[nodiscard]] bool GetBetterPolygons() const noexcept { return BetterPolygons; }
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
+    [[nodiscard]] u32 GetColorTargetWidth() const noexcept { return static_cast<u32>(ScreenW); }
+    [[nodiscard]] u32 GetColorTargetHeight() const noexcept { return static_cast<u32>(ScreenH); }
+    [[nodiscard]] std::vector<u32> CaptureColorTargetForDebug();
+    [[nodiscard]] std::vector<u32> CaptureTopDepthForDebug();
+    [[nodiscard]] std::vector<u32> CaptureTopAttrForDebug();
+    [[nodiscard]] std::vector<u32> CaptureTopCoverageForDebug();
 
     void VCount144(GPU& gpu) override {};
     void RenderFrame(GPU& gpu) override;

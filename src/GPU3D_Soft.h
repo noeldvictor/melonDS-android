@@ -23,6 +23,7 @@
 #include "Platform.h"
 #include <thread>
 #include <atomic>
+#include <vector>
 
 namespace melonDS
 {
@@ -40,11 +41,17 @@ public:
     void RenderFrame(GPU& gpu) override;
     void RestartFrame(GPU& gpu) override;
     u32* GetLine(int line) override;
+    [[nodiscard]] u32 GetColorTargetWidth() const noexcept { return 256; }
+    [[nodiscard]] u32 GetColorTargetHeight() const noexcept { return 192; }
+    [[nodiscard]] std::vector<u32> CaptureColorTargetForDebug() const;
+    [[nodiscard]] std::vector<u32> CaptureTopDepthForDebug() const;
+    [[nodiscard]] std::vector<u32> CaptureTopAttrForDebug() const;
+    [[nodiscard]] std::vector<u32> CaptureTopCoverageForDebug() const;
 
     void SetupRenderThread(GPU& gpu);
     void EnableRenderThread();
     void StopRenderThread();
-private:
+protected:
     friend void GPU3D::DoSavestate(Savestate* file) noexcept;
     // Notes on the interpolator:
     //

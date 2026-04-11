@@ -35,6 +35,9 @@ public:
     void renderScreenshot(GPU* gpu, Renderer renderer, Frame* renderFrame);
     u32* getScreenshot();
     void cleanup();
+
+private:
+    bool initialized = false;
 };
 
 }

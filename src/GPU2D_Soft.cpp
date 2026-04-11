@@ -19,6 +19,41 @@
 #include "GPU2D_Soft.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#include "Platform.h"
+
+namespace MelonDSAndroid
+{
+bool areRendererDebugToolsEnabled();
+}
+
+namespace
+{
+struct RendererDebugSamplePoint
+{
+    const char* label;
+    melonDS::u32 x;
+    melonDS::u32 y;
+};
+
+static constexpr RendererDebugSamplePoint kRendererDebugSamplePoints[] = {
+    {"seamA", 85u, 14u},
+    {"goodA", 84u, 14u},
+    {"seamB", 75u, 58u},
+    {"goodB", 74u, 58u},
+    {"seamC", 150u, 81u},
+    {"goodC", 149u, 81u},
+};
+
+const RendererDebugSamplePoint* findRendererDebugSamplePoint(melonDS::u32 x, melonDS::u32 y)
+{
+    for (const RendererDebugSamplePoint& sample : kRendererDebugSamplePoints)
+    {
+        if (sample.x == x && sample.y == y)
+            return &sample;
+    }
+    return nullptr;
+}
+}
 
 namespace melonDS
 {
@@ -105,6 +140,7 @@ u32 SoftRenderer::ColorComposite(int i, u32 val1, u32 val2) const
 void SoftRenderer::DrawScanline(u32 line, Unit* unit)
 {
     CurUnit = unit;
+    _3DLine = nullptr;
 
     int stride = GPU.GPU3D.IsRendererAccelerated() ? (256*3 + 1) : 256;
     u32* dst = &Framebuffer[CurUnit->Num][stride * line];
@@ -148,11 +184,6 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
     {
         if (!GPU.GPU3D.IsRendererAccelerated())
             _3DLine = GPU.GPU3D.GetLine(n3dline);
-        else if (CurUnit->CaptureLatch && (((CurUnit->CaptureCnt >> 29) & 0x3) != 1))
-        {
-            _3DLine = GPU.GPU3D.GetLine(n3dline);
-            //GPU3D::GLRenderer::PrepareCaptureFrame();
-        }
     }
 
     if (forceblank)
@@ -247,7 +278,7 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
         }
 
         if (line < capheight)
-            DoCapture(line, capwidth);
+            DoCapture(line, capwidth, static_cast<u32>(n3dline));
     }
 
     u32 masterBrightness = CurUnit->MasterBrightness;
@@ -310,7 +341,16 @@ void SoftRenderer::VBlankEnd(Unit* unitA, Unit* unitB)
 #ifdef OGLRENDERER_ENABLED
     if (Renderer3D& renderer3d = GPU.GPU3D.GetCurrentRenderer(); renderer3d.Accelerated)
     {
-        if ((unitA->CaptureCnt & (1<<31)) && (((unitA->CaptureCnt >> 29) & 0x3) != 1))
+        const u32 captureCnt = unitA->CaptureCnt;
+        const u32 captureMode = (captureCnt >> 29u) & 0x3u;
+        const bool captureEnabled = (captureCnt & (1u << 31u)) != 0u;
+        const bool captureUsesDirect3D = (captureCnt & (1u << 24u)) != 0u;
+        const bool sourceAContributes = captureMode == 0u
+            || ((captureMode >= 2u) && ((captureCnt & 0x1Fu) != 0u));
+        const bool bg0Uses3D = (unitA->DispCnt & 0x0108u) == 0x0108u;
+        if (captureEnabled
+            && captureMode != 1u
+            && (captureUsesDirect3D || (bg0Uses3D && sourceAContributes)))
         {
             renderer3d.PrepareCaptureFrame();
         }
@@ -318,9 +358,22 @@ void SoftRenderer::VBlankEnd(Unit* unitA, Unit* unitB)
 #endif
 }
 
-void SoftRenderer::DoCapture(u32 line, u32 width)
+void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
 {
     u32 captureCnt = CurUnit->CaptureCnt;
+    const u32 captureMode = (captureCnt >> 29u) & 0x3u;
+    const bool captureDebugEnabled = MelonDSAndroid::areRendererDebugToolsEnabled();
+    const bool logCaptureSamples = captureDebugEnabled;
+    if (captureDebugEnabled && line == 0)
+    {
+        LastDebugCaptureStats = {};
+        LastDebugCaptureStats.CaptureWidth = width;
+        LastDebugCaptureStats.CaptureMode = captureMode;
+        LastDebugCaptureStats.CaptureBit24 = (captureCnt & (1u << 24u)) != 0u ? 1u : 0u;
+        HasLastDebugCapture3dSource = false;
+    }
+    if (captureDebugEnabled)
+        LastDebugCaptureStats.CaptureLines++;
     u32 dstvram = (captureCnt >> 16) & 0x3;
 
     // TODO: confirm this
@@ -336,6 +389,10 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
     u32* srcA;
     if (captureCnt & (1<<24))
     {
+        if (captureDebugEnabled)
+            LastDebugCaptureStats.Direct3DLines++;
+        if (GPU.GPU3D.IsRendererAccelerated())
+            _3DLine = GPU.GPU3D.GetLine(static_cast<int>(sourceLine));
         srcA = _3DLine;
     }
     else
@@ -343,61 +400,147 @@ void SoftRenderer::DoCapture(u32 line, u32 width)
         srcA = BGOBJLine;
         if (GPU.GPU3D.IsRendererAccelerated())
         {
-            // in GPU3D::CurrentRenderer->Accelerated mode, compositing is normally done on the GPU
-            // but when doing display capture, we do need the composited output
-            // so we do it here
-
-            for (int i = 0; i < 256; i++)
+            // In accelerated mode, only fetch the 3D line if this capture line actually
+            // needs 3D contribution for source A.
+            const bool sourceAContributes = captureMode == 0u
+                || ((captureMode >= 2u) && ((captureCnt & 0x1Fu) != 0u));
+            bool needs3dComposite = false;
+            if (sourceAContributes)
             {
-                u32 val1 = BGOBJLine[i];
-                u32 val2 = BGOBJLine[256+i];
-                u32 val3 = BGOBJLine[512+i];
-
-                u32 compmode = (val3 >> 24) & 0xF;
-
-                if (compmode == 4)
+                for (int i = 0; i < 256; i++)
                 {
-                    // 3D on top, blending
-
-                    u32 _3dval = _3DLine[i];
-                    if ((_3dval >> 24) > 0)
-                        val1 = ColorBlend5(_3dval, val1);
-                    else
-                        val1 = val2;
-                }
-                else if (compmode == 1)
-                {
-                    // 3D on bottom, blending
-
-                    u32 _3dval = _3DLine[i];
-                    if ((_3dval >> 24) > 0)
+                    const u32 compmode = (BGOBJLine[512 + i] >> 24) & 0xF;
+                    if (captureDebugEnabled && compmode < 8u)
+                        LastDebugCaptureStats.CompModeCounts[compmode]++;
+                    if (compmode <= 4u)
                     {
-                        u32 eva = (val3 >> 8) & 0x1F;
-                        u32 evb = (val3 >> 16) & 0x1F;
-
-                        val1 = ColorBlend4(val1, _3dval, eva, evb);
+                        needs3dComposite = true;
+                        break;
                     }
-                    else
-                        val1 = val2;
                 }
-                else if (compmode <= 3)
+            }
+
+            if (needs3dComposite)
+            {
+                if (captureDebugEnabled)
+                    LastDebugCaptureStats.SourceACompositeLines++;
+                _3DLine = GPU.GPU3D.GetLine(static_cast<int>(sourceLine));
+                if (_3DLine)
                 {
-                    // 3D on top, normal/fade
-
-                    u32 _3dval = _3DLine[i];
-                    if ((_3dval >> 24) > 0)
+                    struct CaptureSamplePoint
                     {
-                        u32 evy = (val3 >> 8) & 0x1F;
+                        const char* label;
+                        u32 x;
+                        u32 y;
+                    };
+                    static constexpr CaptureSamplePoint kCaptureSamplePoints[] = {
+                        {"seamA", 85u, 14u},
+                        {"goodA", 84u, 14u},
+                        {"seamB", 75u, 58u},
+                        {"goodB", 74u, 58u},
+                        {"seamC", 150u, 81u},
+                        {"goodC", 149u, 81u},
+                    };
 
-                        val1 = _3dval;
-                        if      (compmode == 2) val1 = ColorBrightnessUp(val1, evy, 0x8);
-                        else if (compmode == 3) val1 = ColorBrightnessDown(val1, evy, 0x7);
+                    if (captureDebugEnabled)
+                    {
+                        std::memcpy(
+                            &LastDebugCapture3dSource[static_cast<size_t>(sourceLine) * 256u],
+                            _3DLine,
+                            256u * sizeof(u32));
+                        HasLastDebugCapture3dSource = true;
                     }
-                    else
-                        val1 = val2;
-                }
 
-                BGOBJLine[i] = val1;
+                    // In accelerated mode compositing is normally done on the GPU, but
+                    // display capture needs source A on CPU for VRAM writes.
+                    for (int i = 0; i < 256; i++)
+                    {
+                        u32 val1 = BGOBJLine[i];
+                        u32 val2 = BGOBJLine[256+i];
+                        u32 val3 = BGOBJLine[512+i];
+
+                        u32 compmode = (val3 >> 24) & 0xF;
+                        const u32 _3dval = _3DLine[i];
+                        if (captureDebugEnabled && (_3dval >> 24) > 0)
+                        {
+                            LastDebugCaptureStats.Opaque3DSourcePixels++;
+                            if ((val1 & 0xFF000000u) == 0x20000000u)
+                                LastDebugCaptureStats.Opaque3DBackdropPixels++;
+                        }
+
+                        if (compmode == 4)
+                        {
+                            // 3D on top, blending
+
+                            if ((_3dval >> 24) > 0)
+                                val1 = ColorBlend5(_3dval, val1);
+                            else
+                                val1 = val2;
+                        }
+                        else if (compmode == 1)
+                        {
+                            // 3D on bottom, blending
+
+                            if ((_3dval >> 24) > 0)
+                            {
+                                u32 eva = (val3 >> 8) & 0x1F;
+                                u32 evb = (val3 >> 16) & 0x1F;
+
+                                val1 = ColorBlend4(val1, _3dval, eva, evb);
+                            }
+                            else
+                                val1 = val2;
+                        }
+                        else if (compmode <= 3)
+                        {
+                            // 3D on top, normal/fade
+
+                            if ((_3dval >> 24) > 0)
+                            {
+                                u32 evy = (val3 >> 8) & 0x1F;
+
+                                val1 = _3dval;
+                                if      (compmode == 2) val1 = ColorBrightnessUp(val1, evy, 0x8);
+                                else if (compmode == 3) val1 = ColorBrightnessDown(val1, evy, 0x7);
+                            }
+                            else
+                                val1 = val2;
+                        }
+
+                        if (logCaptureSamples)
+                        {
+                            for (const CaptureSamplePoint& sample : kCaptureSamplePoints)
+                            {
+                                if (sample.y != sourceLine || sample.x != static_cast<u32>(i))
+                                    continue;
+
+                                const u32 packedWord =
+                                    ((val1 >> 1) & 0x1Fu)
+                                    | (((val1 >> 9) & 0x1Fu) << 5)
+                                    | (((val1 >> 17) & 0x1Fu) << 10)
+                                    | (((val1 >> 24) != 0u) ? 0x8000u : 0u);
+
+                                Platform::Log(
+                                    Platform::LogLevel::Warn,
+                                    "RendererDebug[CaptureLoop]: label=%s line=%u sourceLine=%u x=%u comp=%u raw3d=%08X val1=%08X val2=%08X val3=%08X packed=%08X",
+                                    sample.label,
+                                    line,
+                                    sourceLine,
+                                    static_cast<u32>(i),
+                                    compmode,
+                                    _3dval,
+                                    val1,
+                                    val2,
+                                    val3,
+                                    packedWord
+                                );
+                                break;
+                            }
+                        }
+
+                        BGOBJLine[i] = val1;
+                    }
+                }
             }
         }
     }
@@ -691,6 +834,22 @@ void SoftRenderer::DrawScanlineBGMode7(u32 line)
 
 void SoftRenderer::DrawScanline_BGOBJ(u32 line)
 {
+    struct CaptureSamplePoint
+    {
+        const char* label;
+        u32 x;
+        u32 y;
+    };
+    static constexpr CaptureSamplePoint kCaptureSamplePoints[] = {
+        {"seamA", 85u, 14u},
+        {"goodA", 84u, 14u},
+        {"seamB", 75u, 58u},
+        {"goodB", 74u, 58u},
+        {"seamC", 150u, 81u},
+        {"goodC", 149u, 81u},
+    };
+    const bool logCaptureSamples = MelonDSAndroid::areRendererDebugToolsEnabled();
+
     // forced blank disables BG/OBJ compositing
     if (CurUnit->DispCnt & (1<<7))
     {
@@ -755,9 +914,13 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         {
             for (int i = 0; i < 256; i++)
             {
-                u32 val1 = BGOBJLine[i];
-                u32 val2 = BGOBJLine[256+i];
-                u32 val3 = BGOBJLine[512+i];
+                const u32 originalVal1 = BGOBJLine[i];
+                const u32 originalVal2 = BGOBJLine[256+i];
+                const u32 originalVal3 = BGOBJLine[512+i];
+
+                u32 val1 = originalVal1;
+                u32 val2 = originalVal2;
+                u32 val3 = originalVal3;
 
                 u32 flag1 = val1 >> 24;
                 u32 flag2 = val2 >> 24;
@@ -825,18 +988,71 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
                     BGOBJLine[256+i] = 0;
                     BGOBJLine[512+i] = 0x07000000;
                 }
+
+                if (logCaptureSamples)
+                {
+                    for (const CaptureSamplePoint& sample : kCaptureSamplePoints)
+                    {
+                        if (sample.y != line || sample.x != static_cast<u32>(i))
+                            continue;
+
+                        Platform::Log(
+                            Platform::LogLevel::Warn,
+                            "RendererDebug[BGOBJ]: unit=%u label=%s line=%u x=%u pre0=%08X pre1=%08X pre2=%08X out0=%08X out1=%08X out2=%08X",
+                            CurUnit->Num,
+                            sample.label,
+                            line,
+                            static_cast<u32>(i),
+                            originalVal1,
+                            originalVal2,
+                            originalVal3,
+                            BGOBJLine[i],
+                            BGOBJLine[256+i],
+                            BGOBJLine[512+i]
+                        );
+                        break;
+                    }
+                }
             }
         }
         else
         {
             for (int i = 0; i < 256; i++)
             {
-                u32 val1 = BGOBJLine[i];
-                u32 val2 = BGOBJLine[256+i];
+                const u32 originalVal1 = BGOBJLine[i];
+                const u32 originalVal2 = BGOBJLine[256+i];
+
+                u32 val1 = originalVal1;
+                u32 val2 = originalVal2;
 
                 BGOBJLine[i]     = ColorComposite(i, val1, val2);
                 BGOBJLine[256+i] = 0;
                 BGOBJLine[512+i] = 0x07000000;
+
+                if (logCaptureSamples)
+                {
+                    for (const CaptureSamplePoint& sample : kCaptureSamplePoints)
+                    {
+                        if (sample.y != line || sample.x != static_cast<u32>(i))
+                            continue;
+
+                        Platform::Log(
+                            Platform::LogLevel::Warn,
+                            "RendererDebug[BGOBJ]: unit=%u label=%s line=%u x=%u pre0=%08X pre1=%08X pre2=%08X out0=%08X out1=%08X out2=%08X",
+                            CurUnit->Num,
+                            sample.label,
+                            line,
+                            static_cast<u32>(i),
+                            originalVal1,
+                            originalVal2,
+                            0u,
+                            BGOBJLine[i],
+                            BGOBJLine[256+i],
+                            BGOBJLine[512+i]
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1806,7 +2022,35 @@ void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight,
         {
             if ((u32)rotX < width && (u32)rotY < height)
             {
-                color = *(u16*)&objvram[(pixelsaddr + ((rotY >> 8) * ytilefactor) + ((rotX >> 8) << 1)) & objvrammask];
+                const u32 sampleAddr = (pixelsaddr + ((rotY >> 8) * ytilefactor) + ((rotX >> 8) << 1)) & objvrammask;
+                color = *(u16*)&objvram[sampleAddr];
+
+                const u32 currentLine = (GPU.VCount + 1u) & 0xFFu;
+                if (!window && CurUnit->Num == 1 && MelonDSAndroid::areRendererDebugToolsEnabled())
+                {
+                    if (const RendererDebugSamplePoint* sample = findRendererDebugSamplePoint(static_cast<u32>(xpos), currentLine))
+                    {
+                        Platform::Log(
+                            Platform::LogLevel::Warn,
+                            "RendererDebug[SpriteBitmap]: unit=%u label=%s sprite=%u rotscale=1 line=%u x=%u color=%04X old=%08X pixelattr=%08X pixelsaddr=%u tilenum=%u srcX=%u srcY=%u attr0=%04X attr1=%04X attr2=%04X",
+                            CurUnit->Num,
+                            sample->label,
+                            num,
+                            currentLine,
+                            static_cast<u32>(xpos),
+                            color,
+                            objLine[xpos],
+                            pixelattr,
+                            sampleAddr,
+                            tilenum,
+                            static_cast<u32>(rotX >> 8),
+                            static_cast<u32>(rotY >> 8),
+                            attrib[0],
+                            attrib[1],
+                            attrib[2]
+                        );
+                    }
+                }
 
                 if (color & 0x8000)
                 {
@@ -2022,7 +2266,35 @@ void SoftRenderer::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s
 
         for (; xoff < xend;)
         {
-            color = *(u16*)&objvram[pixelsaddr & objvrammask];
+            const u32 sampleAddr = pixelsaddr & objvrammask;
+            color = *(u16*)&objvram[sampleAddr];
+
+            const u32 currentLine = (GPU.VCount + 1u) & 0xFFu;
+            if (!window && CurUnit->Num == 1 && MelonDSAndroid::areRendererDebugToolsEnabled())
+            {
+                if (const RendererDebugSamplePoint* sample = findRendererDebugSamplePoint(static_cast<u32>(xpos), currentLine))
+                {
+                    Platform::Log(
+                        Platform::LogLevel::Warn,
+                        "RendererDebug[SpriteBitmap]: unit=%u label=%s sprite=%u rotscale=0 line=%u x=%u color=%04X old=%08X pixelattr=%08X pixelsaddr=%u tilenum=%u ypos=%u xoff=%u attr0=%04X attr1=%04X attr2=%04X",
+                        CurUnit->Num,
+                        sample->label,
+                        num,
+                        currentLine,
+                        static_cast<u32>(xpos),
+                        color,
+                        objLine[xpos],
+                        pixelattr,
+                        sampleAddr,
+                        tilenum,
+                        ypos,
+                        xoff,
+                        attrib[0],
+                        attrib[1],
+                        attrib[2]
+                    );
+                }
+            }
 
             pixelsaddr += pixelstride;
 

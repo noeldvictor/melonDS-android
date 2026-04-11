@@ -30,12 +30,27 @@ namespace GPU2D
 class SoftRenderer : public Renderer2D
 {
 public:
+    struct DebugCaptureStats
+    {
+        u32 CaptureLines = 0;
+        u32 CaptureWidth = 0;
+        u32 CaptureMode = 0;
+        u32 CaptureBit24 = 0;
+        u32 Direct3DLines = 0;
+        u32 SourceACompositeLines = 0;
+        u32 Opaque3DSourcePixels = 0;
+        u32 Opaque3DBackdropPixels = 0;
+        u32 CompModeCounts[8] {};
+    };
+
     SoftRenderer(melonDS::GPU& gpu);
     ~SoftRenderer() override {}
 
     void DrawScanline(u32 line, Unit* unit) override;
     void DrawSprites(u32 line, Unit* unit) override;
     void VBlankEnd(Unit* unitA, Unit* unitB) override;
+    [[nodiscard]] const DebugCaptureStats& GetDebugCaptureStats() const noexcept { return LastDebugCaptureStats; }
+    [[nodiscard]] const u32* GetDebugCapture3dSource() const noexcept { return HasLastDebugCapture3dSource ? LastDebugCapture3dSource : nullptr; }
 private:
     melonDS::GPU& GPU;
     alignas(8) u32 BGOBJLine[256*3];
@@ -141,7 +156,11 @@ private:
     template<bool window> void DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos);
     template<bool window> void DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos);
 
-    void DoCapture(u32 line, u32 width);
+    void DoCapture(u32 line, u32 width, u32 sourceLine);
+
+    DebugCaptureStats LastDebugCaptureStats {};
+    bool HasLastDebugCapture3dSource = false;
+    alignas(8) u32 LastDebugCapture3dSource[256 * 192] {};
 };
 
 }

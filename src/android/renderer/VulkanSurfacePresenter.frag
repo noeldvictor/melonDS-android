@@ -1,0 +1,215 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D uTexture;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D u3dImage;
+
+layout(set = 0, binding = 2, std430) readonly buffer TopPackedBuffer
+{
+    uint topPacked[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer BottomPackedBuffer
+{
+    uint bottomPacked[];
+};
+
+layout(push_constant) uniform PresenterPushConstants
+{
+    uint drawMode;
+    uint scale;
+    uint rendererWidth;
+    uint rendererHeight;
+    uint packedStride;
+} pushConstants;
+
+layout(location = 0) in vec2 fragUv;
+layout(location = 1) in float fragAlpha;
+
+layout(location = 0) out vec4 outColor;
+
+struct Rgba6
+{
+    int r;
+    int g;
+    int b;
+    int a;
+};
+
+int clampColor6(int value)
+{
+    return clamp(value, 0, 63);
+}
+
+int toColor8(int value6)
+{
+    int base = clampColor6(value6) << 2;
+    return base | (base >> 6);
+}
+
+Rgba6 unpackColor6(uint packedColor)
+{
+    Rgba6 color;
+    color.r = int(packedColor & 0xFFu);
+    color.g = int((packedColor >> 8u) & 0xFFu);
+    color.b = int((packedColor >> 16u) & 0xFFu);
+    color.a = int((packedColor >> 24u) & 0xFFu);
+    return color;
+}
+
+void applyBrightnessUp(inout Rgba6 color, int evy)
+{
+    color.r = clampColor6(color.r + (((63 - color.r) * evy) >> 4));
+    color.g = clampColor6(color.g + (((63 - color.g) * evy) >> 4));
+    color.b = clampColor6(color.b + (((63 - color.b) * evy) >> 4));
+}
+
+void applyBrightnessDown(inout Rgba6 color, int evy, int roundingBias)
+{
+    color.r = clampColor6(color.r - (((color.r * evy) + roundingBias) >> 4));
+    color.g = clampColor6(color.g - (((color.g * evy) + roundingBias) >> 4));
+    color.b = clampColor6(color.b - (((color.b * evy) + roundingBias) >> 4));
+}
+
+Rgba6 sample3DColor(int x3D, int y3D)
+{
+    Rgba6 zero;
+    zero.r = 0;
+    zero.g = 0;
+    zero.b = 0;
+    zero.a = 0;
+
+    if (x3D < 0 || x3D >= 256 || y3D < 0 || y3D >= 192)
+        return zero;
+
+    uint safeScale = max(pushConstants.scale, 1u);
+    int sampleX = int(min(uint(x3D) * safeScale, pushConstants.rendererWidth - 1u));
+    int sampleY = int(min(uint(y3D) * safeScale, pushConstants.rendererHeight - 1u));
+    vec4 color3d = imageLoad(u3dImage, ivec2(sampleX, sampleY));
+
+    Rgba6 color;
+    color.r = int(clamp(color3d.r * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.g = int(clamp(color3d.g * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.b = int(clamp(color3d.b * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.a = int(clamp(color3d.a * 255.0 + 0.5, 0.0, 255.0)) >> 3;
+    return color;
+}
+
+uint readPacked(bool topScreen, int y, int x)
+{
+    uint offset = uint(y) * pushConstants.packedStride + uint(x);
+    return topScreen ? topPacked[offset] : bottomPacked[offset];
+}
+
+vec4 composeScreenColor(bool topScreen)
+{
+    int sourceX = clamp(int(fragUv.x * 256.0), 0, 255);
+    int sourceY = clamp(int((1.0 - fragUv.y) * 192.0), 0, 191);
+
+    uint masterBrightness = readPacked(topScreen, sourceY, 256 * 3);
+    int displayMode = int((masterBrightness >> 16u) & 0x3u);
+    int brightnessMode = int(((masterBrightness >> 8u) & 0xFFu) >> 6u);
+    int brightnessFactor = min(16, int(masterBrightness & 0x1Fu));
+    int xOffset = int((masterBrightness >> 24u) & 0xFFu)
+        - ((((masterBrightness >> 16u) & 0x80u) != 0u) ? 256 : 0);
+
+    Rgba6 pixel = unpackColor6(readPacked(topScreen, sourceY, sourceX));
+
+    if (displayMode == 1)
+    {
+        Rgba6 val1 = pixel;
+        Rgba6 val2 = unpackColor6(readPacked(topScreen, sourceY, 256 + sourceX));
+        Rgba6 val3 = unpackColor6(readPacked(topScreen, sourceY, 512 + sourceX));
+
+        int compMode = val3.a & 0xF;
+        Rgba6 pixel3D = sample3DColor(sourceX + xOffset, sourceY);
+
+        if (compMode == 4)
+        {
+            if ((pixel3D.a & 0x1F) > 0)
+            {
+                int eva = (pixel3D.a & 0x1F) + 1;
+                int evb = 32 - eva;
+                val1.r = clampColor6(((pixel3D.r * eva) + (val1.r * evb) + 0x10) >> 5);
+                val1.g = clampColor6(((pixel3D.g * eva) + (val1.g * evb) + 0x10) >> 5);
+                val1.b = clampColor6(((pixel3D.b * eva) + (val1.b * evb) + 0x10) >> 5);
+            }
+            else
+            {
+                val1 = val2;
+            }
+        }
+        else if (compMode == 1)
+        {
+            if ((pixel3D.a & 0x1F) > 0)
+            {
+                int eva = val3.g;
+                int evb = val3.b;
+                val1.r = clampColor6(((val1.r * eva) + (pixel3D.r * evb) + 0x8) >> 4);
+                val1.g = clampColor6(((val1.g * eva) + (pixel3D.g * evb) + 0x8) >> 4);
+                val1.b = clampColor6(((val1.b * eva) + (pixel3D.b * evb) + 0x8) >> 4);
+            }
+            else
+            {
+                val1 = val2;
+            }
+        }
+        else if (compMode <= 3)
+        {
+            if ((pixel3D.a & 0x1F) > 0)
+            {
+                val1 = pixel3D;
+                int evy = val3.g;
+                if (compMode == 2)
+                {
+                    val1.r = clampColor6(val1.r + ((((63 - val1.r) * evy) + 0x8) >> 4));
+                    val1.g = clampColor6(val1.g + ((((63 - val1.g) * evy) + 0x8) >> 4));
+                    val1.b = clampColor6(val1.b + ((((63 - val1.b) * evy) + 0x8) >> 4));
+                }
+                else if (compMode == 3)
+                {
+                    applyBrightnessDown(val1, evy, 0x7);
+                }
+            }
+            else
+            {
+                val1 = val2;
+            }
+        }
+
+        pixel = val1;
+    }
+
+    if (displayMode != 0)
+    {
+        if (brightnessMode == 1)
+            applyBrightnessUp(pixel, brightnessFactor);
+        else if (brightnessMode == 2)
+            applyBrightnessDown(pixel, brightnessFactor, 0xF);
+    }
+
+    return vec4(
+        float(toColor8(pixel.r)) * (1.0 / 255.0),
+        float(toColor8(pixel.g)) * (1.0 / 255.0),
+        float(toColor8(pixel.b)) * (1.0 / 255.0),
+        fragAlpha
+    );
+}
+
+void main()
+{
+    if (pushConstants.drawMode == 0u)
+    {
+        vec4 sampledColor = texture(uTexture, fragUv);
+        outColor = vec4(sampledColor.rgb, fragAlpha);
+        return;
+    }
+
+    if (pushConstants.drawMode == 1u)
+    {
+        vec4 sampledColor = texture(uTexture, fragUv);
+        outColor = vec4(sampledColor.bgr, fragAlpha);
+        return;
+    }
+
+    outColor = composeScreenColor(pushConstants.drawMode == 2u);
+}

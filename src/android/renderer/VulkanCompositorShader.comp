@@ -1,0 +1,223 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outImage;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D image3dInput;
+
+layout(set = 0, binding = 2, std430) readonly buffer TopPackedBuffer
+{
+    uint topPacked[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer BottomPackedBuffer
+{
+    uint bottomPacked[];
+};
+
+layout(push_constant) uniform PushConsts
+{
+    uint outputWidth;
+    uint outputHeight;
+    uint scale;
+    uint rendererWidth;
+    uint rendererHeight;
+    uint packedStride;
+} pc;
+
+struct Rgba6
+{
+    int r;
+    int g;
+    int b;
+    int a;
+};
+
+int clampColor6(int value)
+{
+    return clamp(value, 0, 63);
+}
+
+int toColor8(int value6)
+{
+    int base = clampColor6(value6) << 2;
+    return base | (base >> 6);
+}
+
+Rgba6 unpackColor6(uint packedColor)
+{
+    Rgba6 color;
+    color.r = int(packedColor & 0xFFu);
+    color.g = int((packedColor >> 8u) & 0xFFu);
+    color.b = int((packedColor >> 16u) & 0xFFu);
+    color.a = int((packedColor >> 24u) & 0xFFu);
+    return color;
+}
+
+void applyBrightnessUp(inout Rgba6 color, int evy)
+{
+    color.r = clampColor6(color.r + (((63 - color.r) * evy) >> 4));
+    color.g = clampColor6(color.g + (((63 - color.g) * evy) >> 4));
+    color.b = clampColor6(color.b + (((63 - color.b) * evy) >> 4));
+}
+
+void applyBrightnessDown(inout Rgba6 color, int evy, int roundingBias)
+{
+    color.r = clampColor6(color.r - (((color.r * evy) + roundingBias) >> 4));
+    color.g = clampColor6(color.g - (((color.g * evy) + roundingBias) >> 4));
+    color.b = clampColor6(color.b - (((color.b * evy) + roundingBias) >> 4));
+}
+
+Rgba6 sample3DColor(int x3D, int y3D)
+{
+    Rgba6 zero;
+    zero.r = 0;
+    zero.g = 0;
+    zero.b = 0;
+    zero.a = 0;
+
+    if (x3D < 0 || x3D >= 256 || y3D < 0 || y3D >= 192)
+        return zero;
+
+    uint safeScale = max(pc.scale, 1u);
+    int sampleX = int(min(uint(x3D) * safeScale, pc.rendererWidth - 1u));
+    int sampleY = int(min(uint(y3D) * safeScale, pc.rendererHeight - 1u));
+
+    vec4 color3d = imageLoad(image3dInput, ivec2(sampleX, sampleY));
+
+    Rgba6 color;
+    color.r = int(clamp(color3d.r * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.g = int(clamp(color3d.g * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.b = int(clamp(color3d.b * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.a = int(clamp(color3d.a * 255.0 + 0.5, 0.0, 255.0)) >> 3;
+    return color;
+}
+
+uint readPacked(bool topScreen, int y, int x)
+{
+    uint offset = uint(y) * pc.packedStride + uint(x);
+    return topScreen ? topPacked[offset] : bottomPacked[offset];
+}
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.outputWidth || gid.y >= pc.outputHeight)
+        return;
+
+    uint safeScale = max(pc.scale, 1u);
+    int sourceY = int(gid.y / safeScale);
+    bool isTopScreen = sourceY < 192;
+    bool isBottomScreen = sourceY >= 194 && sourceY < 386;
+
+    if (!isTopScreen && !isBottomScreen)
+    {
+        imageStore(outImage, ivec2(gid), vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    int sourceX = int(gid.x / safeScale);
+    if (sourceX < 0 || sourceX >= 256)
+    {
+        imageStore(outImage, ivec2(gid), vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    int dsY = isTopScreen ? sourceY : (sourceY - 194);
+    bool topScreen = isTopScreen;
+
+    uint masterBrightness = readPacked(topScreen, dsY, 256 * 3);
+    int displayMode = int((masterBrightness >> 16u) & 0x3u);
+    int brightnessMode = int(((masterBrightness >> 8u) & 0xFFu) >> 6u);
+    int brightnessFactor = min(16, int(masterBrightness & 0x1Fu));
+    int xOffset = int((masterBrightness >> 24u) & 0xFFu)
+        - ((((masterBrightness >> 16u) & 0x80u) != 0u) ? 256 : 0);
+
+    Rgba6 pixel = unpackColor6(readPacked(topScreen, dsY, sourceX));
+
+    if (displayMode == 1)
+    {
+        Rgba6 val1 = pixel;
+        Rgba6 val2 = unpackColor6(readPacked(topScreen, dsY, 256 + sourceX));
+        Rgba6 val3 = unpackColor6(readPacked(topScreen, dsY, 512 + sourceX));
+
+        int compMode = val3.a & 0xF;
+        int y3D = dsY;
+        int x3D = sourceX + xOffset;
+        Rgba6 pixel3D = sample3DColor(x3D, y3D);
+
+        if (compMode == 4)
+        {
+            if ((pixel3D.a & 0x1F) > 0)
+            {
+                int eva = (pixel3D.a & 0x1F) + 1;
+                int evb = 32 - eva;
+                val1.r = clampColor6(((pixel3D.r * eva) + (val1.r * evb) + 0x10) >> 5);
+                val1.g = clampColor6(((pixel3D.g * eva) + (val1.g * evb) + 0x10) >> 5);
+                val1.b = clampColor6(((pixel3D.b * eva) + (val1.b * evb) + 0x10) >> 5);
+            }
+            else
+            {
+                val1 = val2;
+            }
+        }
+        else if (compMode == 1)
+        {
+            if ((pixel3D.a & 0x1F) > 0)
+            {
+                int eva = val3.g;
+                int evb = val3.b;
+                val1.r = clampColor6(((val1.r * eva) + (pixel3D.r * evb) + 0x8) >> 4);
+                val1.g = clampColor6(((val1.g * eva) + (pixel3D.g * evb) + 0x8) >> 4);
+                val1.b = clampColor6(((val1.b * eva) + (pixel3D.b * evb) + 0x8) >> 4);
+            }
+            else
+            {
+                val1 = val2;
+            }
+        }
+        else if (compMode <= 3)
+        {
+            if ((pixel3D.a & 0x1F) > 0)
+            {
+                val1 = pixel3D;
+                int evy = val3.g;
+                if (compMode == 2)
+                {
+                    val1.r = clampColor6(val1.r + ((((63 - val1.r) * evy) + 0x8) >> 4));
+                    val1.g = clampColor6(val1.g + ((((63 - val1.g) * evy) + 0x8) >> 4));
+                    val1.b = clampColor6(val1.b + ((((63 - val1.b) * evy) + 0x8) >> 4));
+                }
+                else if (compMode == 3)
+                {
+                    applyBrightnessDown(val1, evy, 0x7);
+                }
+            }
+            else
+            {
+                val1 = val2;
+            }
+        }
+
+        pixel = val1;
+    }
+
+    if (displayMode != 0)
+    {
+        if (brightnessMode == 1)
+            applyBrightnessUp(pixel, brightnessFactor);
+        else if (brightnessMode == 2)
+            applyBrightnessDown(pixel, brightnessFactor, 0xF);
+    }
+
+    int r = toColor8(pixel.r);
+    int g = toColor8(pixel.g);
+    int b = toColor8(pixel.b);
+
+    // Keep compatibility with current texture color channel packing (BGR in RGBA slots).
+    imageStore(
+        outImage,
+        ivec2(gid),
+        vec4(float(b) * (1.0 / 255.0), float(g) * (1.0 / 255.0), float(r) * (1.0 / 255.0), 1.0)
+    );
+}

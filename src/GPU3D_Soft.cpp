@@ -26,6 +26,21 @@
 
 namespace melonDS
 {
+namespace
+{
+u32 PackColor6A5ToRgba8(u32 color)
+{
+    const u32 r6 = color & 0x3Fu;
+    const u32 g6 = (color >> 8) & 0x3Fu;
+    const u32 b6 = (color >> 16) & 0x3Fu;
+    const u32 a5 = (color >> 24) & 0x1Fu;
+    const u32 r8 = (r6 << 2) | (r6 >> 4);
+    const u32 g8 = (g6 << 2) | (g6 >> 4);
+    const u32 b8 = (b6 << 2) | (b6 >> 4);
+    const u32 a8 = (a5 << 3) | (a5 >> 2);
+    return r8 | (g8 << 8) | (b8 << 16) | (a8 << 24);
+}
+}
 
 void RenderThreadFunc();
 
@@ -1813,6 +1828,61 @@ u32* SoftRenderer::GetLine(int line)
     }
 
     return &ColorBuffer[(line * ScanlineWidth) + FirstPixelOffset];
+}
+
+std::vector<u32> SoftRenderer::CaptureColorTargetForDebug() const
+{
+    std::vector<u32> pixels(static_cast<size_t>(GetColorTargetWidth()) * static_cast<size_t>(GetColorTargetHeight()));
+    for (u32 y = 0; y < GetColorTargetHeight(); y++)
+    {
+        const size_t dstRowOffset = static_cast<size_t>(y) * static_cast<size_t>(GetColorTargetWidth());
+        const size_t srcRowOffset = static_cast<size_t>(FirstPixelOffset) + static_cast<size_t>(y) * static_cast<size_t>(ScanlineWidth);
+        for (u32 x = 0; x < GetColorTargetWidth(); x++)
+            pixels[dstRowOffset + x] = PackColor6A5ToRgba8(ColorBuffer[srcRowOffset + x]);
+    }
+    return pixels;
+}
+
+std::vector<u32> SoftRenderer::CaptureTopDepthForDebug() const
+{
+    std::vector<u32> depth(static_cast<size_t>(GetColorTargetWidth()) * static_cast<size_t>(GetColorTargetHeight()));
+    for (u32 y = 0; y < GetColorTargetHeight(); y++)
+    {
+        const size_t dstRowOffset = static_cast<size_t>(y) * static_cast<size_t>(GetColorTargetWidth());
+        const size_t srcRowOffset = static_cast<size_t>(FirstPixelOffset) + static_cast<size_t>(y) * static_cast<size_t>(ScanlineWidth);
+        std::memcpy(
+            depth.data() + dstRowOffset,
+            DepthBuffer + srcRowOffset,
+            static_cast<size_t>(GetColorTargetWidth()) * sizeof(u32));
+    }
+    return depth;
+}
+
+std::vector<u32> SoftRenderer::CaptureTopAttrForDebug() const
+{
+    std::vector<u32> attr(static_cast<size_t>(GetColorTargetWidth()) * static_cast<size_t>(GetColorTargetHeight()));
+    for (u32 y = 0; y < GetColorTargetHeight(); y++)
+    {
+        const size_t dstRowOffset = static_cast<size_t>(y) * static_cast<size_t>(GetColorTargetWidth());
+        const size_t srcRowOffset = static_cast<size_t>(FirstPixelOffset) + static_cast<size_t>(y) * static_cast<size_t>(ScanlineWidth);
+        std::memcpy(
+            attr.data() + dstRowOffset,
+            AttrBuffer + srcRowOffset,
+            static_cast<size_t>(GetColorTargetWidth()) * sizeof(u32));
+    }
+    return attr;
+}
+
+std::vector<u32> SoftRenderer::CaptureTopCoverageForDebug() const
+{
+    const std::vector<u32> topAttr = CaptureTopAttrForDebug();
+    if (topAttr.empty())
+        return {};
+
+    std::vector<u32> coverage(topAttr.size(), 0u);
+    for (size_t i = 0; i < topAttr.size(); i++)
+        coverage[i] = (topAttr[i] >> 8) & 0x1Fu;
+    return coverage;
 }
 
 }

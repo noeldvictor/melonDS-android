@@ -2,6 +2,7 @@
 #define MELONEVENTMESSENGER_H
 
 #include <Platform.h>
+#include "renderer/Renderer.h"
 
 namespace MelonDSAndroid
 {
@@ -21,6 +22,8 @@ public:
     virtual void onRumbleStart(int durationMs) = 0;
     virtual void onRumbleStop() = 0;
     virtual void onEmulatorStop(melonDS::Platform::StopReason reason) = 0;
+    virtual void onRendererInitFailed(Renderer renderer) = 0;
+    virtual void onVulkanCompileProgress(int stageId, int current, int total) {}
 
     virtual void onAchievementPrimed(long achievementId) = 0;
     virtual void onAchievementTriggered(long achievementId) = 0;

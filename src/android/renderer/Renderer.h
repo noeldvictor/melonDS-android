@@ -7,7 +7,8 @@ namespace MelonDSAndroid
 enum class Renderer {
     Software = 0,
     OpenGl = 1,
-    Compute = 2
+    Vulkan = 2,
+    Compute = 3
 };
 
 }
