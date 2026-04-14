@@ -18,15 +18,15 @@ constexpr std::array<const char*, 2> kRequiredInstanceExtensions = {
     VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
 };
 
-constexpr std::array<const char*, 3> kRequiredDeviceExtensions = {
+constexpr std::array<const char*, 1> kRequiredDeviceExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-    VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
 };
 
 constexpr const char* kTimelineSemaphoreExtension = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
 constexpr const char* kDescriptorIndexingExtension = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME;
 constexpr const char* kOptionalHostQueryResetExtension = VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME;
+constexpr const char* kOptionalExternalMemoryExtension = VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME;
+constexpr const char* kOptionalAndroidHardwareBufferExtension = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
 constexpr const char* kOptionalDebugUtilsExtension = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
 constexpr const char* kValidationLayerName = "VK_LAYER_KHRONOS_validation";
 
@@ -294,6 +294,7 @@ bool VulkanContext::initializeLocked()
     std::vector<VkPhysicalDevice> physicalDevices(physicalDeviceCount);
     vkEnumeratePhysicalDevices(Instance, &physicalDeviceCount, physicalDevices.data());
 
+    bool ahbInteropRequested = false;
     for (VkPhysicalDevice candidate : physicalDevices)
     {
         u32 deviceExtensionCount = 0;
@@ -334,6 +335,34 @@ bool VulkanContext::initializeLocked()
             continue;
 
         std::vector<const char*> enabledDeviceExtensions(requiredDeviceExtensions.begin(), requiredDeviceExtensions.end());
+        const bool hasExternalMemoryExtension = hasExtension(kOptionalExternalMemoryExtension, deviceExtensions);
+        const bool hasAndroidHardwareBufferExtension = hasExtension(kOptionalAndroidHardwareBufferExtension, deviceExtensions);
+        bool enableAhbInterop = false;
+        if (hasExternalMemoryExtension && hasAndroidHardwareBufferExtension)
+        {
+            enabledDeviceExtensions.push_back(kOptionalExternalMemoryExtension);
+            enabledDeviceExtensions.push_back(kOptionalAndroidHardwareBufferExtension);
+            enableAhbInterop = true;
+        }
+        else if (hasAndroidHardwareBufferExtension && !hasExternalMemoryExtension)
+        {
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "VulkanContext: device '%s' reports %s without %s; disabling AndroidHardwareBuffer interop",
+                deviceProperties.deviceName,
+                kOptionalAndroidHardwareBufferExtension,
+                kOptionalExternalMemoryExtension
+            );
+        }
+        else if (!hasAndroidHardwareBufferExtension)
+        {
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "VulkanContext: device '%s' missing optional extension %s; continuing without AndroidHardwareBuffer interop",
+                deviceProperties.deviceName,
+                kOptionalAndroidHardwareBufferExtension
+            );
+        }
         const bool hasHostQueryReset = hasExtension(kOptionalHostQueryResetExtension, deviceExtensions);
         if (hasHostQueryReset)
             enabledDeviceExtensions.push_back(kOptionalHostQueryResetExtension);
@@ -546,15 +575,17 @@ bool VulkanContext::initializeLocked()
         }
         Platform::Log(
             Platform::LogLevel::Warn,
-            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d g52=%d nonUniformTextures=%d)",
+            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d g52=%d nonUniformTextures=%d ahbInterop=%d)",
             deviceProperties.deviceName,
             deviceProperties.vendorID,
             deviceProperties.deviceID,
             DeviceProfile.IsAdreno ? 1 : 0,
             DeviceProfile.IsArmMali ? 1 : 0,
             DeviceProfile.IsMaliG52Class ? 1 : 0,
-            NonUniformTextureIndexingSupported ? 1 : 0
+            NonUniformTextureIndexingSupported ? 1 : 0,
+            enableAhbInterop ? 1 : 0
         );
+        ahbInteropRequested = enableAhbInterop;
         break;
     }
 
@@ -568,11 +599,12 @@ bool VulkanContext::initializeLocked()
     AhbProperties = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
         vkGetDeviceProcAddr(Device, "vkGetAndroidHardwareBufferPropertiesANDROID")
     );
-    if (AhbProperties == nullptr)
+    if (AhbProperties == nullptr && ahbInteropRequested)
     {
-        Platform::Log(Platform::LogLevel::Error, "VulkanContext: vkGetAndroidHardwareBufferPropertiesANDROID unavailable");
-        shutdownLocked();
-        return false;
+        Platform::Log(
+            Platform::LogLevel::Warn,
+            "VulkanContext: optional proc vkGetAndroidHardwareBufferPropertiesANDROID unavailable; continuing without AndroidHardwareBuffer interop"
+        );
     }
 
     WaitSemaphores = reinterpret_cast<PFN_vkWaitSemaphoresKHR>(
