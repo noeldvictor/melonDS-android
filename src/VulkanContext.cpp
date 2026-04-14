@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstring>
 #include <string>
@@ -29,6 +30,8 @@ constexpr const char* kOptionalExternalMemoryExtension = VK_KHR_EXTERNAL_MEMORY_
 constexpr const char* kOptionalAndroidHardwareBufferExtension = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
 constexpr const char* kOptionalDebugUtilsExtension = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
 constexpr const char* kValidationLayerName = "VK_LAYER_KHRONOS_validation";
+std::atomic<bool> gForceDisableTimelineSemaphores{false};
+std::atomic<bool> gForceDisableDynamicTextureIndexing{false};
 
 bool hasExtension(const char* extensionName, const std::vector<VkExtensionProperties>& extensions)
 {
@@ -171,6 +174,9 @@ bool VulkanContext::IsReady() const
 
 bool VulkanContext::initializeLocked()
 {
+    ForceDisableTimelineSemaphores = gForceDisableTimelineSemaphores.load(std::memory_order_relaxed);
+    ForceDisableDynamicTextureIndexing = gForceDisableDynamicTextureIndexing.load(std::memory_order_relaxed);
+
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "melonDS-android";
@@ -312,8 +318,6 @@ bool VulkanContext::initializeLocked()
         std::vector<const char*> requiredDeviceExtensions(
             kRequiredDeviceExtensions.begin(),
             kRequiredDeviceExtensions.end());
-        if (!apiAtLeast12)
-            requiredDeviceExtensions.push_back(kTimelineSemaphoreExtension);
 
         bool hasRequiredExtensions = true;
         for (const char* requiredExtension : requiredDeviceExtensions)
@@ -434,35 +438,83 @@ bool VulkanContext::initializeLocked()
             vkGetPhysicalDeviceFeatures(candidate, &deviceFeatures2.features);
         }
 
-        if (timelineFeaturesAvailable.timelineSemaphore != VK_TRUE)
+        const bool timelineFeatureAvailable = timelineFeaturesAvailable.timelineSemaphore == VK_TRUE;
+        const bool timelineExtensionAvailable = apiAtLeast12 || hasExtension(kTimelineSemaphoreExtension, deviceExtensions);
+        const bool enableTimelineSemaphores =
+            !ForceDisableTimelineSemaphores && timelineFeatureAvailable && timelineExtensionAvailable;
+        if (!enableTimelineSemaphores)
         {
-            Platform::Log(
-                Platform::LogLevel::Warn,
-                "VulkanContext: device '%s' missing feature timelineSemaphore",
-                deviceProperties.deviceName
-            );
-            continue;
+            if (ForceDisableTimelineSemaphores)
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanContext: forcing timeline semaphore fallback on '%s'",
+                    deviceProperties.deviceName
+                );
+            }
+            else if (!timelineFeatureAvailable)
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanContext: device '%s' missing feature timelineSemaphore; using fence-based sync fallback",
+                    deviceProperties.deviceName
+                );
+            }
+            else
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanContext: device '%s' missing extension %s for timeline semaphores; using fence-based sync fallback",
+                    deviceProperties.deviceName,
+                    kTimelineSemaphoreExtension
+                );
+            }
         }
 
-        if (deviceFeatures2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE)
+        const bool dynamicTextureIndexingFeatureAvailable =
+            deviceFeatures2.features.shaderSampledImageArrayDynamicIndexing == VK_TRUE;
+        const bool enableDynamicTextureIndexing =
+            !ForceDisableDynamicTextureIndexing && dynamicTextureIndexingFeatureAvailable;
+        if (!enableDynamicTextureIndexing)
         {
-            Platform::Log(
-                Platform::LogLevel::Warn,
-                "VulkanContext: device '%s' missing feature shaderSampledImageArrayDynamicIndexing",
-                deviceProperties.deviceName
-            );
-            continue;
+            if (ForceDisableDynamicTextureIndexing)
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanContext: forcing dynamic-indexing fallback on '%s'",
+                    deviceProperties.deviceName
+                );
+            }
+            else
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanContext: device '%s' missing feature shaderSampledImageArrayDynamicIndexing; using single-descriptor texture fallback",
+                    deviceProperties.deviceName
+                );
+            }
         }
 
         const bool descriptorFeatureAvailable =
             descriptorIndexingFeaturesAvailable.shaderSampledImageArrayNonUniformIndexing == VK_TRUE;
         const bool descriptorIndexingExtensionAvailable =
             apiAtLeast12 || hasExtension(kDescriptorIndexingExtension, deviceExtensions);
-        const bool enableDescriptorIndexing = descriptorFeatureAvailable && descriptorIndexingExtensionAvailable;
+        const bool enableDescriptorIndexing =
+            enableDynamicTextureIndexing
+            && descriptorFeatureAvailable
+            && descriptorIndexingExtensionAvailable;
 
         if (!enableDescriptorIndexing)
         {
-            if (!descriptorFeatureAvailable)
+            if (!enableDynamicTextureIndexing)
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanContext: device '%s' using single-descriptor texture fallback (dynamic indexing disabled)",
+                    deviceProperties.deviceName
+                );
+            }
+            else if (!descriptorFeatureAvailable)
             {
                 Platform::Log(
                     Platform::LogLevel::Warn,
@@ -487,7 +539,7 @@ bool VulkanContext::initializeLocked()
 
         VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures{};
         timelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-        timelineFeatures.timelineSemaphore = VK_TRUE;
+        timelineFeatures.timelineSemaphore = enableTimelineSemaphores ? VK_TRUE : VK_FALSE;
 
         VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexingFeatures{};
         descriptorIndexingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
@@ -500,7 +552,9 @@ bool VulkanContext::initializeLocked()
         const bool enableHostQueryReset = hasHostQueryReset && hostQueryResetFeaturesAvailable.hostQueryReset == VK_TRUE;
         hostQueryResetFeatures.hostQueryReset = enableHostQueryReset ? VK_TRUE : VK_FALSE;
 
-        void* featureChainHead = static_cast<void*>(&timelineFeatures);
+        void* featureChainHead = nullptr;
+        if (enableTimelineSemaphores)
+            featureChainHead = static_cast<void*>(&timelineFeatures);
         if (enableDescriptorIndexing)
         {
             descriptorIndexingFeatures.pNext = featureChainHead;
@@ -511,6 +565,9 @@ bool VulkanContext::initializeLocked()
             hostQueryResetFeatures.pNext = featureChainHead;
             featureChainHead = static_cast<void*>(&hostQueryResetFeatures);
         }
+
+        if (enableTimelineSemaphores && !apiAtLeast12)
+            enabledDeviceExtensions.push_back(kTimelineSemaphoreExtension);
 
         float queuePriority = 1.0f;
         VkDeviceQueueCreateInfo queueCreateInfo{};
@@ -544,6 +601,8 @@ bool VulkanContext::initializeLocked()
         vkGetDeviceQueue(Device, QueueFamilyIndex, 0, &Queue);
         TimestampPeriod = deviceProperties.limits.timestampPeriod;
         TimestampQueriesSupported = queueSupportsTimestamps;
+        TimelineSemaphoresSupported = enableTimelineSemaphores;
+        DynamicTextureIndexingSupported = enableDynamicTextureIndexing;
         DeviceProfile = makeDeviceProfile(deviceProperties);
         // Adreno 740 can sustain the non-uniform path in simple scenes, but display-capture
         // workloads have shown intermittent VK_ERROR_DEVICE_LOST with the textured raster path.
@@ -575,15 +634,19 @@ bool VulkanContext::initializeLocked()
         }
         Platform::Log(
             Platform::LogLevel::Warn,
-            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d g52=%d nonUniformTextures=%d ahbInterop=%d)",
+            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d g52=%d timeline=%d dynamicIndexing=%d nonUniformTextures=%d ahbInterop=%d forceTimelineOff=%d forceDynamicOff=%d)",
             deviceProperties.deviceName,
             deviceProperties.vendorID,
             deviceProperties.deviceID,
             DeviceProfile.IsAdreno ? 1 : 0,
             DeviceProfile.IsArmMali ? 1 : 0,
             DeviceProfile.IsMaliG52Class ? 1 : 0,
+            TimelineSemaphoresSupported ? 1 : 0,
+            DynamicTextureIndexingSupported ? 1 : 0,
             NonUniformTextureIndexingSupported ? 1 : 0,
-            enableAhbInterop ? 1 : 0
+            enableAhbInterop ? 1 : 0,
+            ForceDisableTimelineSemaphores ? 1 : 0,
+            ForceDisableDynamicTextureIndexing ? 1 : 0
         );
         ahbInteropRequested = enableAhbInterop;
         break;
@@ -674,7 +737,11 @@ void VulkanContext::shutdownLocked()
     ResetQueryPool = nullptr;
     TimestampPeriod = 0.0f;
     TimestampQueriesSupported = false;
+    TimelineSemaphoresSupported = false;
+    DynamicTextureIndexingSupported = false;
     NonUniformTextureIndexingSupported = false;
+    ForceDisableTimelineSemaphores = false;
+    ForceDisableDynamicTextureIndexing = false;
     DeviceProfile = VulkanDeviceProfile{};
 }
 
@@ -696,6 +763,12 @@ u32 VulkanContext::FindMemoryType(u32 typeBits, VkMemoryPropertyFlags properties
     }
 
     return UINT32_MAX;
+}
+
+void VulkanContext::SetCompatibilityOverrides(bool disableTimelineSemaphores, bool disableDynamicTextureIndexing)
+{
+    gForceDisableTimelineSemaphores.store(disableTimelineSemaphores, std::memory_order_relaxed);
+    gForceDisableDynamicTextureIndexing.store(disableDynamicTextureIndexing, std::memory_order_relaxed);
 }
 
 }

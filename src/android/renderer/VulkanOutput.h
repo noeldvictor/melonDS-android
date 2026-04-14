@@ -122,7 +122,7 @@ private:
         u32 snapshotWidth{};
         u32 snapshotHeight{};
 
-        u64 timelineValue{};
+        u64 submissionValue{};
         u32 width{};
         u32 height{};
         bool screenSwap{};
@@ -180,6 +180,7 @@ private:
 
     VkSemaphore timelineSemaphore{VK_NULL_HANDLE};
     u64 timelineValue{};
+    bool useTimelineSemaphores{};
 
     PFN_vkWaitSemaphoresKHR waitSemaphores{};
     PFN_vkGetSemaphoreCounterValueKHR getSemaphoreCounterValue{};

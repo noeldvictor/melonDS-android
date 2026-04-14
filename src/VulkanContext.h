@@ -48,9 +48,14 @@ public:
     PFN_vkWaitSemaphoresKHR GetWaitSemaphores() const { return WaitSemaphores; }
     PFN_vkGetSemaphoreCounterValueKHR GetSemaphoreCounterValue() const { return GetSemaphoreCounterValueFn; }
     PFN_vkResetQueryPoolEXT GetResetQueryPool() const { return ResetQueryPool; }
+    bool SupportsTimelineSemaphores() const { return TimelineSemaphoresSupported; }
+    bool SupportsDynamicTextureIndexing() const { return DynamicTextureIndexingSupported; }
     bool SupportsNonUniformTextureIndexing() const { return NonUniformTextureIndexingSupported; }
+    bool IsTimelineSemaphoreForcedOff() const { return ForceDisableTimelineSemaphores; }
+    bool IsDynamicTextureIndexingForcedOff() const { return ForceDisableDynamicTextureIndexing; }
 
     u32 FindMemoryType(u32 typeBits, VkMemoryPropertyFlags properties) const;
+    static void SetCompatibilityOverrides(bool disableTimelineSemaphores, bool disableDynamicTextureIndexing);
 
 private:
     VulkanContext() = default;
@@ -77,7 +82,11 @@ private:
     PFN_vkResetQueryPoolEXT ResetQueryPool = nullptr;
     float TimestampPeriod = 0.0f;
     bool TimestampQueriesSupported = false;
+    bool TimelineSemaphoresSupported = false;
+    bool DynamicTextureIndexingSupported = false;
     bool NonUniformTextureIndexingSupported = false;
+    bool ForceDisableTimelineSemaphores = false;
+    bool ForceDisableDynamicTextureIndexing = false;
     VulkanDeviceProfile DeviceProfile{};
 };
 

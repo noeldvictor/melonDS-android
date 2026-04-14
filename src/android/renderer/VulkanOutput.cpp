@@ -85,11 +85,23 @@ bool VulkanOutput::init()
     device = melonDS::VulkanContext::Get().GetDevice();
     queue = melonDS::VulkanContext::Get().GetQueue();
     queueFamilyIndex = melonDS::VulkanContext::Get().GetQueueFamilyIndex();
-    waitSemaphores = melonDS::VulkanContext::Get().GetWaitSemaphores();
-    getSemaphoreCounterValue = melonDS::VulkanContext::Get().GetSemaphoreCounterValue();
+    useTimelineSemaphores = melonDS::VulkanContext::Get().SupportsTimelineSemaphores();
+    waitSemaphores = useTimelineSemaphores ? melonDS::VulkanContext::Get().GetWaitSemaphores() : nullptr;
+    getSemaphoreCounterValue = useTimelineSemaphores ? melonDS::VulkanContext::Get().GetSemaphoreCounterValue() : nullptr;
     resetQueryPool = melonDS::VulkanContext::Get().GetResetQueryPool();
     timestampPeriodNs = melonDS::VulkanContext::Get().GetTimestampPeriod();
     timestampQueriesSupported = melonDS::VulkanContext::Get().SupportsTimestamps();
+
+    if (useTimelineSemaphores && (waitSemaphores == nullptr || getSemaphoreCounterValue == nullptr))
+    {
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "VulkanOutput: timeline semaphore support reported but required functions are unavailable; using fence-based fallback"
+        );
+        useTimelineSemaphores = false;
+        waitSemaphores = nullptr;
+        getSemaphoreCounterValue = nullptr;
+    }
 
     if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE)
     {
@@ -106,6 +118,11 @@ bool VulkanOutput::init()
 
     initialized = true;
     timelineValue = 0;
+    melonDS::Platform::Log(
+        melonDS::Platform::LogLevel::Warn,
+        "VulkanOutput: sync path initialized (timeline=%d)",
+        useTimelineSemaphores ? 1 : 0
+    );
     return true;
 }
 
@@ -146,11 +163,15 @@ void VulkanOutput::shutdown()
     timestampPeriodNs = 0.0f;
     timestampQueriesSupported = false;
     timelineValue = 0;
+    useTimelineSemaphores = false;
     initialized = false;
 }
 
 bool VulkanOutput::createSyncObjects()
 {
+    if (!useTimelineSemaphores)
+        return true;
+
     VkSemaphoreTypeCreateInfo semaphoreTypeInfo{};
     semaphoreTypeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
     semaphoreTypeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -667,7 +688,7 @@ bool VulkanOutput::createFrameResource(Frame* frame, u32 width, u32 height)
     resource.renderer3dSnapshotMemory = VK_NULL_HANDLE;
     resource.snapshotWidth = 0;
     resource.snapshotHeight = 0;
-    resource.timelineValue = 0;
+    resource.submissionValue = 0;
     resource.width = width;
     resource.height = height;
     resource.hasContent = false;
@@ -822,18 +843,22 @@ bool VulkanOutput::submitFrameCommand(Frame* frame, FrameResource& resource, boo
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &resource.commandBuffer;
 
-    u64 signalValue = resource.timelineValue;
+    u64 signalValue = resource.submissionValue;
     VkTimelineSemaphoreSubmitInfo timelineSubmitInfo{};
+    const bool shouldSignalTimelineSemaphore = signalTimeline && useTimelineSemaphores && timelineSemaphore != VK_NULL_HANDLE;
     if (signalTimeline)
     {
         signalValue = ++timelineValue;
-        timelineSubmitInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timelineSubmitInfo.signalSemaphoreValueCount = 1;
-        timelineSubmitInfo.pSignalSemaphoreValues = &signalValue;
+        if (shouldSignalTimelineSemaphore)
+        {
+            timelineSubmitInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+            timelineSubmitInfo.signalSemaphoreValueCount = 1;
+            timelineSubmitInfo.pSignalSemaphoreValues = &signalValue;
 
-        submitInfo.pNext = &timelineSubmitInfo;
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &timelineSemaphore;
+            submitInfo.pNext = &timelineSubmitInfo;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &timelineSemaphore;
+        }
     }
 
     {
@@ -850,7 +875,7 @@ bool VulkanOutput::submitFrameCommand(Frame* frame, FrameResource& resource, boo
     }
 
     if (signalTimeline)
-        resource.timelineValue = signalValue;
+        resource.submissionValue = signalValue;
 
     if (signalTimeline && resource.timestampQueryPool != VK_NULL_HANDLE)
         resource.timestampPending = true;
@@ -1654,7 +1679,7 @@ bool VulkanOutput::waitForFrame(const Frame* frame, u64 timeoutNs)
     const u64 waitStartNs = PerfNowNs();
     bool waitSucceeded = false;
 
-    if (waitSemaphores != nullptr)
+    if (useTimelineSemaphores && waitSemaphores != nullptr && timelineSemaphore != VK_NULL_HANDLE)
     {
         VkSemaphoreWaitInfo waitInfo{};
         waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
@@ -1746,7 +1771,7 @@ bool VulkanOutput::isFrameReady(const Frame* frame) const
     if (frame->renderTimelineValue == 0)
         return false;
 
-    if (getSemaphoreCounterValue != nullptr && timelineSemaphore != VK_NULL_HANDLE)
+    if (useTimelineSemaphores && getSemaphoreCounterValue != nullptr && timelineSemaphore != VK_NULL_HANDLE)
     {
         u64 completedValue = 0;
         if (getSemaphoreCounterValue(device, timelineSemaphore, &completedValue) == VK_SUCCESS)

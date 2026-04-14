@@ -101,6 +101,13 @@ private:
         LegacyWorklist = 1,
     };
 
+    enum class TextureSamplingPath : u8
+    {
+        BaseSingleDescriptor = 0,
+        CompatDynamicUniform = 1,
+        NonUniform = 2,
+    };
+
     struct DescriptorSetCache
     {
         bool Ready = false;
@@ -124,6 +131,7 @@ private:
         VkCommandBuffer CommandBuffer = VK_NULL_HANDLE;
         VkFence FrameFence = VK_NULL_HANDLE;
         VkDescriptorSet DescriptorSet = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, MaxTextureDescriptors> SingleTextureDescriptorSets{};
         VkBuffer TriangleBuffer = VK_NULL_HANDLE;
         VkDeviceMemory TriangleMemory = VK_NULL_HANDLE;
         VkDeviceSize TriangleBufferSize = 0;
@@ -155,6 +163,7 @@ private:
         VkQueryPool TimestampQueryPool = VK_NULL_HANDLE;
         bool TimestampPending = false;
         DescriptorSetCache DescriptorCache{};
+        std::array<DescriptorSetCache, MaxTextureDescriptors> SingleTextureDescriptorCaches{};
     };
 
     struct RasterPushConstants
@@ -238,9 +247,9 @@ private:
     bool createTimestampQueryPool(VkQueryPool& queryPool);
     bool createDescriptorObjects();
     bool createComputePipeline();
-    bool createPipelineCache(bool useNonUniformTextureIndexing);
+    bool createPipelineCache(TextureSamplingPath samplingPath);
     void savePipelineCache();
-    std::string buildPipelineCacheFileName(bool useNonUniformTextureIndexing) const;
+    std::string buildPipelineCacheFileName(TextureSamplingPath samplingPath) const;
 
     bool ensureRenderTarget(u32 width, u32 height);
     void destroyRenderTarget();
@@ -280,11 +289,16 @@ private:
     bool createResultReadbackBuffer();
     void destroyResultReadbackBuffer();
 
-    void updateDescriptorSet(RenderContext* context);
+    void updateDescriptorSet(RenderContext* context, u32 singleTextureDescriptorIndex = FallbackTextureDescriptorIndex);
     static bool descriptorImageInfoEquals(const VkDescriptorImageInfo& lhs, const VkDescriptorImageInfo& rhs);
-    DescriptorSetCache& getDescriptorSetCache(RenderContext* context);
+    VkDescriptorSet getDescriptorSet(RenderContext* context, u32 singleTextureDescriptorIndex) const;
+    DescriptorSetCache& getDescriptorSetCache(RenderContext* context, u32 singleTextureDescriptorIndex);
     void invalidateDescriptorSetCache(RenderContext* context);
     void invalidateAllDescriptorSetCaches();
+    [[nodiscard]] bool usesSingleDescriptorTexturePath() const noexcept;
+    [[nodiscard]] u32 getTextureBindingDescriptorCount() const noexcept;
+    [[nodiscard]] TextureSamplingPath resolveTextureSamplingPath() const noexcept;
+    [[nodiscard]] static const char* textureSamplingPathName(TextureSamplingPath path) noexcept;
     u32 findMemoryType(u32 typeBits, VkMemoryPropertyFlags properties) const;
     bool tryAcquireRenderContext(RenderContext& context, bool countMisses = true);
     bool waitForRenderContext(RenderContext& context);
@@ -357,7 +371,10 @@ private:
     VkDescriptorSetLayout DescriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool DescriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet DescriptorSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, MaxTextureDescriptors> SingleTextureDescriptorSets{};
     DescriptorSetCache DescriptorCache{};
+    std::array<DescriptorSetCache, MaxTextureDescriptors> SingleTextureDescriptorCaches{};
+    TextureSamplingPath ActiveTextureSamplingPath = TextureSamplingPath::CompatDynamicUniform;
     VkPipelineLayout PipelineLayout = VK_NULL_HANDLE;
     VkPipelineCache ComputePipelineCache = VK_NULL_HANDLE;
     std::string ComputePipelineCacheFile;

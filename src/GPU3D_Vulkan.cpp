@@ -34,6 +34,7 @@
 #include "GPU3D_Vulkan_FinalPassShaderData.h"
 #include "GPU3D_Vulkan_InterpSpansShaderData.h"
 #include "GPU3D_Vulkan_SortWorkShaderData.h"
+#include "GPU3D_Vulkan_TriRasterBaseShaderData.h"
 #include "GPU3D_Vulkan_TriRasterCompatShaderData.h"
 #include "GPU3D_Vulkan_TriRasterShaderData.h"
 #include "Platform.h"
@@ -54,7 +55,7 @@ using Platform::LogLevel;
 
 namespace
 {
-constexpr u32 kPipelineCacheFileVersion = 1;
+constexpr u32 kPipelineCacheFileVersion = 2;
 constexpr u32 kVulkanDiagnosticDisablePassiveRepeatCoverageExpand = 1u << 0u;
 constexpr float kTriangleAreaEpsilon = 0.000001f;
 constexpr float kTileOverlapEpsilon = 0.00001f;
@@ -831,6 +832,7 @@ bool VulkanRenderer3D::ensureInitialized()
     ResetQueryPool = VulkanContext::Get().GetResetQueryPool();
     TimestampPeriodNs = VulkanContext::Get().GetTimestampPeriod();
     TimestampQueriesSupported = VulkanContext::Get().SupportsTimestamps();
+    ActiveTextureSamplingPath = resolveTextureSamplingPath();
 
     if (!createCommandObjects() || !createSyncObjects() || !createDescriptorObjects() || !createComputePipeline())
     {
@@ -941,9 +943,13 @@ void VulkanRenderer3D::destroyVulkan()
     }
 
     DescriptorSet = VK_NULL_HANDLE;
+    SingleTextureDescriptorSets.fill(VK_NULL_HANDLE);
     invalidateAllDescriptorSetCaches();
     for (RenderContext& renderContext : RenderContexts)
+    {
         renderContext.DescriptorSet = VK_NULL_HANDLE;
+        renderContext.SingleTextureDescriptorSets.fill(VK_NULL_HANDLE);
+    }
 
     if (DescriptorSetLayout != VK_NULL_HANDLE)
     {
@@ -1015,6 +1021,7 @@ void VulkanRenderer3D::destroyVulkan()
     ColorImageInitialized = false;
     ActiveTextureDescriptorCount = 0;
     ActiveTextureDescriptors.fill(VkDescriptorImageInfo{});
+    ActiveTextureSamplingPath = TextureSamplingPath::CompatDynamicUniform;
 }
 
 bool VulkanRenderer3D::createCommandObjects()
@@ -1822,15 +1829,17 @@ bool VulkanRenderer3D::createDescriptorObjects()
 {
     VkPhysicalDeviceProperties deviceProperties{};
     vkGetPhysicalDeviceProperties(PhysicalDevice, &deviceProperties);
-    if (deviceProperties.limits.maxPerStageDescriptorSampledImages < MaxTextureDescriptors
-        || deviceProperties.limits.maxDescriptorSetSampledImages < MaxTextureDescriptors)
+    const u32 textureDescriptorBindingCount = getTextureBindingDescriptorCount();
+    if (deviceProperties.limits.maxPerStageDescriptorSampledImages < textureDescriptorBindingCount
+        || deviceProperties.limits.maxDescriptorSetSampledImages < textureDescriptorBindingCount)
     {
         Log(
             LogLevel::Error,
-            "VulkanRenderer3D: descriptor limits too low (per-stage=%u, set=%u, required=%u)",
+            "VulkanRenderer3D: descriptor limits too low (per-stage=%u, set=%u, required=%u, path=%s)",
             deviceProperties.limits.maxPerStageDescriptorSampledImages,
             deviceProperties.limits.maxDescriptorSetSampledImages,
-            MaxTextureDescriptors
+            textureDescriptorBindingCount,
+            textureSamplingPathName(ActiveTextureSamplingPath)
         );
         return false;
     }
@@ -1850,7 +1859,7 @@ bool VulkanRenderer3D::createDescriptorObjects()
     VkDescriptorSetLayoutBinding textureBinding{};
     textureBinding.binding = 2;
     textureBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    textureBinding.descriptorCount = MaxTextureDescriptors;
+    textureBinding.descriptorCount = textureDescriptorBindingCount;
     textureBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutBinding resultBinding{};
@@ -1918,14 +1927,16 @@ bool VulkanRenderer3D::createDescriptorObjects()
         return false;
     }
 
-    constexpr u32 descriptorSetCount = static_cast<u32>(AsyncRenderContextCount + 1);
+    const bool singleTexturePath = usesSingleDescriptorTexturePath();
+    const u32 descriptorSetsPerContext = singleTexturePath ? MaxTextureDescriptors : 1u;
+    const u32 descriptorSetCount = static_cast<u32>((AsyncRenderContextCount + 1u) * descriptorSetsPerContext);
     std::array<VkDescriptorPoolSize, 3> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     poolSizes[0].descriptorCount = descriptorSetCount;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     poolSizes[1].descriptorCount = 8u * descriptorSetCount;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[2].descriptorCount = MaxTextureDescriptors * descriptorSetCount;
+    poolSizes[2].descriptorCount = textureDescriptorBindingCount * descriptorSetCount;
 
     VkDescriptorPoolCreateInfo poolCreateInfo{};
     poolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1939,9 +1950,8 @@ bool VulkanRenderer3D::createDescriptorObjects()
         return false;
     }
 
-    std::array<VkDescriptorSetLayout, AsyncRenderContextCount + 1> descriptorSetLayouts{};
-    descriptorSetLayouts.fill(DescriptorSetLayout);
-    std::array<VkDescriptorSet, AsyncRenderContextCount + 1> descriptorSets{};
+    std::vector<VkDescriptorSetLayout> descriptorSetLayouts(descriptorSetCount, DescriptorSetLayout);
+    std::vector<VkDescriptorSet> descriptorSets(descriptorSetCount, VK_NULL_HANDLE);
 
     VkDescriptorSetAllocateInfo descriptorAllocInfo{};
     descriptorAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1955,9 +1965,41 @@ bool VulkanRenderer3D::createDescriptorObjects()
         return false;
     }
 
-    DescriptorSet = descriptorSets[0];
-    for (size_t i = 0; i < AsyncRenderContextCount; i++)
-        RenderContexts[i].DescriptorSet = descriptorSets[i + 1];
+    DescriptorSet = VK_NULL_HANDLE;
+    SingleTextureDescriptorSets.fill(VK_NULL_HANDLE);
+    for (RenderContext& renderContext : RenderContexts)
+    {
+        renderContext.DescriptorSet = VK_NULL_HANDLE;
+        renderContext.SingleTextureDescriptorSets.fill(VK_NULL_HANDLE);
+    }
+
+    size_t descriptorCursor = 0;
+    if (singleTexturePath)
+    {
+        for (u32 descriptorIndex = 0; descriptorIndex < MaxTextureDescriptors; descriptorIndex++)
+            SingleTextureDescriptorSets[descriptorIndex] = descriptorSets[descriptorCursor++];
+        DescriptorSet = SingleTextureDescriptorSets[FallbackTextureDescriptorIndex];
+
+        for (RenderContext& renderContext : RenderContexts)
+        {
+            for (u32 descriptorIndex = 0; descriptorIndex < MaxTextureDescriptors; descriptorIndex++)
+                renderContext.SingleTextureDescriptorSets[descriptorIndex] = descriptorSets[descriptorCursor++];
+            renderContext.DescriptorSet = renderContext.SingleTextureDescriptorSets[FallbackTextureDescriptorIndex];
+        }
+    }
+    else
+    {
+        DescriptorSet = descriptorSets[descriptorCursor++];
+        for (RenderContext& renderContext : RenderContexts)
+            renderContext.DescriptorSet = descriptorSets[descriptorCursor++];
+    }
+
+    if (descriptorCursor != descriptorSets.size())
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: descriptor set allocation mismatch");
+        return false;
+    }
+
     invalidateAllDescriptorSetCaches();
 
     if (!createFallbackTexture())
@@ -1969,12 +2011,13 @@ bool VulkanRenderer3D::createDescriptorObjects()
     return true;
 }
 
-std::string VulkanRenderer3D::buildPipelineCacheFileName(bool useNonUniformTextureIndexing) const
+std::string VulkanRenderer3D::buildPipelineCacheFileName(TextureSamplingPath samplingPath) const
 {
     VkPhysicalDeviceProperties deviceProperties{};
     vkGetPhysicalDeviceProperties(PhysicalDevice, &deviceProperties);
 
     const u64 versionHash = fnv1a64(MELONDS_VERSION);
+    const char* samplingPathSuffix = textureSamplingPathName(samplingPath);
     char cacheFileName[256]{};
     std::snprintf(
         cacheFileName,
@@ -1985,17 +2028,17 @@ std::string VulkanRenderer3D::buildPipelineCacheFileName(bool useNonUniformTextu
         deviceProperties.deviceID,
         deviceProperties.driverVersion,
         static_cast<unsigned long long>(versionHash),
-        useNonUniformTextureIndexing ? "nonuniform" : "compat"
+        samplingPathSuffix
     );
     return cacheFileName;
 }
 
-bool VulkanRenderer3D::createPipelineCache(bool useNonUniformTextureIndexing)
+bool VulkanRenderer3D::createPipelineCache(TextureSamplingPath samplingPath)
 {
     if (ComputePipelineCache != VK_NULL_HANDLE)
         return true;
 
-    ComputePipelineCacheFile = buildPipelineCacheFileName(useNonUniformTextureIndexing);
+    ComputePipelineCacheFile = buildPipelineCacheFileName(samplingPath);
 
     std::vector<u8> cacheData;
     if (Platform::FileHandle* cacheFile = Platform::OpenLocalFile(ComputePipelineCacheFile, Platform::FileMode::Read))
@@ -2102,6 +2145,7 @@ bool VulkanRenderer3D::createComputePipeline()
         || melonDS_gpu3d_vulkan_calc_work_offsets_comp_spv_len == 0
         || melonDS_gpu3d_vulkan_sort_work_comp_spv_len == 0
         || melonDS_gpu3d_vulkan_tri_raster_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_tri_raster_base_comp_spv_len == 0
         || melonDS_gpu3d_vulkan_tri_raster_compat_comp_spv_len == 0
         || melonDS_gpu3d_vulkan_depth_blend_comp_spv_len == 0
         || melonDS_gpu3d_vulkan_final_pass_comp_spv_len == 0
@@ -2111,8 +2155,8 @@ bool VulkanRenderer3D::createComputePipeline()
         return false;
     }
 
-    const bool useNonUniformTextureIndexing = VulkanContext::Get().SupportsNonUniformTextureIndexing();
-    if (!createPipelineCache(useNonUniformTextureIndexing))
+    const TextureSamplingPath samplingPath = ActiveTextureSamplingPath;
+    if (!createPipelineCache(samplingPath))
     {
         Log(
             LogLevel::Warn,
@@ -2266,16 +2310,38 @@ bool VulkanRenderer3D::createComputePipeline()
     const char* rasterShadeModeNames[] = {"modulate", "decal", "toon", "highlight", "shadow", "any"};
     const char* rasterTextureModeNames[] = {"notexture", "texture", "anytex"};
     const char* rasterTranslucencyModeNames[] = {"opaque", "translucent", "anyalpha"};
-    const unsigned char* triRasterSpirv = useNonUniformTextureIndexing
-        ? melonDS_gpu3d_vulkan_tri_raster_comp_spv
-        : melonDS_gpu3d_vulkan_tri_raster_compat_comp_spv;
-    const size_t triRasterSpirvLen = useNonUniformTextureIndexing
-        ? melonDS_gpu3d_vulkan_tri_raster_comp_spv_len
-        : melonDS_gpu3d_vulkan_tri_raster_compat_comp_spv_len;
+    const unsigned char* triRasterSpirv = melonDS_gpu3d_vulkan_tri_raster_comp_spv;
+    size_t triRasterSpirvLen = melonDS_gpu3d_vulkan_tri_raster_comp_spv_len;
+    if (samplingPath == TextureSamplingPath::BaseSingleDescriptor)
+    {
+        triRasterSpirv = melonDS_gpu3d_vulkan_tri_raster_base_comp_spv;
+        triRasterSpirvLen = melonDS_gpu3d_vulkan_tri_raster_base_comp_spv_len;
+    }
+    else if (samplingPath == TextureSamplingPath::CompatDynamicUniform)
+    {
+        triRasterSpirv = melonDS_gpu3d_vulkan_tri_raster_compat_comp_spv;
+        triRasterSpirvLen = melonDS_gpu3d_vulkan_tri_raster_compat_comp_spv_len;
+    }
+
+    const VulkanContext& context = VulkanContext::Get();
+    Log(
+        LogLevel::Warn,
+        "VulkanRuntime[Capabilities]: swapchain=1 timeline=%d dynamicIndexing=%d nonUniform=%d path=%s forceTimelineOff=%d forceDynamicOff=%d",
+        context.SupportsTimelineSemaphores() ? 1 : 0,
+        context.SupportsDynamicTextureIndexing() ? 1 : 0,
+        context.SupportsNonUniformTextureIndexing() ? 1 : 0,
+        textureSamplingPathName(samplingPath),
+        context.IsTimelineSemaphoreForcedOff() ? 1 : 0,
+        context.IsDynamicTextureIndexingForcedOff() ? 1 : 0
+    );
     Log(
         LogLevel::Warn,
         "VulkanRenderer3D: using %s texture sampling path",
-        useNonUniformTextureIndexing ? "non-uniform descriptor indexing" : "compatibility (dynamic-uniform descriptor indexing)"
+        samplingPath == TextureSamplingPath::NonUniform
+            ? "non-uniform descriptor indexing"
+            : (samplingPath == TextureSamplingPath::CompatDynamicUniform
+                ? "compatibility (dynamic-uniform descriptor indexing)"
+                : "base switch-descriptor compatibility")
     );
     auto makeRasterPipelineIndex = [&](u32 rasterWMode, u32 rasterShadeMode, u32 rasterTextureMode, u32 rasterTranslucencyMode) -> u32
     {
@@ -3851,26 +3917,102 @@ bool VulkanRenderer3D::descriptorImageInfoEquals(const VkDescriptorImageInfo& lh
         && lhs.imageLayout == rhs.imageLayout;
 }
 
-VulkanRenderer3D::DescriptorSetCache& VulkanRenderer3D::getDescriptorSetCache(RenderContext* context)
+bool VulkanRenderer3D::usesSingleDescriptorTexturePath() const noexcept
 {
-    return context != nullptr ? context->DescriptorCache : DescriptorCache;
+    // Base fallback now uses a switch-selected descriptor array in a single raster pass.
+    return false;
+}
+
+u32 VulkanRenderer3D::getTextureBindingDescriptorCount() const noexcept
+{
+    return MaxTextureDescriptors;
+}
+
+VulkanRenderer3D::TextureSamplingPath VulkanRenderer3D::resolveTextureSamplingPath() const noexcept
+{
+    if (!VulkanContext::Get().SupportsDynamicTextureIndexing())
+        return TextureSamplingPath::BaseSingleDescriptor;
+    return VulkanContext::Get().SupportsNonUniformTextureIndexing()
+        ? TextureSamplingPath::NonUniform
+        : TextureSamplingPath::CompatDynamicUniform;
+}
+
+const char* VulkanRenderer3D::textureSamplingPathName(TextureSamplingPath path) noexcept
+{
+    switch (path)
+    {
+        case TextureSamplingPath::BaseSingleDescriptor:
+            return "base-switch-descriptor";
+        case TextureSamplingPath::CompatDynamicUniform:
+            return "compat-dynamic-uniform";
+        case TextureSamplingPath::NonUniform:
+            return "nonuniform";
+    }
+    return "unknown";
+}
+
+VkDescriptorSet VulkanRenderer3D::getDescriptorSet(RenderContext* context, u32 singleTextureDescriptorIndex) const
+{
+    if (!usesSingleDescriptorTexturePath())
+        return context != nullptr ? context->DescriptorSet : DescriptorSet;
+
+    const u32 resolvedDescriptorIndex = std::min<u32>(singleTextureDescriptorIndex, MaxTextureDescriptors - 1u);
+    return context != nullptr
+        ? context->SingleTextureDescriptorSets[resolvedDescriptorIndex]
+        : SingleTextureDescriptorSets[resolvedDescriptorIndex];
+}
+
+VulkanRenderer3D::DescriptorSetCache& VulkanRenderer3D::getDescriptorSetCache(RenderContext* context, u32 singleTextureDescriptorIndex)
+{
+    if (!usesSingleDescriptorTexturePath())
+        return context != nullptr ? context->DescriptorCache : DescriptorCache;
+
+    const u32 resolvedDescriptorIndex = std::min<u32>(singleTextureDescriptorIndex, MaxTextureDescriptors - 1u);
+    return context != nullptr
+        ? context->SingleTextureDescriptorCaches[resolvedDescriptorIndex]
+        : SingleTextureDescriptorCaches[resolvedDescriptorIndex];
 }
 
 void VulkanRenderer3D::invalidateDescriptorSetCache(RenderContext* context)
 {
-    getDescriptorSetCache(context).Ready = false;
+    if (!usesSingleDescriptorTexturePath())
+    {
+        if (context != nullptr)
+            context->DescriptorCache.Ready = false;
+        else
+            DescriptorCache.Ready = false;
+        return;
+    }
+
+    if (context != nullptr)
+    {
+        for (DescriptorSetCache& cache : context->SingleTextureDescriptorCaches)
+            cache.Ready = false;
+    }
+    else
+    {
+        for (DescriptorSetCache& cache : SingleTextureDescriptorCaches)
+            cache.Ready = false;
+    }
 }
 
 void VulkanRenderer3D::invalidateAllDescriptorSetCaches()
 {
     DescriptorCache.Ready = false;
+    for (DescriptorSetCache& cache : SingleTextureDescriptorCaches)
+        cache.Ready = false;
+
     for (RenderContext& renderContext : RenderContexts)
+    {
         renderContext.DescriptorCache.Ready = false;
+        for (DescriptorSetCache& cache : renderContext.SingleTextureDescriptorCaches)
+            cache.Ready = false;
+    }
 }
 
-void VulkanRenderer3D::updateDescriptorSet(RenderContext* context)
+void VulkanRenderer3D::updateDescriptorSet(RenderContext* context, u32 singleTextureDescriptorIndex)
 {
-    const VkDescriptorSet DescriptorSet = context != nullptr ? context->DescriptorSet : this->DescriptorSet;
+    const VkDescriptorSet DescriptorSet = getDescriptorSet(context, singleTextureDescriptorIndex);
     const VkBuffer TriangleBuffer = context != nullptr ? context->TriangleBuffer : this->TriangleBuffer;
     const VkBuffer BinMaskBuffer = context != nullptr && context->BinMaskBuffer != VK_NULL_HANDLE
         ? context->BinMaskBuffer
@@ -3901,7 +4043,7 @@ void VulkanRenderer3D::updateDescriptorSet(RenderContext* context)
         || FallbackTextureSampler == VK_NULL_HANDLE)
         return;
 
-    DescriptorSetCache& descriptorCache = getDescriptorSetCache(context);
+    DescriptorSetCache& descriptorCache = getDescriptorSetCache(context, singleTextureDescriptorIndex);
 
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageView = ColorImageView;
@@ -3953,10 +4095,19 @@ void VulkanRenderer3D::updateDescriptorSet(RenderContext* context)
     fallbackInfo.imageView = FallbackTextureView;
     fallbackInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     textureInfos.fill(fallbackInfo);
-    for (u32 i = 0; i < ActiveTextureDescriptorCount && i < MaxActiveTextureDescriptors; i++)
+
+    if (usesSingleDescriptorTexturePath())
     {
-        textureInfos[i] = ActiveTextureDescriptors[i];
+        const u32 resolvedDescriptorIndex = std::min<u32>(singleTextureDescriptorIndex, MaxTextureDescriptors - 1u);
+        if (resolvedDescriptorIndex < ActiveTextureDescriptorCount && resolvedDescriptorIndex < MaxActiveTextureDescriptors)
+            textureInfos[0] = ActiveTextureDescriptors[resolvedDescriptorIndex];
     }
+    else
+    {
+        for (u32 i = 0; i < ActiveTextureDescriptorCount && i < MaxActiveTextureDescriptors; i++)
+            textureInfos[i] = ActiveTextureDescriptors[i];
+    }
+    const u32 textureDescriptorCount = getTextureBindingDescriptorCount();
 
     std::array<VkWriteDescriptorSet, 10> writes{};
     u32 writeCount = 0;
@@ -3973,7 +4124,7 @@ void VulkanRenderer3D::updateDescriptorSet(RenderContext* context)
     bool texturesChanged = !descriptorCache.Ready;
     if (!texturesChanged)
     {
-        for (u32 i = 0; i < MaxTextureDescriptors; i++)
+        for (u32 i = 0; i < textureDescriptorCount; i++)
         {
             if (!descriptorImageInfoEquals(descriptorCache.TextureInfos[i], textureInfos[i]))
             {
@@ -3988,7 +4139,7 @@ void VulkanRenderer3D::updateDescriptorSet(RenderContext* context)
             DescriptorSet,
             2,
             textureInfos.data(),
-            MaxTextureDescriptors,
+            textureDescriptorCount,
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     }
 
@@ -4081,7 +4232,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     const bool useSynchronousContext = context == nullptr;
     const VkCommandBuffer CommandBuffer = context != nullptr ? context->CommandBuffer : this->CommandBuffer;
     const VkFence FrameFence = context != nullptr ? context->FrameFence : this->FrameFence;
-    const VkDescriptorSet DescriptorSet = context != nullptr ? context->DescriptorSet : this->DescriptorSet;
     const VkBuffer TriangleBuffer = context != nullptr ? context->TriangleBuffer : this->TriangleBuffer;
     const VkDeviceMemory TriangleMemory = context != nullptr ? context->TriangleMemory : this->TriangleMemory;
     const VkDeviceSize TriangleBufferSize = context != nullptr ? context->TriangleBufferSize : this->TriangleBufferSize;
@@ -4282,18 +4432,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
             return kRasterShadeModeModulate;
         return kRasterShadeModeAny;
     };
-    auto resolveRasterTextureMode = [](u32 variantKey) -> u32 {
-        if (variantKey == kVariantWildcard)
-            return kRasterTextureModeAny;
-        return (variantKey & kVariantFlagTextured) != 0u ? kRasterTextureModeUseTexture : kRasterTextureModeNoTexture;
-    };
-    auto resolveRasterTranslucencyMode = [](u32 variantKey) -> u32 {
-        if (variantKey == kVariantWildcard)
-            return kRasterTranslucencyModeAny;
-        return (variantKey & kVariantFlagTranslucent) != 0u
-            ? kRasterTranslucencyModeTranslucent
-            : kRasterTranslucencyModeOpaque;
-    };
     auto makeRasterPipelineIndex = [&](u32 rasterWMode, u32 rasterShadeMode, u32 rasterTextureMode, u32 rasterTranslucencyMode) -> u32 {
         return (((rasterWMode * RasterShadeModeCount) + rasterShadeMode) * RasterTextureModeCount + rasterTextureMode)
             * RasterTranslucencyModeCount
@@ -4306,7 +4444,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     pushConstants.depthBlendMode = frameWBufferMode ? 1u : 0u;
 
     TriangleCountWindow.Add(static_cast<u64>(Triangles.size()));
-    PassCountWindow.Add(1);
 
     void* mappedTriangles = context != nullptr ? context->TriangleMapped : TriangleMapped;
     if (mappedTriangles == nullptr)
@@ -4560,7 +4697,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         );
     }
 
-    vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout, 0, 1, &DescriptorSet, 0, nullptr);
     constexpr u32 binTileSize = 8;
     const u32 binTilesX = (ColorImageWidth + (binTileSize - 1u)) / binTileSize;
     const u32 binTilesY = (ColorImageHeight + (binTileSize - 1u)) / binTileSize;
@@ -4639,27 +4775,77 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     constexpr VkDeviceSize kSortDispatchIndirectOffset = 0;
     constexpr VkDeviceSize kRasterDispatchIndirectOffset = sizeof(u32) * 3u;
 
-    pushConstants.triangleBase = 0u;
-    pushConstants.triangleCount = static_cast<u32>(Triangles.size());
-    pushConstants.variantKey = kVariantWildcard;
-
-    const u32 binGroupCount = std::max<u32>(1u, (pushConstants.triangleCount + 31u) / 32u);
-    const u32 interpGroupCount = std::max<u32>(1u, (pushConstants.triangleCount + 63u) / 64u);
-    const u32 rasterWMode = resolveRasterWMode(kVariantWildcard);
-    u32 rasterShadeMode = kRasterShadeModeAny;
-    u32 rasterTextureMode = kRasterTextureModeAny;
-    u32 rasterTranslucencyMode = kRasterTranslucencyModeAny;
-    if (!Triangles.empty())
+    struct RasterPass
     {
+        u32 triangleBase;
+        u32 triangleCount;
+        u32 textureDescriptorIndex;
+    };
+
+    std::vector<RasterPass> rasterPasses;
+    const bool singleDescriptorTexturePath = usesSingleDescriptorTexturePath();
+    if (singleDescriptorTexturePath)
+    {
+        auto resolveTriangleDescriptorIndex = [&](const TriangleGpu& triangle) -> u32 {
+            if ((triangle.variantKey & kVariantFlagTextured) == 0u)
+                return FallbackTextureDescriptorIndex;
+            return std::min<u32>(triangle.texArrayIndex, MaxTextureDescriptors - 1u);
+        };
+
+        const u32 triangleCount = static_cast<u32>(Triangles.size());
+        if (triangleCount == 0u)
+        {
+            rasterPasses.push_back({0u, 0u, FallbackTextureDescriptorIndex});
+        }
+        else
+        {
+            u32 runBase = 0u;
+            u32 runDescriptorIndex = resolveTriangleDescriptorIndex(Triangles[0]);
+            for (u32 triangleIndex = 1u; triangleIndex < triangleCount; triangleIndex++)
+            {
+                const u32 descriptorIndex = resolveTriangleDescriptorIndex(Triangles[triangleIndex]);
+                if (descriptorIndex != runDescriptorIndex)
+                {
+                    rasterPasses.push_back({runBase, triangleIndex - runBase, runDescriptorIndex});
+                    runBase = triangleIndex;
+                    runDescriptorIndex = descriptorIndex;
+                }
+            }
+            rasterPasses.push_back({runBase, triangleCount - runBase, runDescriptorIndex});
+        }
+    }
+    else
+    {
+        rasterPasses.push_back({0u, static_cast<u32>(Triangles.size()), FallbackTextureDescriptorIndex});
+    }
+
+    if (rasterPasses.empty())
+        rasterPasses.push_back({0u, 0u, FallbackTextureDescriptorIndex});
+
+    PassCountWindow.Add(static_cast<u64>(rasterPasses.size()));
+
+    auto resolveRasterModesForRange = [&](u32 triangleBase,
+                                          u32 triangleCount,
+                                          u32& outShadeMode,
+                                          u32& outTextureMode,
+                                          u32& outTranslucencyMode) {
+        outShadeMode = kRasterShadeModeAny;
+        outTextureMode = kRasterTextureModeAny;
+        outTranslucencyMode = kRasterTranslucencyModeAny;
+
+        if (triangleCount == 0u)
+            return;
+
         bool allTextured = true;
         bool allUntextured = true;
         bool allTranslucent = true;
         bool allOpaque = true;
-        const u32 firstShadeMode = resolveRasterShadeMode(Triangles[0].variantKey);
+        const u32 firstShadeMode = resolveRasterShadeMode(Triangles[triangleBase].variantKey);
         bool uniformShadeMode = firstShadeMode != kRasterShadeModeAny;
 
-        for (const TriangleGpu& triangle : Triangles)
+        for (u32 triangleIndex = triangleBase; triangleIndex < triangleBase + triangleCount; triangleIndex++)
         {
+            const TriangleGpu& triangle = Triangles[triangleIndex];
             const bool isTextured = (triangle.variantKey & kVariantFlagTextured) != 0u;
             const bool isTranslucent = (triangle.variantKey & kVariantFlagTranslucent) != 0u;
             allTextured &= isTextured;
@@ -4672,246 +4858,155 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         }
 
         if (allTextured)
-            rasterTextureMode = kRasterTextureModeUseTexture;
+            outTextureMode = kRasterTextureModeUseTexture;
         else if (allUntextured)
-            rasterTextureMode = kRasterTextureModeNoTexture;
+            outTextureMode = kRasterTextureModeNoTexture;
 
         if (allTranslucent)
-            rasterTranslucencyMode = kRasterTranslucencyModeTranslucent;
+            outTranslucencyMode = kRasterTranslucencyModeTranslucent;
         else if (allOpaque)
-            rasterTranslucencyMode = kRasterTranslucencyModeOpaque;
+            outTranslucencyMode = kRasterTranslucencyModeOpaque;
 
         if (uniformShadeMode)
-            rasterShadeMode = firstShadeMode;
-    }
-    if (rasterTextureMode != kRasterTextureModeAny)
-        RasterSpecializedTextureModeCount++;
-    if (rasterTranslucencyMode != kRasterTranslucencyModeAny)
-        RasterSpecializedTranslucencyModeCount++;
-    if (rasterShadeMode != kRasterShadeModeAny)
-        RasterSpecializedShadeModeCount++;
-    if (rasterTextureMode != kRasterTextureModeAny
-        && rasterTranslucencyMode != kRasterTranslucencyModeAny
-        && rasterShadeMode != kRasterShadeModeAny)
-    {
-        RasterSpecializedAllModesCount++;
-    }
-    const u32 rasterPipelineIndex = makeRasterPipelineIndex(
-        rasterWMode,
-        rasterShadeMode,
-        rasterTextureMode,
-        rasterTranslucencyMode
-    );
-    if (rasterPipelineIndex >= RasterPipelineVariantCount)
-        return false;
-    VkPipeline rasterPipeline = RasterPipelines[rasterPipelineIndex];
-    if (rasterPipeline == VK_NULL_HANDLE)
-        return false;
-    if (!useCpuDirectTiles)
-    {
-        const u64 interpCpuStartNs = PerfNowNs();
-        vkCmdPipelineBarrier(
-            CommandBuffer,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0,
-            0,
-            nullptr,
-            1,
-            &spanSetupToWriteBarrier,
-            0,
-            nullptr
-        );
-        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, InterpPipeline);
-        vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-        vkCmdDispatch(CommandBuffer, interpGroupCount, 1, 1);
-        if (timestampQueryPool != VK_NULL_HANDLE)
-            vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 1);
-        InterpCpuWindow.Add(PerfNowNs() - interpCpuStartNs);
-    }
-    else
-    {
-        InterpCpuWindow.Add(0);
-        if (timestampQueryPool != VK_NULL_HANDLE)
-            vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 1);
-    }
+            outShadeMode = firstShadeMode;
+    };
 
-    u32 cpuActiveTileCountSample = 0;
-    u32 cpuTileCountSample = 0;
-    u32 cpuActiveGroupCountSample = 0;
-    u32 cpuActiveDispatchSample = 0;
+    u64 cpuActiveTileCountAccum = 0;
+    u64 cpuTileCountAccum = 0;
+    u64 cpuActiveGroupCountAccum = 0;
+    u64 cpuActiveDispatchAccum = 0;
+    bool canUseFinalActiveTileDispatch = rasterPasses.size() == 1u;
+    bool finalUsesCpuActiveTileDispatch = false;
 
-    const u64 binCpuStartNs = PerfNowNs();
-    if (useCpuDirectTiles)
+    for (const RasterPass& rasterPass : rasterPasses)
     {
-        if (!prepareCpuTileBins(*context, pushConstants))
-        {
-            Log(LogLevel::Error, "VulkanRenderer3D: failed to prepare CPU tile bins");
+        const VkDescriptorSet passDescriptorSet = getDescriptorSet(context, rasterPass.textureDescriptorIndex);
+        if (passDescriptorSet == VK_NULL_HANDLE)
             return false;
-        }
 
-        const u32* workOffsetValues = reinterpret_cast<const u32*>(context->WorkOffsetMapped);
-        if (workOffsetValues != nullptr)
-        {
-            cpuActiveTileCountSample = workOffsetValues[kWorkActiveTileCount];
-            cpuActiveGroupCountSample = workOffsetValues[kWorkActiveGroupCount];
-        }
-        cpuTileCountSample = tileCount;
-        const bool hasSparseCoverage = static_cast<u64>(cpuActiveTileCountSample) * 100ull
-            < static_cast<u64>(tileCount) * static_cast<u64>(kCpuActiveTileDispatchMaxCoveragePercent);
-        useCpuActiveTileDispatch = cpuActiveTileCountSample == 0u || hasSparseCoverage;
-        cpuActiveDispatchSample = useCpuActiveTileDispatch ? 100u : 0u;
-        if (useCpuActiveTileDispatch)
-            pushConstants.passIndex |= kDebugFlagFinalActiveTileMask;
+        updateDescriptorSet(context, rasterPass.textureDescriptorIndex);
+        vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout, 0, 1, &passDescriptorSet, 0, nullptr);
 
-        BinCpuWindow.Add(PerfNowNs() - binCpuStartNs);
-        WorkOffsetsCpuWindow.Add(0);
-        SortCpuWindow.Add(0);
-        CpuDirectTilesPathCount++;
+        pushConstants.triangleBase = rasterPass.triangleBase;
+        pushConstants.triangleCount = rasterPass.triangleCount;
+        pushConstants.variantKey = kVariantWildcard;
+        pushConstants.passIndex = MelonDSAndroid::getVulkanDiagnosticFlags() & ~kDebugFlagFinalActiveTileMask;
 
-        std::array<VkBufferMemoryBarrier, 4> rasterReadBarriers = {
-            spanSetupHostToReadBarrier,
-            binMaskHostToReadBarrier,
-            groupListHostToReadBarrier,
-            workOffsetHostToReadBarrier,
-        };
-        vkCmdPipelineBarrier(
-            CommandBuffer,
-            VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-            0,
-            0,
-            nullptr,
-            static_cast<u32>(rasterReadBarriers.size()),
-            rasterReadBarriers.data(),
-            0,
-            nullptr
+        const u32 binGroupCount = std::max<u32>(1u, (pushConstants.triangleCount + 31u) / 32u);
+        const u32 interpGroupCount = std::max<u32>(1u, (pushConstants.triangleCount + 63u) / 64u);
+        const u32 rasterWMode = resolveRasterWMode(kVariantWildcard);
+        u32 rasterShadeMode = kRasterShadeModeAny;
+        u32 rasterTextureMode = kRasterTextureModeAny;
+        u32 rasterTranslucencyMode = kRasterTranslucencyModeAny;
+        resolveRasterModesForRange(
+            rasterPass.triangleBase,
+            rasterPass.triangleCount,
+            rasterShadeMode,
+            rasterTextureMode,
+            rasterTranslucencyMode
         );
-        if (timestampQueryPool != VK_NULL_HANDLE)
+
+        if (rasterTextureMode != kRasterTextureModeAny)
+            RasterSpecializedTextureModeCount++;
+        if (rasterTranslucencyMode != kRasterTranslucencyModeAny)
+            RasterSpecializedTranslucencyModeCount++;
+        if (rasterShadeMode != kRasterShadeModeAny)
+            RasterSpecializedShadeModeCount++;
+        if (rasterTextureMode != kRasterTextureModeAny
+            && rasterTranslucencyMode != kRasterTranslucencyModeAny
+            && rasterShadeMode != kRasterShadeModeAny)
         {
-            vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 2);
-            vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 3);
-            vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 4);
+            RasterSpecializedAllModesCount++;
         }
-    }
-    else
-    {
-        if (!useLegacyRasterWorklist)
-        {
-            vkCmdFillBuffer(
-                CommandBuffer,
-                GroupListBuffer,
-                0,
-                static_cast<VkDeviceSize>(tileCount) * sizeof(u32),
-                0
-            );
-        }
-        std::array<VkBufferMemoryBarrier, 3> binWriteBarriers = {
-            spanSetupToReadBarrier,
-            binMaskToWriteBarrier,
-            groupListToWriteBarrier,
-        };
-        const u32 binWriteBarrierCount = useLegacyRasterWorklist ? 2u : static_cast<u32>(binWriteBarriers.size());
-        const VkPipelineStageFlags binWriteSrcStages = useLegacyRasterWorklist
-            ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-            : (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
-        vkCmdPipelineBarrier(
-            CommandBuffer,
-            binWriteSrcStages,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0,
-            0,
-            nullptr,
-            binWriteBarrierCount,
-            binWriteBarriers.data(),
-            0,
-            nullptr
+
+        const u32 rasterPipelineIndex = makeRasterPipelineIndex(
+            rasterWMode,
+            rasterShadeMode,
+            rasterTextureMode,
+            rasterTranslucencyMode
         );
-        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, BinPipeline);
-        vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-        vkCmdDispatch(CommandBuffer, binGroupCount, binTilesX, binTilesY);
-        if (timestampQueryPool != VK_NULL_HANDLE)
-            vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 2);
-        BinCpuWindow.Add(PerfNowNs() - binCpuStartNs);
+        if (rasterPipelineIndex >= RasterPipelineVariantCount)
+            return false;
+        VkPipeline rasterPipeline = RasterPipelines[rasterPipelineIndex];
+        if (rasterPipeline == VK_NULL_HANDLE)
+            return false;
 
-        if (useLegacyRasterWorklist)
+        if (!useCpuDirectTiles)
         {
-            LegacyWorklistPathCount++;
-
-            const u64 workOffsetsCpuStartNs = PerfNowNs();
-            std::array<VkBufferMemoryBarrier, 2> workOffsetsBarriers = {
-                binMaskToReadBarrier,
-                workOffsetToWriteBarrier,
-            };
+            const u64 interpCpuStartNs = PerfNowNs();
             vkCmdPipelineBarrier(
                 CommandBuffer,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0,
-                0,
-                nullptr,
-                static_cast<u32>(workOffsetsBarriers.size()),
-                workOffsetsBarriers.data(),
-                0,
-                nullptr
-            );
-            vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, WorkOffsetsPipeline);
-            vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-            vkCmdDispatch(CommandBuffer, 1, 1, 1);
-            if (timestampQueryPool != VK_NULL_HANDLE)
-                vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 3);
-            WorkOffsetsCpuWindow.Add(PerfNowNs() - workOffsetsCpuStartNs);
-
-            const u64 sortCpuStartNs = PerfNowNs();
-            vkCmdPipelineBarrier(
-                CommandBuffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                 0,
                 0,
                 nullptr,
                 1,
-                &workOffsetToReadBarrier,
+                &spanSetupToWriteBarrier,
                 0,
                 nullptr
             );
-            vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, SortPipeline);
+            vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, InterpPipeline);
             vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-            vkCmdDispatchIndirect(CommandBuffer, WorkOffsetBuffer, kSortDispatchIndirectOffset);
+            vkCmdDispatch(CommandBuffer, interpGroupCount, 1, 1);
             if (timestampQueryPool != VK_NULL_HANDLE)
-                vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 4);
-            SortCpuWindow.Add(PerfNowNs() - sortCpuStartNs);
-
-            std::array<VkBufferMemoryBarrier, 2> rasterReadBarriers = {
-                binMaskToReadBarrier,
-                workOffsetToReadBarrier,
-            };
-            vkCmdPipelineBarrier(
-                CommandBuffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                0,
-                0,
-                nullptr,
-                static_cast<u32>(rasterReadBarriers.size()),
-                rasterReadBarriers.data(),
-                0,
-                nullptr
-            );
+                vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 1);
+            InterpCpuWindow.Add(PerfNowNs() - interpCpuStartNs);
         }
         else
         {
-            DirectTilesPathCount++;
+            InterpCpuWindow.Add(0);
+            if (timestampQueryPool != VK_NULL_HANDLE)
+                vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 1);
+        }
+
+        u32 cpuActiveTileCountSample = 0;
+        u32 cpuTileCountSample = 0;
+        u32 cpuActiveGroupCountSample = 0;
+        u32 cpuActiveDispatchSample = 0;
+        bool passUsesCpuActiveTileDispatch = false;
+
+        const u64 binCpuStartNs = PerfNowNs();
+        if (useCpuDirectTiles)
+        {
+            if (!prepareCpuTileBins(*context, pushConstants))
+            {
+                Log(LogLevel::Error, "VulkanRenderer3D: failed to prepare CPU tile bins");
+                return false;
+            }
+
+            const u32* workOffsetValues = reinterpret_cast<const u32*>(context->WorkOffsetMapped);
+            if (workOffsetValues != nullptr)
+            {
+                cpuActiveTileCountSample = workOffsetValues[kWorkActiveTileCount];
+                cpuActiveGroupCountSample = workOffsetValues[kWorkActiveGroupCount];
+            }
+            cpuTileCountSample = tileCount;
+            const bool hasSparseCoverage = static_cast<u64>(cpuActiveTileCountSample) * 100ull
+                < static_cast<u64>(tileCount) * static_cast<u64>(kCpuActiveTileDispatchMaxCoveragePercent);
+            const bool firstPassOfMultiDescriptorSequence =
+                singleDescriptorTexturePath && rasterPasses.size() > 1u && rasterPass.triangleBase == 0u;
+            passUsesCpuActiveTileDispatch =
+                !firstPassOfMultiDescriptorSequence && (cpuActiveTileCountSample == 0u || hasSparseCoverage);
+            cpuActiveDispatchSample = passUsesCpuActiveTileDispatch ? 100u : 0u;
+            if (passUsesCpuActiveTileDispatch)
+                pushConstants.passIndex |= kDebugFlagFinalActiveTileMask;
+
+            BinCpuWindow.Add(PerfNowNs() - binCpuStartNs);
             WorkOffsetsCpuWindow.Add(0);
             SortCpuWindow.Add(0);
-            std::array<VkBufferMemoryBarrier, 2> rasterReadBarriers = {
-                binMaskToReadBarrier,
-                groupListToReadBarrier,
+            CpuDirectTilesPathCount++;
+
+            std::array<VkBufferMemoryBarrier, 4> rasterReadBarriers = {
+                spanSetupHostToReadBarrier,
+                binMaskHostToReadBarrier,
+                groupListHostToReadBarrier,
+                workOffsetHostToReadBarrier,
             };
             vkCmdPipelineBarrier(
                 CommandBuffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                 0,
                 0,
                 nullptr,
@@ -4922,42 +5017,187 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
             );
             if (timestampQueryPool != VK_NULL_HANDLE)
             {
+                vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 2);
                 vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 3);
                 vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 4);
             }
         }
+        else
+        {
+            if (!useLegacyRasterWorklist)
+            {
+                vkCmdFillBuffer(
+                    CommandBuffer,
+                    GroupListBuffer,
+                    0,
+                    static_cast<VkDeviceSize>(tileCount) * sizeof(u32),
+                    0
+                );
+            }
+            std::array<VkBufferMemoryBarrier, 3> binWriteBarriers = {
+                spanSetupToReadBarrier,
+                binMaskToWriteBarrier,
+                groupListToWriteBarrier,
+            };
+            const u32 binWriteBarrierCount = useLegacyRasterWorklist ? 2u : static_cast<u32>(binWriteBarriers.size());
+            const VkPipelineStageFlags binWriteSrcStages = useLegacyRasterWorklist
+                ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                : (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vkCmdPipelineBarrier(
+                CommandBuffer,
+                binWriteSrcStages,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                nullptr,
+                binWriteBarrierCount,
+                binWriteBarriers.data(),
+                0,
+                nullptr
+            );
+            vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, BinPipeline);
+            vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+            vkCmdDispatch(CommandBuffer, binGroupCount, binTilesX, binTilesY);
+            if (timestampQueryPool != VK_NULL_HANDLE)
+                vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 2);
+            BinCpuWindow.Add(PerfNowNs() - binCpuStartNs);
+
+            if (useLegacyRasterWorklist)
+            {
+                LegacyWorklistPathCount++;
+
+                const u64 workOffsetsCpuStartNs = PerfNowNs();
+                std::array<VkBufferMemoryBarrier, 2> workOffsetsBarriers = {
+                    binMaskToReadBarrier,
+                    workOffsetToWriteBarrier,
+                };
+                vkCmdPipelineBarrier(
+                    CommandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    0,
+                    nullptr,
+                    static_cast<u32>(workOffsetsBarriers.size()),
+                    workOffsetsBarriers.data(),
+                    0,
+                    nullptr
+                );
+                vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, WorkOffsetsPipeline);
+                vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+                vkCmdDispatch(CommandBuffer, 1, 1, 1);
+                if (timestampQueryPool != VK_NULL_HANDLE)
+                    vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 3);
+                WorkOffsetsCpuWindow.Add(PerfNowNs() - workOffsetsCpuStartNs);
+
+                const u64 sortCpuStartNs = PerfNowNs();
+                vkCmdPipelineBarrier(
+                    CommandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                    0,
+                    0,
+                    nullptr,
+                    1,
+                    &workOffsetToReadBarrier,
+                    0,
+                    nullptr
+                );
+                vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, SortPipeline);
+                vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+                vkCmdDispatchIndirect(CommandBuffer, WorkOffsetBuffer, kSortDispatchIndirectOffset);
+                if (timestampQueryPool != VK_NULL_HANDLE)
+                    vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 4);
+                SortCpuWindow.Add(PerfNowNs() - sortCpuStartNs);
+
+                std::array<VkBufferMemoryBarrier, 2> rasterReadBarriers = {
+                    binMaskToReadBarrier,
+                    workOffsetToReadBarrier,
+                };
+                vkCmdPipelineBarrier(
+                    CommandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                    0,
+                    0,
+                    nullptr,
+                    static_cast<u32>(rasterReadBarriers.size()),
+                    rasterReadBarriers.data(),
+                    0,
+                    nullptr
+                );
+            }
+            else
+            {
+                DirectTilesPathCount++;
+                WorkOffsetsCpuWindow.Add(0);
+                SortCpuWindow.Add(0);
+                std::array<VkBufferMemoryBarrier, 2> rasterReadBarriers = {
+                    binMaskToReadBarrier,
+                    groupListToReadBarrier,
+                };
+                vkCmdPipelineBarrier(
+                    CommandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    0,
+                    nullptr,
+                    static_cast<u32>(rasterReadBarriers.size()),
+                    rasterReadBarriers.data(),
+                    0,
+                    nullptr
+                );
+                if (timestampQueryPool != VK_NULL_HANDLE)
+                {
+                    vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 3);
+                    vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 4);
+                }
+            }
+        }
+
+        cpuActiveTileCountAccum += cpuActiveTileCountSample;
+        cpuTileCountAccum += cpuTileCountSample;
+        cpuActiveGroupCountAccum += cpuActiveGroupCountSample;
+        cpuActiveDispatchAccum += cpuActiveDispatchSample;
+        if (canUseFinalActiveTileDispatch)
+            finalUsesCpuActiveTileDispatch = passUsesCpuActiveTileDispatch;
+
+        const u64 rasterCpuStartNs = PerfNowNs();
+        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rasterPipeline);
+        vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+        if (useLegacyRasterWorklist || passUsesCpuActiveTileDispatch)
+            vkCmdDispatchIndirect(CommandBuffer, WorkOffsetBuffer, kRasterDispatchIndirectOffset);
+        else
+            vkCmdDispatch(CommandBuffer, binTilesX, binTilesY, 1);
+        if (timestampQueryPool != VK_NULL_HANDLE)
+            vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 5);
+        vkCmdPipelineBarrier(
+            CommandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            nullptr,
+            1,
+            &resultToReadWriteBarrier,
+            0,
+            nullptr
+        );
+        RasterCpuWindow.Add(PerfNowNs() - rasterCpuStartNs);
     }
 
-    CpuActiveTileCountWindow.Add(cpuActiveTileCountSample);
-    CpuTileCountWindow.Add(cpuTileCountSample);
-    CpuActiveGroupCountWindow.Add(cpuActiveGroupCountSample);
-    CpuActiveDispatchWindow.Add(cpuActiveDispatchSample);
+    const u64 rasterPassCount = std::max<u64>(1u, static_cast<u64>(rasterPasses.size()));
+    CpuActiveTileCountWindow.Add(cpuActiveTileCountAccum / rasterPassCount);
+    CpuTileCountWindow.Add(cpuTileCountAccum / rasterPassCount);
+    CpuActiveGroupCountWindow.Add(cpuActiveGroupCountAccum / rasterPassCount);
+    CpuActiveDispatchWindow.Add(cpuActiveDispatchAccum / rasterPassCount);
 
-    const u64 rasterCpuStartNs = PerfNowNs();
-    vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rasterPipeline);
-    vkCmdPushConstants(CommandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
-    if (useLegacyRasterWorklist || useCpuActiveTileDispatch)
-        vkCmdDispatchIndirect(CommandBuffer, WorkOffsetBuffer, kRasterDispatchIndirectOffset);
-    else
-        vkCmdDispatch(CommandBuffer, binTilesX, binTilesY, 1);
-    if (timestampQueryPool != VK_NULL_HANDLE)
-        vkCmdWriteTimestamp(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, timestampQueryPool, 5);
-    vkCmdPipelineBarrier(
-        CommandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        0,
-        nullptr,
-        1,
-        &resultToReadWriteBarrier,
-        0,
-        nullptr
-    );
-    RasterCpuWindow.Add(PerfNowNs() - rasterCpuStartNs);
-
+    useCpuActiveTileDispatch = canUseFinalActiveTileDispatch && finalUsesCpuActiveTileDispatch;
     pushConstants.variantKey = kVariantWildcard;
     pushConstants.triangleBase = 0;
+    pushConstants.triangleCount = static_cast<u32>(Triangles.size());
+    pushConstants.passIndex = MelonDSAndroid::getVulkanDiagnosticFlags() & ~kDebugFlagFinalActiveTileMask;
     pushConstants.depthBlendMode = frameWBufferMode ? 1u : 0u;
 
     DepthBlendCpuWindow.Add(0);
