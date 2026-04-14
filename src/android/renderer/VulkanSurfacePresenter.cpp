@@ -26,6 +26,17 @@ constexpr u32 kDrawModeBackground = 0u;
 constexpr u32 kDrawModeCompositeFrame = 1u;
 constexpr u32 kDrawModeTopScreen = 2u;
 constexpr u32 kDrawModeBottomScreen = 3u;
+constexpr std::array<VkFormat, 9> kPreferredSurfaceFormats = {
+    VK_FORMAT_R8G8B8A8_UNORM,
+    VK_FORMAT_B8G8R8A8_UNORM,
+    VK_FORMAT_R8G8B8A8_SRGB,
+    VK_FORMAT_B8G8R8A8_SRGB,
+    VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+    VK_FORMAT_A8B8G8R8_SRGB_PACK32,
+    VK_FORMAT_R5G6B5_UNORM_PACK16,
+    VK_FORMAT_A1R5G5B5_UNORM_PACK16,
+    VK_FORMAT_R5G5B5A1_UNORM_PACK16,
+};
 
 struct PresenterPushConstants
 {
@@ -65,17 +76,7 @@ VkSurfaceFormatKHR chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& fo
         };
     }
 
-    constexpr std::array<VkFormat, 7> preferredFormats = {
-        VK_FORMAT_R8G8B8A8_UNORM,
-        VK_FORMAT_B8G8R8A8_UNORM,
-        VK_FORMAT_R8G8B8A8_SRGB,
-        VK_FORMAT_B8G8R8A8_SRGB,
-        VK_FORMAT_A8B8G8R8_UNORM_PACK32,
-        VK_FORMAT_A8B8G8R8_SRGB_PACK32,
-        VK_FORMAT_R5G6B5_UNORM_PACK16,
-    };
-
-    for (const VkFormat preferredFormat : preferredFormats)
+    for (const VkFormat preferredFormat : kPreferredSurfaceFormats)
     {
         for (const VkSurfaceFormatKHR& format : formats)
         {
@@ -84,7 +85,7 @@ VkSurfaceFormatKHR chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& fo
         }
     }
 
-    for (const VkFormat preferredFormat : preferredFormats)
+    for (const VkFormat preferredFormat : kPreferredSurfaceFormats)
     {
         for (const VkSurfaceFormatKHR& format : formats)
         {
@@ -137,6 +138,22 @@ VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& presentM
 
 std::vector<VkSurfaceFormatKHR> rankSurfaceFormats(const std::vector<VkSurfaceFormatKHR>& formats)
 {
+    if (formats.size() == 1 && formats.front().format == VK_FORMAT_UNDEFINED)
+    {
+        // VK_FORMAT_UNDEFINED means "application chooses"; materialize concrete safe formats
+        // instead of feeding UNDEFINED to vkCreateSwapchainKHR on older Adreno stacks.
+        std::vector<VkSurfaceFormatKHR> ranked;
+        ranked.reserve(kPreferredSurfaceFormats.size());
+        for (const VkFormat preferredFormat : kPreferredSurfaceFormats)
+        {
+            ranked.push_back(VkSurfaceFormatKHR{
+                .format = preferredFormat,
+                .colorSpace = formats.front().colorSpace,
+            });
+        }
+        return ranked;
+    }
+
     std::vector<VkSurfaceFormatKHR> ranked;
     ranked.reserve(formats.size());
     std::vector<bool> consumed(formats.size(), false);
@@ -1018,6 +1035,32 @@ bool VulkanSurfacePresenter::ensureSwapchain(SurfaceState& surfaceState)
 
     VkSurfaceFormatKHR surfaceFormat = chooseSurfaceFormat(formats);
     VkPresentModeKHR presentMode = choosePresentMode(presentModes);
+    auto failSwapchainConfig = [&](const char* stage, VkResult result) -> bool {
+        const u64 configKey = makeSwapchainConfigKey(
+            surfaceState.id,
+            surfaceFormat.format,
+            surfaceFormat.colorSpace,
+            presentMode
+        );
+        failedSwapchainConfigs.insert(configKey);
+        if (loggedFailedSwapchainConfigs.insert(configKey).second)
+        {
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Warn,
+                "VulkanSurfacePresenter: rejected swapchain config after %s surface=%d format=%d colorspace=%d presentMode=%d result=%d",
+                stage != nullptr ? stage : "unknown",
+                surfaceState.id,
+                static_cast<int>(surfaceFormat.format),
+                static_cast<int>(surfaceFormat.colorSpace),
+                static_cast<int>(presentMode),
+                static_cast<int>(result)
+            );
+        }
+
+        destroySwapchain(surfaceState);
+        surfaceState.swapchainDirty = true;
+        return false;
+    };
     const VkSurfaceTransformFlagBitsKHR preTransform =
         (capabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
             ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
@@ -1117,8 +1160,9 @@ bool VulkanSurfacePresenter::ensureSwapchain(SurfaceState& surfaceState)
     renderPassInfo.dependencyCount = 1;
     renderPassInfo.pDependencies = &subpassDependency;
 
-    if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &surfaceState.renderPass) != VK_SUCCESS)
-        return false;
+    const VkResult createRenderPassResult = vkCreateRenderPass(device, &renderPassInfo, nullptr, &surfaceState.renderPass);
+    if (createRenderPassResult != VK_SUCCESS)
+        return failSwapchainConfig("vkCreateRenderPass", createRenderPassResult);
 
     const bool swapchainSelectionChanged =
         !surfaceState.hasCachedSwapchainSelection
@@ -1145,13 +1189,29 @@ bool VulkanSurfacePresenter::ensureSwapchain(SurfaceState& surfaceState)
     }
 
     u32 swapchainImageCount = 0;
-    if (vkGetSwapchainImagesKHR(device, surfaceState.swapchain, &swapchainImageCount, nullptr) != VK_SUCCESS
-        || swapchainImageCount == 0)
-        return false;
+    const VkResult getSwapchainImageCountResult = vkGetSwapchainImagesKHR(
+        device,
+        surfaceState.swapchain,
+        &swapchainImageCount,
+        nullptr
+    );
+    if (getSwapchainImageCountResult != VK_SUCCESS || swapchainImageCount == 0)
+    {
+        const VkResult failureResult = getSwapchainImageCountResult != VK_SUCCESS
+            ? getSwapchainImageCountResult
+            : VK_ERROR_FORMAT_NOT_SUPPORTED;
+        return failSwapchainConfig("vkGetSwapchainImagesKHR(count)", failureResult);
+    }
 
     surfaceState.swapchainImages.resize(swapchainImageCount);
-    if (vkGetSwapchainImagesKHR(device, surfaceState.swapchain, &swapchainImageCount, surfaceState.swapchainImages.data()) != VK_SUCCESS)
-        return false;
+    const VkResult getSwapchainImagesResult = vkGetSwapchainImagesKHR(
+        device,
+        surfaceState.swapchain,
+        &swapchainImageCount,
+        surfaceState.swapchainImages.data()
+    );
+    if (getSwapchainImagesResult != VK_SUCCESS)
+        return failSwapchainConfig("vkGetSwapchainImagesKHR(images)", getSwapchainImagesResult);
 
     surfaceState.swapchainImageViews.resize(swapchainImageCount);
     surfaceState.framebuffers.resize(swapchainImageCount);
@@ -1167,8 +1227,9 @@ bool VulkanSurfacePresenter::ensureSwapchain(SurfaceState& surfaceState)
         imageViewInfo.subresourceRange.levelCount = 1;
         imageViewInfo.subresourceRange.layerCount = 1;
 
-        if (vkCreateImageView(device, &imageViewInfo, nullptr, &surfaceState.swapchainImageViews[i]) != VK_SUCCESS)
-            return false;
+        const VkResult createImageViewResult = vkCreateImageView(device, &imageViewInfo, nullptr, &surfaceState.swapchainImageViews[i]);
+        if (createImageViewResult != VK_SUCCESS)
+            return failSwapchainConfig("vkCreateImageView", createImageViewResult);
     }
 
     VkPipelineShaderStageCreateInfo shaderStages[2]{};
@@ -1267,8 +1328,16 @@ bool VulkanSurfacePresenter::ensureSwapchain(SurfaceState& surfaceState)
     pipelineInfo.renderPass = surfaceState.renderPass;
     pipelineInfo.subpass = 0;
 
-    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &surfaceState.pipeline) != VK_SUCCESS)
-        return false;
+    const VkResult createPipelineResult = vkCreateGraphicsPipelines(
+        device,
+        VK_NULL_HANDLE,
+        1,
+        &pipelineInfo,
+        nullptr,
+        &surfaceState.pipeline
+    );
+    if (createPipelineResult != VK_SUCCESS)
+        return failSwapchainConfig("vkCreateGraphicsPipelines", createPipelineResult);
 
     for (u32 i = 0; i < swapchainImageCount; i++)
     {
@@ -1283,8 +1352,14 @@ bool VulkanSurfacePresenter::ensureSwapchain(SurfaceState& surfaceState)
         framebufferInfo.height = extent.height;
         framebufferInfo.layers = 1;
 
-        if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &surfaceState.framebuffers[i]) != VK_SUCCESS)
-            return false;
+        const VkResult createFramebufferResult = vkCreateFramebuffer(
+            device,
+            &framebufferInfo,
+            nullptr,
+            &surfaceState.framebuffers[i]
+        );
+        if (createFramebufferResult != VK_SUCCESS)
+            return failSwapchainConfig("vkCreateFramebuffer", createFramebufferResult);
     }
 
     const bool extentChanged = surfaceState.extent.width != extent.width || surfaceState.extent.height != extent.height;
@@ -2287,11 +2362,14 @@ bool VulkanSurfacePresenter::submitSurfaceCommands(SurfaceState& surfaceState, u
     if (surfaceState.timestampQueryPool != VK_NULL_HANDLE)
         surfaceState.timestampPending = true;
 
-    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR)
     {
         surfaceState.swapchainDirty = true;
         return true;
     }
+
+    if (presentResult == VK_SUBOPTIMAL_KHR)
+        return true;
 
     if (presentResult != VK_SUCCESS)
     {

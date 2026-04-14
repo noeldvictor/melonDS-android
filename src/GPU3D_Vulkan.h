@@ -176,11 +176,8 @@ private:
         u32 passIndex;
         u32 triangleBase;
         u32 depthBlendMode;
-        u32 debugFlags;
-        u32 captureScale;
-        u32 captureSampleOffset;
-        u32 captureFlags;
     };
+    static_assert(sizeof(RasterPushConstants) == 128u, "RasterPushConstants must fit maxPushConstantsSize=128");
 
     struct TriangleGpu
     {

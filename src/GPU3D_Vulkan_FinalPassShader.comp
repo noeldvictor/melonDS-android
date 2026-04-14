@@ -46,10 +46,6 @@ layout(push_constant) uniform PushConsts
     uint passIndex;
     uint triangleBase;
     uint depthBlendMode;
-    uint debugFlags;
-    uint captureScale;
-    uint captureSampleOffset;
-    uint captureFlags;
 } pc;
 
 const uint DEBUG_FLAG_LEGACY_FINAL_AA_MASK = 1u << 2u;
@@ -221,7 +217,7 @@ vec4 unpackColorToVec4(uint color)
 
 bool useFinalActiveTileMask()
 {
-    return (pc.debugFlags & DEBUG_FLAG_FINAL_ACTIVE_TILE_MASK) != 0u;
+    return (pc.passIndex & DEBUG_FLAG_FINAL_ACTIVE_TILE_MASK) != 0u;
 }
 
 bool tileHasWork(uvec2 gid)
@@ -366,7 +362,7 @@ void main()
             colorBottom = blendFog(colorBottom, depthBottom);
     }
 
-    uint finalAaAttrMask = (pc.debugFlags & DEBUG_FLAG_LEGACY_FINAL_AA_MASK) != 0u ? 0x3u : 0xFu;
+    uint finalAaAttrMask = (pc.passIndex & DEBUG_FLAG_LEGACY_FINAL_AA_MASK) != 0u ? 0x3u : 0xFu;
     if (ENABLE_ANTIALIAS != 0u && ((attrTop & finalAaAttrMask) != 0u))
     {
         uint coverage = (attrTop >> 8u) & 0x1Fu;

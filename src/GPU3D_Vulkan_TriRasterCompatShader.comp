@@ -134,7 +134,6 @@ layout(push_constant) uniform PushConsts
     uint passIndex;
     uint triangleBase;
     uint depthBlendMode;
-    uint debugFlags;
 } pc;
 
 const uint TRI_FLAG_TRANSLUCENT = 1u << 0u;
@@ -523,7 +522,7 @@ void main()
     bool needsBoundaryAttrs = antiAliasingEnabled || edgeMarkingEnabled;
     bool frameWBuffer = (pc.depthBlendMode & 0x1u) != 0u;
     bool prevIsShadowMask = prevIsShadowMaskBits != 0u;
-    bool useLegacyFillDepth = (pc.debugFlags & DEBUG_FLAG_LEGACY_FILL_DEPTH) != 0u;
+    bool useLegacyFillDepth = (pc.passIndex & DEBUG_FLAG_LEGACY_FILL_DEPTH) != 0u;
     uint edgeAttrMask = useLegacyFillDepth ? 0x3u : 0xFu;
 
     if (!tileHasWork)

@@ -135,7 +135,6 @@ layout(push_constant) uniform PushConsts
     uint passIndex;
     uint triangleBase;
     uint depthBlendMode;
-    uint debugFlags;
 } pc;
 
 const uint TRI_FLAG_TRANSLUCENT = 1u << 0u;

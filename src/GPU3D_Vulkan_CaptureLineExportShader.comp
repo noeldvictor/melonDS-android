@@ -28,10 +28,6 @@ layout(push_constant) uniform PushConsts
     uint passIndex;
     uint triangleBase;
     uint depthBlendMode;
-    uint debugFlags;
-    uint captureScale;
-    uint captureSampleOffset;
-    uint captureFlags;
 } pc;
 
 uint packColor6A5(vec4 color)
@@ -55,8 +51,8 @@ void main()
 
     uint colorWidth = max(pc.width, 1u);
     uint colorHeight = max(pc.height, 1u);
-    uint captureScale = max(pc.captureScale, 1u);
-    uint captureSampleOffset = min(pc.captureSampleOffset, captureScale - 1u);
+    uint captureScale = max(1u, colorWidth / 256u);
+    uint captureSampleOffset = captureScale > 1u ? (captureScale / 2u) : 0u;
     uint sourceX = min(colorWidth - 1u, gid.x * captureScale + captureSampleOffset);
     uint sourceY = min(colorHeight - 1u, gid.y * captureScale + captureSampleOffset);
 

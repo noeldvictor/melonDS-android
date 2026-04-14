@@ -1582,7 +1582,11 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
     const u32 tilesPerLine = (pushConstants.width + (kTileSize - 1u)) / kTileSize;
     const u32 tileLineCount = (pushConstants.height + (kTileSize - 1u)) / kTileSize;
     const u32 tileCount = std::max<u32>(1u, tilesPerLine * tileLineCount);
-    const u32 triangleCount = std::min<u32>(pushConstants.triangleCount, static_cast<u32>(Triangles.size()));
+    const u32 triangleBase = std::min<u32>(pushConstants.triangleBase, static_cast<u32>(Triangles.size()));
+    const u32 triangleCount = std::min<u32>(
+        pushConstants.triangleCount,
+        static_cast<u32>(Triangles.size()) - triangleBase
+    );
     const u32 groupCount = std::max<u32>(1u, (triangleCount + 31u) / 32u);
     const size_t requiredSpanSetupCount = std::max<size_t>(1u, static_cast<size_t>(triangleCount));
     const size_t requiredBinMaskWords = static_cast<size_t>(tileCount) * static_cast<size_t>(groupCount);
@@ -1613,10 +1617,11 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
         return (triangleVariantKey & kVariantPipelineMask) == (passVariantKey & kVariantPipelineMask);
     };
 
-    for (u32 triangleIdx = 0; triangleIdx < triangleCount; triangleIdx++)
+    for (u32 localTriangleIdx = 0; localTriangleIdx < triangleCount; localTriangleIdx++)
     {
+        const u32 triangleIdx = triangleBase + localTriangleIdx;
         const TriangleGpu& tri = Triangles[triangleIdx];
-        SpanSetupGpu& span = spanSetups[triangleIdx];
+        SpanSetupGpu& span = spanSetups[localTriangleIdx];
         const float p0x = tri.x0;
         const float p0y = tri.y0;
         const float p1x = tri.x1;
@@ -1690,8 +1695,8 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
         const float edge0StepX = edge0.a * kTileSizeF;
         const float edge1StepX = edge1.a * kTileSizeF;
         const float edge2StepX = edge2.a * kTileSizeF;
-        const u32 groupIdx = triangleIdx / 32u;
-        const u32 groupBit = 1u << (triangleIdx & 31u);
+        const u32 groupIdx = localTriangleIdx / 32u;
+        const u32 groupBit = 1u << (localTriangleIdx & 31u);
         for (int tileY = minTileY; tileY <= maxTileY; tileY++)
         {
             const size_t rowTileBase = static_cast<size_t>(tileY) * static_cast<size_t>(tilesPerLine);
@@ -4295,14 +4300,10 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
             + rasterTranslucencyMode;
     };
     pushConstants.variantKey = kVariantWildcard;
-    pushConstants.passIndex = 0;
+    pushConstants.passIndex = MelonDSAndroid::getVulkanDiagnosticFlags();
+    pushConstants.passIndex &= ~kDebugFlagFinalActiveTileMask;
     pushConstants.triangleBase = 0;
     pushConstants.depthBlendMode = frameWBufferMode ? 1u : 0u;
-    pushConstants.debugFlags = MelonDSAndroid::getVulkanDiagnosticFlags();
-    pushConstants.debugFlags &= ~kDebugFlagFinalActiveTileMask;
-    pushConstants.captureScale = std::max(1u, ScaleFactor > 0 ? static_cast<u32>(ScaleFactor) : 1u);
-    pushConstants.captureSampleOffset = pushConstants.captureScale > 1u ? (pushConstants.captureScale / 2u) : 0u;
-    pushConstants.captureFlags = exportCaptureLine ? 1u : 0u;
 
     TriangleCountWindow.Add(static_cast<u64>(Triangles.size()));
     PassCountWindow.Add(1);
@@ -4641,7 +4642,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     pushConstants.triangleBase = 0u;
     pushConstants.triangleCount = static_cast<u32>(Triangles.size());
     pushConstants.variantKey = kVariantWildcard;
-    pushConstants.passIndex = 0u;
 
     const u32 binGroupCount = std::max<u32>(1u, (pushConstants.triangleCount + 31u) / 32u);
     const u32 interpGroupCount = std::max<u32>(1u, (pushConstants.triangleCount + 63u) / 64u);
@@ -4762,7 +4762,7 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         useCpuActiveTileDispatch = cpuActiveTileCountSample == 0u || hasSparseCoverage;
         cpuActiveDispatchSample = useCpuActiveTileDispatch ? 100u : 0u;
         if (useCpuActiveTileDispatch)
-            pushConstants.debugFlags |= kDebugFlagFinalActiveTileMask;
+            pushConstants.passIndex |= kDebugFlagFinalActiveTileMask;
 
         BinCpuWindow.Add(PerfNowNs() - binCpuStartNs);
         WorkOffsetsCpuWindow.Add(0);
@@ -4957,7 +4957,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     RasterCpuWindow.Add(PerfNowNs() - rasterCpuStartNs);
 
     pushConstants.variantKey = kVariantWildcard;
-    pushConstants.passIndex = 0;
     pushConstants.triangleBase = 0;
     pushConstants.depthBlendMode = frameWBufferMode ? 1u : 0u;
 
