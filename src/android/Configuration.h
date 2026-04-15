@@ -15,6 +15,7 @@ struct SoftwareRenderSettings : public RenderSettings
 {
     bool threadedRendering;
     bool rendererDebugToolsEnabled;
+    bool rendererDebugBgObjEnabled;
 };
 
 struct OpenGlRenderSettings : public RenderSettings
@@ -22,6 +23,7 @@ struct OpenGlRenderSettings : public RenderSettings
     bool betterPolygons;
     int scale;
     bool rendererDebugToolsEnabled;
+    bool rendererDebugBgObjEnabled;
     bool conservativeCoverageEnabled;
     float conservativeCoveragePx;
     float conservativeCoverageDepthBias;
@@ -42,6 +44,7 @@ struct VulkanRenderSettings : public RenderSettings
     bool betterPolygons;
     int scale;
     bool rendererDebugToolsEnabled;
+    bool rendererDebugBgObjEnabled;
     bool conservativeCoverageEnabled;
     float conservativeCoveragePx;
     float conservativeCoverageDepthBias;

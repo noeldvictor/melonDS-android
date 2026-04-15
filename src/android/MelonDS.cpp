@@ -38,6 +38,7 @@ namespace MelonDSAndroid
     {
         bool fastForwardActive = false;
         std::atomic_bool rendererDebugToolsEnabled = false;
+        std::atomic_bool rendererDebugBgObjEnabled = false;
         std::atomic_uint vulkanDiagnosticFlags = 0;
 
         bool EqualsIgnoreCase(const char* lhs, const char* rhs)
@@ -111,6 +112,26 @@ namespace MelonDSAndroid
                     return static_cast<const OpenGlRenderSettings&>(*configuration.renderSettings).rendererDebugToolsEnabled;
                 case Renderer::Vulkan:
                     return static_cast<const VulkanRenderSettings&>(*configuration.renderSettings).rendererDebugToolsEnabled;
+                case Renderer::Compute:
+                    return false;
+            }
+
+            return false;
+        }
+
+        bool ResolveRendererDebugBgObjEnabled(const EmulatorConfiguration& configuration)
+        {
+            if (!configuration.renderSettings)
+                return false;
+
+            switch (configuration.renderer)
+            {
+                case Renderer::Software:
+                    return static_cast<const SoftwareRenderSettings&>(*configuration.renderSettings).rendererDebugBgObjEnabled;
+                case Renderer::OpenGl:
+                    return static_cast<const OpenGlRenderSettings&>(*configuration.renderSettings).rendererDebugBgObjEnabled;
+                case Renderer::Vulkan:
+                    return static_cast<const VulkanRenderSettings&>(*configuration.renderSettings).rendererDebugBgObjEnabled;
                 case Renderer::Compute:
                     return false;
             }
@@ -243,6 +264,7 @@ namespace MelonDSAndroid
         currentConfiguration = ShareConfiguration(std::move(emulatorConfiguration));
         internalFilesDir = currentConfiguration->internalFilesDir;
         rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*currentConfiguration), std::memory_order_relaxed);
+        rendererDebugBgObjEnabled.store(ResolveRendererDebugBgObjEnabled(*currentConfiguration), std::memory_order_relaxed);
         vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
 
         net = std::make_shared<Net>();
@@ -362,6 +384,7 @@ namespace MelonDSAndroid
 
         currentConfiguration = sharedConfig;
         rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*sharedConfig), std::memory_order_relaxed);
+        rendererDebugBgObjEnabled.store(ResolveRendererDebugBgObjEnabled(*sharedConfig), std::memory_order_relaxed);
         vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
     }
 
@@ -526,6 +549,12 @@ namespace MelonDSAndroid
     bool areRendererDebugToolsEnabled()
     {
         return rendererDebugToolsEnabled.load(std::memory_order_relaxed);
+    }
+
+    bool areRendererDebugBgObjLogsEnabled()
+    {
+        return rendererDebugToolsEnabled.load(std::memory_order_relaxed)
+            && rendererDebugBgObjEnabled.load(std::memory_order_relaxed);
     }
 
     u32 getVulkanDiagnosticFlags()

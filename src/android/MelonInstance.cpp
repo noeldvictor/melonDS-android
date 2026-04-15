@@ -107,13 +107,12 @@ FrameQueuePolicy makeLegacyFrameQueuePolicy()
 FrameQueuePolicy makeVulkanRealtimeFrameQueuePolicy(int renderScale)
 {
     FrameQueuePolicy policy{};
-    const bool highResolutionRealtime = renderScale > 1;
-    policy.MaxBacklogDepth = highResolutionRealtime ? 2 : 1;
+    policy.MaxBacklogDepth = renderScale > 1 ? 2 : 1;
     policy.AllowStealPending = false;
     policy.AllowPreviousFrameReuse = true;
     policy.AllowDropForDeadline = false;
     policy.PreferOldestFrame = false;
-    policy.PreserveBacklogOnPresent = highResolutionRealtime;
+    policy.PreserveBacklogOnPresent = false;
     return policy;
 }
 

@@ -24,6 +24,7 @@
 namespace MelonDSAndroid
 {
 bool areRendererDebugToolsEnabled();
+bool areRendererDebugBgObjLogsEnabled();
 }
 
 namespace
@@ -848,7 +849,7 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         {"seamC", 150u, 81u},
         {"goodC", 149u, 81u},
     };
-    const bool logCaptureSamples = MelonDSAndroid::areRendererDebugToolsEnabled();
+    const bool logCaptureSamples = MelonDSAndroid::areRendererDebugBgObjLogsEnabled();
 
     // forced blank disables BG/OBJ compositing
     if (CurUnit->DispCnt & (1<<7))

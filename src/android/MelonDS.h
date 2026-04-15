@@ -92,6 +92,7 @@ namespace MelonDSAndroid {
         std::optional<std::chrono::time_point<std::chrono::steady_clock>> budgetDeadline);
     extern void requestVulkanPresentationResync();
     extern bool areRendererDebugToolsEnabled();
+    extern bool areRendererDebugBgObjLogsEnabled();
     extern u32 getVulkanDiagnosticFlags();
     extern bool hasVulkanDiagnosticFlag(VulkanDiagnosticFlag flag);
     extern std::vector<u32> captureCurrentFrameForDebug();
