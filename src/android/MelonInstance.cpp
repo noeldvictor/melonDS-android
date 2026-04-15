@@ -430,6 +430,12 @@ void MelonInstance::loadGbaMemoryExpansion()
     nds->SetGBACart(std::move(memoryExpansionCart));
 }
 
+void MelonInstance::loadGbaAnalogInput()
+{
+    auto analogInputCart = GBACart::LoadAddon(GBAAddon_Analog, this);
+    nds->SetGBACart(std::move(analogInputCart));
+}
+
 void MelonInstance::loadGbaRumblePak()
 {
     auto rumbleCart = GBACart::LoadAddon(GBAAddon_RumblePak, this);
@@ -564,6 +570,9 @@ u32 MelonInstance::runFrame()
 
     if (!nds->IsRunning())
         return 0;
+
+    nds->GBACartSlot.SetInput(GBACart::Input_AnalogX, slot2AnalogX.load(std::memory_order_relaxed));
+    nds->GBACartSlot.SetInput(GBACart::Input_AnalogY, slot2AnalogY.load(std::memory_order_relaxed));
 
     int screenWidth;
     int screenHeight;
@@ -838,6 +847,12 @@ void MelonInstance::releaseKey(u32 key)
         inputMask |= (1 << key);
         nds->SetKeyMask(inputMask);
     }
+}
+
+void MelonInstance::setSlot2AnalogInput(float x, float y)
+{
+    slot2AnalogX.store(std::clamp(x, -1.0f, 1.0f), std::memory_order_relaxed);
+    slot2AnalogY.store(std::clamp(y, -1.0f, 1.0f), std::memory_order_relaxed);
 }
 
 int MelonInstance::readAudioOutput(s16* buffer, int length)
@@ -1654,6 +1669,14 @@ void MelonInstance::requestFirmwareSaveWrite(const u8* saveData, u32 saveLength,
 {
     if (firmwareSave)
         firmwareSave->RequestFlush(saveData, saveLength, writeOffset, writeLength);
+}
+
+bool MelonInstance::areSaveStatesAllowed()
+{
+    if (!retroAchievementsManager)
+        return true;
+
+    return retroAchievementsManager->AreSaveStatesAllowed();
 }
 
 bool MelonInstance::saveState(Savestate* state, bool refreshScreenshot)

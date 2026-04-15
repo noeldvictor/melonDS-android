@@ -384,6 +384,11 @@ namespace MelonDSAndroid
         {
             instance->loadGbaMemoryExpansion();
         }
+        else if (gbaSlotConfig->type == ANALOG_INPUT)
+        {
+            Platform::Log(Platform::LogLevel::Warn, "MelonDSAndroid: enabling Slot-2 analog input addon\n");
+            instance->loadGbaAnalogInput();
+        }
 
         return 0;
     }
@@ -427,6 +432,12 @@ namespace MelonDSAndroid
     {
         if (instance)
             instance->releaseKey(key);
+    }
+
+    void setSlot2AnalogInput(float x, float y)
+    {
+        if (instance)
+            instance->setSlot2AnalogInput(x, y);
     }
 
     void start()
@@ -665,6 +676,12 @@ namespace MelonDSAndroid
 
     bool loadState(const char* path)
     {
+        if (!instance->areSaveStatesAllowed())
+        {
+            Platform::Log(Platform::LogLevel::Warn, "Savestate load denied: RetroAchievements hardcore session active\n");
+            return false;
+        }
+
         auto saveStateFile = Platform::OpenFile(path, Platform::FileMode::Read);
         if (!saveStateFile)
         {
@@ -717,6 +734,12 @@ namespace MelonDSAndroid
 
     bool loadRewindState(melonDS::RewindSaveState rewindSaveState)
     {
+        if (!instance->areSaveStatesAllowed())
+        {
+            Platform::Log(Platform::LogLevel::Warn, "Rewind load denied: RetroAchievements hardcore session active\n");
+            return false;
+        }
+
         std::unique_ptr<Savestate> backup = std::make_unique<Savestate>(Savestate::DEFAULT_SIZE);
         if (backup->Error)
         {

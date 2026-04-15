@@ -2,6 +2,7 @@
 #define MELONINSTANCE_H
 
 #include <string>
+#include <atomic>
 #include "Args.h"
 #include "Configuration.h"
 #include "NDS.h"
@@ -36,6 +37,7 @@ public:
     bool loadGbaRom(std::string romPath, std::string sramPath);
     void loadRumblePak();
     void loadGbaMemoryExpansion();
+    void loadGbaAnalogInput();
     void loadGbaRumblePak();
     bool bootFirmware();
     bool precompileVulkanPipelines();
@@ -48,6 +50,7 @@ public:
     void releaseScreen();
     void pressKey(u32 key);
     void releaseKey(u32 key);
+    void setSlot2AnalogInput(float x, float y);
     int readAudioOutput(s16* buffer, int length);
     void setAudioOutputSkew(double skew);
     void loadCheats(std::list<Cheat> cheats);
@@ -79,6 +82,7 @@ public:
     void requestNdsSaveWrite(const u8* saveData, u32 saveLength, u32 writeOffset, u32 writeLength);
     void requestGbaSaveWrite(const u8* saveData, u32 saveLength, u32 writeOffset, u32 writeLength);
     void requestFirmwareSaveWrite(const u8* saveData, u32 saveLength, u32 writeOffset, u32 writeLength);
+    bool areSaveStatesAllowed();
     bool saveState(Savestate* state, bool refreshScreenshot);
     bool loadState(Savestate* state);
     RewindWindow getRewindWindow();
@@ -117,6 +121,8 @@ private:
     std::unique_ptr<SaveManager> gbaSave;
     std::unique_ptr<SaveManager> firmwareSave;
     u32 inputMask;
+    std::atomic<float> slot2AnalogX = 0.0f;
+    std::atomic<float> slot2AnalogY = 0.0f;
 
     std::shared_ptr<EmulatorConfiguration> currentConfiguration;
     FrameQueue frameQueue;

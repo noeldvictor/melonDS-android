@@ -9,7 +9,8 @@ namespace MelonDSAndroid
         NONE = 0,
         GBA_ROM = 1,
         RUMBLE_PAK = 2,
-        MEMORY_EXPANSION = 3
+        MEMORY_EXPANSION = 3,
+        ANALOG_INPUT = 4,
     } ;
 
     struct RomGbaSlotConfig {
@@ -32,6 +33,10 @@ namespace MelonDSAndroid
 
     struct RomGbaSlotConfigMemoryExpansion {
         RomGbaSlotConfig _base = { .type = RomGbaSlotConfigType::MEMORY_EXPANSION };
+    };
+
+    struct RomGbaSlotConfigAnalogInput {
+        RomGbaSlotConfig _base = { .type = RomGbaSlotConfigType::ANALOG_INPUT };
     };
 }
 

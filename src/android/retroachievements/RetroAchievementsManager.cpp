@@ -1038,6 +1038,17 @@ std::vector<long> RetroAchievementsManager::GetRuntimeSubsetIds()
     return subsetIds;
 }
 
+bool RetroAchievementsManager::AreSaveStatesAllowed()
+{
+    std::unique_lock lock(runtimeLock);
+
+    if (!runtimeBridgeConfig.has_value() || !runtimeBridgeConfig->hardcoreEnabled)
+        return true;
+
+    const bool hasActiveRuntimeData = IsRcClientRuntimeActiveLocked() || !loadedAchievements.empty() || !loadedLeaderboards.empty();
+    return !hasActiveRuntimeData;
+}
+
 bool RetroAchievementsManager::DoSavestate(Savestate* savestate)
 {
     std::unique_lock lock(runtimeLock);
