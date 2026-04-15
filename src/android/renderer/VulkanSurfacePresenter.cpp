@@ -45,6 +45,7 @@ struct PresenterPushConstants
     u32 rendererWidth;
     u32 rendererHeight;
     u32 packedStride;
+    u32 filtering;
 };
 
 bool isPreferredAndroidSurfaceFormat(VkFormat format)
@@ -2290,6 +2291,7 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
         pushConstants.rendererWidth = inputs.rendererWidth;
         pushConstants.rendererHeight = inputs.rendererHeight;
         pushConstants.packedStride = inputs.packedStride;
+        pushConstants.filtering = surfaceState.config.filtering == VulkanPresenterFilter::Linear ? 1u : 0u;
         vkCmdPushConstants(
             surfaceState.commandBuffer,
             pipelineLayout,

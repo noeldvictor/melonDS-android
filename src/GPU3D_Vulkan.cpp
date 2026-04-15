@@ -352,10 +352,10 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
     const bool captureSource3d = (captureCnt & (1u << 24u)) != 0u;
     const bool preservePreparedCpuCapture = HasCpuFrame && captureEnabled && (captureMode != 1u);
     const bool captureNeedsCpuReadback = captureEnabled && (captureMode != 1u) && deviceProfile.IsAdreno;
-    // Adreno stays on the stable readback capture path here because the
-    // VCount144 export path can cross top/bottom when both DS screens depend
-    // on 3D in the same frame.
-    const bool captureNeedsGpuCaptureLine = captureEnabled && (captureMode != 1u) && !deviceProfile.IsAdreno;
+    // Keep CPU readback on Adreno for diagnostics/snapshot parity, but always
+    // export capture lines from the final Vulkan pass so GetLine() has valid
+    // source-A data when both DS screens depend on 3D capture in one frame.
+    const bool captureNeedsGpuCaptureLine = captureEnabled && (captureMode != 1u);
 
     CpuTileBinningEnabled = Threaded && deviceProfile.IsAdreno;
 
@@ -527,6 +527,9 @@ u32* VulkanRenderer3D::GetLine(int line)
         resetCaptureLineState();
     }
 
+    if (CaptureLineReady && ReadyCaptureLineData != nullptr)
+        HasCpuFrame = copyReadyCaptureLineToLineCache();
+
     if (!HasCpuFrame && CaptureReadbackPending && finalizeCaptureReadback(true))
         convertReadbackToLineCache();
 
@@ -534,22 +537,22 @@ u32* VulkanRenderer3D::GetLine(int line)
     {
         if (CaptureLineReady && ReadyCaptureLineData != nullptr)
         {
-            // DS-sized capture lines are written directly by CaptureLineExport.
-            HasCpuFrame = true;
+            // Latch capture export to a stable CPU buffer. Returning the
+            // persistently mapped GPU buffer directly can flicker when threaded
+            // contexts rotate and overwrite capture lines mid-composition.
+            HasCpuFrame = copyReadyCaptureLineToLineCache();
         }
         else if (readbackColorTargetToCpu(true))
             convertReadbackToLineCache();
-        else
-            clearLineCache();
+        // Keep the last valid line cache if capture readback is temporarily
+        // unavailable; clearing here causes visible black flashes on capture
+        // driven screens.
     }
 
     if (line < 0)
         line = 0;
     else if (line > 191)
         line = 191;
-
-    if (CaptureLineReady && ReadyCaptureLineData != nullptr)
-        return const_cast<u32*>(&ReadyCaptureLineData[static_cast<size_t>(line) * 256u]);
 
     return &LineCache[static_cast<size_t>(line) * 256u];
 }
@@ -562,6 +565,17 @@ void VulkanRenderer3D::PrepareCaptureFrame()
 {
     CapturePrepareRequestCount++;
 
+    if (CaptureLinePending || CaptureLineReady)
+    {
+        if (finalizeCaptureLineFrame(false))
+        {
+            HasCpuFrame = copyReadyCaptureLineToLineCache();
+            return;
+        }
+        if (CaptureLinePending)
+            return;
+    }
+
     if (!HasCpuFrame && CaptureReadbackPending)
     {
         if (finalizeCaptureReadback(false))
@@ -570,14 +584,6 @@ void VulkanRenderer3D::PrepareCaptureFrame()
             return;
         }
         if (CaptureReadbackPending)
-            return;
-    }
-
-    if (CaptureLinePending || CaptureLineReady)
-    {
-        if (finalizeCaptureLineFrame(false))
-            return;
-        if (CaptureLinePending)
             return;
     }
 
@@ -590,7 +596,6 @@ void VulkanRenderer3D::PrepareCaptureFrame()
     if (!readbackColorTargetToCpu(true))
     {
         HasCpuFrame = false;
-        clearLineCache();
         return;
     }
 
@@ -6928,6 +6933,15 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
     }
 }
 
+bool VulkanRenderer3D::copyReadyCaptureLineToLineCache()
+{
+    if (ReadyCaptureLineData == nullptr)
+        return false;
+
+    std::memcpy(LineCache.data(), ReadyCaptureLineData, LineCache.size() * sizeof(u32));
+    return true;
+}
+
 void VulkanRenderer3D::convertReadbackToLineCache()
 {
     if (!HasCpuFrame || RawReadbackWidth == 0 || RawReadbackHeight == 0 || RawReadbackRgba.empty())
@@ -6961,12 +6975,13 @@ void VulkanRenderer3D::convertReadbackToLineCache()
     }
 
     const u32 sampleScale = static_cast<u32>(std::max(1, ScaleFactor));
+    const u32 sampleOffset = sampleScale > 1u ? (sampleScale / 2u) : 0u;
     for (u32 y = 0; y < 192; y++)
     {
-        const u32 sourceY = std::min(RawReadbackHeight - 1, y * sampleScale);
+        const u32 sourceY = std::min(RawReadbackHeight - 1, y * sampleScale + sampleOffset);
         for (u32 x = 0; x < 256; x++)
         {
-            const u32 sourceX = std::min(RawReadbackWidth - 1, x * sampleScale);
+            const u32 sourceX = std::min(RawReadbackWidth - 1, x * sampleScale + sampleOffset);
             const u32 sourcePixel = RawReadbackRgba[static_cast<size_t>(sourceY) * static_cast<size_t>(RawReadbackWidth) + sourceX];
 
             const u32 r = sourcePixel & 0xFF;

@@ -20,6 +20,7 @@ layout(push_constant) uniform PresenterPushConstants
     uint rendererWidth;
     uint rendererHeight;
     uint packedStride;
+    uint filtering;
 } pushConstants;
 
 layout(location = 0) in vec2 fragUv;
@@ -100,10 +101,42 @@ uint readPacked(bool topScreen, int y, int x)
     return topScreen ? topPacked[offset] : bottomPacked[offset];
 }
 
+vec3 color6ToRgb01(Rgba6 color)
+{
+    return vec3(
+        float(toColor8(color.r)) * (1.0 / 255.0),
+        float(toColor8(color.g)) * (1.0 / 255.0),
+        float(toColor8(color.b)) * (1.0 / 255.0)
+    );
+}
+
+Rgba6 samplePackedWithBrightness(
+    bool topScreen,
+    int sourceX,
+    int sourceY,
+    int displayMode,
+    int brightnessMode,
+    int brightnessFactor)
+{
+    Rgba6 pixel = unpackColor6(readPacked(topScreen, sourceY, sourceX));
+
+    if (displayMode != 0)
+    {
+        if (brightnessMode == 1)
+            applyBrightnessUp(pixel, brightnessFactor);
+        else if (brightnessMode == 2)
+            applyBrightnessDown(pixel, brightnessFactor, 0xF);
+    }
+
+    return pixel;
+}
+
 vec4 composeScreenColor(bool topScreen)
 {
-    int sourceX = clamp(int(fragUv.x * 256.0), 0, 255);
-    int sourceY = clamp(int((1.0 - fragUv.y) * 192.0), 0, 191);
+    float sourceXFloat = clamp(fragUv.x * 256.0, 0.0, 255.0);
+    float sourceYFloat = clamp((1.0 - fragUv.y) * 192.0, 0.0, 191.0);
+    int sourceX = int(sourceXFloat);
+    int sourceY = int(sourceYFloat);
 
     uint masterBrightness = readPacked(topScreen, sourceY, 256 * 3);
     int displayMode = int((masterBrightness >> 16u) & 0x3u);
@@ -179,20 +212,32 @@ vec4 composeScreenColor(bool topScreen)
         pixel = val1;
     }
 
-    if (displayMode != 0)
+    if (displayMode == 1)
+        return vec4(color6ToRgb01(pixel), fragAlpha);
+
+    if (pushConstants.filtering != 0u)
     {
-        if (brightnessMode == 1)
-            applyBrightnessUp(pixel, brightnessFactor);
-        else if (brightnessMode == 2)
-            applyBrightnessDown(pixel, brightnessFactor, 0xF);
+        float linearX = clamp(sourceXFloat - 0.5, 0.0, 255.0);
+        float linearY = clamp(sourceYFloat - 0.5, 0.0, 191.0);
+        int x0 = int(floor(linearX));
+        int y0 = int(floor(linearY));
+        int x1 = min(x0 + 1, 255);
+        int y1 = min(y0 + 1, 191);
+        float tx = linearX - float(x0);
+        float ty = linearY - float(y0);
+
+        vec3 c00 = color6ToRgb01(samplePackedWithBrightness(topScreen, x0, y0, displayMode, brightnessMode, brightnessFactor));
+        vec3 c10 = color6ToRgb01(samplePackedWithBrightness(topScreen, x1, y0, displayMode, brightnessMode, brightnessFactor));
+        vec3 c01 = color6ToRgb01(samplePackedWithBrightness(topScreen, x0, y1, displayMode, brightnessMode, brightnessFactor));
+        vec3 c11 = color6ToRgb01(samplePackedWithBrightness(topScreen, x1, y1, displayMode, brightnessMode, brightnessFactor));
+        vec3 cx0 = mix(c00, c10, tx);
+        vec3 cx1 = mix(c01, c11, tx);
+        vec3 finalColor = mix(cx0, cx1, ty);
+        return vec4(finalColor, fragAlpha);
     }
 
-    return vec4(
-        float(toColor8(pixel.r)) * (1.0 / 255.0),
-        float(toColor8(pixel.g)) * (1.0 / 255.0),
-        float(toColor8(pixel.b)) * (1.0 / 255.0),
-        fragAlpha
-    );
+    pixel = samplePackedWithBrightness(topScreen, sourceX, sourceY, displayMode, brightnessMode, brightnessFactor);
+    return vec4(color6ToRgb01(pixel), fragAlpha);
 }
 
 void main()

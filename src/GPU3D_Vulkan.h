@@ -332,6 +332,7 @@ private:
         bool captureReadbackPath = false);
     bool readbackColorTargetToCpu(bool capturePath = false);
     bool readbackResultBufferToCpu();
+    bool copyReadyCaptureLineToLineCache();
     void convertReadbackToLineCache();
     u32 buildClearColorRgba8(const GPU& gpu) const;
     void clearLineCache();
