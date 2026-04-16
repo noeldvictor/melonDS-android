@@ -210,6 +210,7 @@ private:
         float x0;
         float y0;
         float z0;
+        // Reciprocal clip-space W (1 / max(w, 1)) for perspective interpolation.
         float w0;
         float x1;
         float y1;

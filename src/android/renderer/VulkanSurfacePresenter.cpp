@@ -26,6 +26,7 @@ constexpr u32 kDrawModeBackground = 0u;
 constexpr u32 kDrawModeCompositeFrame = 1u;
 constexpr u32 kDrawModeTopScreen = 2u;
 constexpr u32 kDrawModeBottomScreen = 3u;
+constexpr u64 kFastForwardPresenterBudgetNs = 1'000'000ull;
 constexpr std::array<VkFormat, 9> kPreferredSurfaceFormats = {
     VK_FORMAT_R8G8B8A8_UNORM,
     VK_FORMAT_B8G8R8A8_UNORM,
@@ -678,7 +679,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
 
         const u64 remainingBudgetNs = [&]() -> u64 {
             if (fastForwardActive)
-                return 0;
+                return kFastForwardPresenterBudgetNs;
             if (deadlineNs == UINT64_MAX)
                 return UINT64_MAX;
 
@@ -717,7 +718,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         u32 imageIndex = 0;
         const u64 acquireBudgetNs = [&]() -> u64 {
             if (fastForwardActive)
-                return 0;
+                return kFastForwardPresenterBudgetNs;
             if (deadlineNs == UINT64_MAX)
                 return UINT64_MAX;
 

@@ -792,9 +792,9 @@ void main()
             vec3 interpBary = bary;
             if (!linearInterp)
             {
-                float recipW0 = 1.0 / max(tri.w0, 1.0);
-                float recipW1 = 1.0 / max(tri.w1, 1.0);
-                float recipW2 = 1.0 / max(tri.w2, 1.0);
+                float recipW0 = tri.w0;
+                float recipW1 = tri.w1;
+                float recipW2 = tri.w2;
                 vec3 weighted = vec3(bary.x * recipW0, bary.y * recipW1, bary.z * recipW2);
                 float weightedSum = weighted.x + weighted.y + weighted.z;
                 if (abs(weightedSum) > 0.000001)

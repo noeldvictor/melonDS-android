@@ -6835,19 +6835,23 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
             u32 boundaryFlags,
             u32 packedYBounds)
         {
+            auto reciprocalW = [](float w) {
+                return 1.0f / std::max(w, 1.0f);
+            };
+
             TriangleGpu triangle{};
             triangle.x0 = vertex0.x;
             triangle.y0 = vertex0.y;
             triangle.z0 = vertex0.z;
-            triangle.w0 = vertex0.w;
+            triangle.w0 = reciprocalW(vertex0.w);
             triangle.x1 = vertex1.x;
             triangle.y1 = vertex1.y;
             triangle.z1 = vertex1.z;
-            triangle.w1 = vertex1.w;
+            triangle.w1 = reciprocalW(vertex1.w);
             triangle.x2 = vertex2.x;
             triangle.y2 = vertex2.y;
             triangle.z2 = vertex2.z;
-            triangle.w2 = vertex2.w;
+            triangle.w2 = reciprocalW(vertex2.w);
 
             triangle.u0 = vertex0.u;
             triangle.v0 = vertex0.v;

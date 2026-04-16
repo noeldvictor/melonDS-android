@@ -622,27 +622,25 @@ bool VulkanContext::initializeLocked()
         TimelineSemaphoresSupported = enableTimelineSemaphores;
         DynamicTextureIndexingSupported = enableDynamicTextureIndexing;
         DeviceProfile = makeDeviceProfile(deviceProperties);
-        // Keep a strict denylist for known-unstable non-uniform paths.
-        // Adreno 740 (0x43050a01) has shown intermittent VK_ERROR_DEVICE_LOST
-        // under display-capture textured raster workloads.
-        const bool forceCompatTexturePath =
-            DeviceProfile.IsAdreno && deviceProperties.deviceID == 0x43050a01u;
+        // Keep Qualcomm/Adreno on the compatibility descriptor path unless we
+        // have explicit proof that non-uniform indexing is stable there.
+        const bool forceCompatTexturePath = DeviceProfile.IsQualcomm || DeviceProfile.IsAdreno;
         NonUniformTextureIndexingSupported = enableDescriptorIndexing && !forceCompatTexturePath;
         if (enableDescriptorIndexing && forceCompatTexturePath)
         {
             Platform::Log(
                 Platform::LogLevel::Warn,
-                "VulkanContext: forcing compatibility texture path on known-unstable device '%s' (vendor=%#x device=%#x)",
+                "VulkanContext: forcing compatibility texture path on '%s' (vendor=%#x device=%#x)",
                 deviceProperties.deviceName,
                 deviceProperties.vendorID,
                 deviceProperties.deviceID
             );
         }
-        if (enableDescriptorIndexing && NonUniformTextureIndexingSupported && DeviceProfile.IsAdreno)
+        if (enableDescriptorIndexing && NonUniformTextureIndexingSupported)
         {
             Platform::Log(
                 Platform::LogLevel::Warn,
-                "VulkanContext: enabling non-uniform texture path on Adreno '%s' (vendor=%#x device=%#x)",
+                "VulkanContext: enabling non-uniform texture path on '%s' (vendor=%#x device=%#x)",
                 deviceProperties.deviceName,
                 deviceProperties.vendorID,
                 deviceProperties.deviceID
