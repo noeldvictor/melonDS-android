@@ -1944,20 +1944,7 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
 
                 const size_t linearTile = rowTileBase + static_cast<size_t>(tileX);
                 const size_t maskIndex = linearTile * static_cast<size_t>(groupCount) + static_cast<size_t>(groupIdx);
-                const u32 previousMask = binMaskValues[maskIndex];
-                binMaskValues[maskIndex] = previousMask | groupBit;
-                if (previousMask == 0u)
-                {
-                    const u32 slot = groupListValues[linearTile]++;
-                    if (slot < groupCount)
-                    {
-                        const size_t listIndex =
-                            static_cast<size_t>(tileCount)
-                            + linearTile * static_cast<size_t>(groupCount)
-                            + static_cast<size_t>(slot);
-                        groupListValues[listIndex] = groupIdx;
-                    }
-                }
+                binMaskValues[maskIndex] |= groupBit;
 
                 tileMinX += kTileSizeF;
                 edge0MinMin += edge0StepX;
@@ -1971,6 +1958,21 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
     }
 
     const size_t tileGroupListBase = static_cast<size_t>(tileCount);
+    for (u32 linearTile = 0; linearTile < tileCount; linearTile++)
+    {
+        const size_t maskBase = static_cast<size_t>(linearTile) * static_cast<size_t>(groupCount);
+        const size_t listBase = tileGroupListBase + static_cast<size_t>(linearTile) * static_cast<size_t>(groupCount);
+        u32 tileGroupCount = 0u;
+        for (u32 groupIdx = 0; groupIdx < groupCount; groupIdx++)
+        {
+            if (binMaskValues[maskBase + static_cast<size_t>(groupIdx)] == 0u)
+                continue;
+            groupListValues[listBase + static_cast<size_t>(tileGroupCount)] = groupIdx;
+            tileGroupCount++;
+        }
+        groupListValues[linearTile] = tileGroupCount;
+    }
+
     const size_t compactGroupListBase = static_cast<size_t>(kWorkTileOffsetsBase)
         + static_cast<size_t>(tileCount + 1u)
         + static_cast<size_t>(tileCount);
