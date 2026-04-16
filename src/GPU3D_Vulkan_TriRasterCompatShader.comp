@@ -459,7 +459,6 @@ void main()
 
     const uint groupCount = max(1u, (pc.triangleCount + 31u) / 32u);
     const uint maskBase = linearTile * groupCount;
-    const uint tileGroupListBase = tileCount;
     const uint compactGroupListBase = WORK_TILE_OFFSETS_BASE + tileCount + 1u + tileCount;
     uint tileGroupOffsetStart = 0u;
     uint tileGroupOffsetEnd = groupCount;
@@ -538,15 +537,18 @@ void main()
         return;
     }
 
-    for (uint activeGroupIndex = 0u; activeGroupIndex < activeGroupCount; activeGroupIndex++)
+    const uint groupIterationCount = useActiveTileDispatch ? activeGroupCount : groupCount;
+    for (uint activeGroupIndex = 0u; activeGroupIndex < groupIterationCount; activeGroupIndex++)
     {
         uint groupIdx = useActiveTileDispatch
             ? workOffsetValues[compactGroupListBase + tileGroupOffsetStart + activeGroupIndex]
-            : groupListValues[tileGroupListBase + linearTile * groupCount + activeGroupIndex];
+            : activeGroupIndex;
         if (groupIdx >= groupCount)
             continue;
 
         uint mask = binMaskValues[maskBase + groupIdx];
+        if (mask == 0u)
+            continue;
         while (mask != 0u)
         {
             uint bit = uint(findLSB(mask));

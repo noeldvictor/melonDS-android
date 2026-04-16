@@ -40,6 +40,7 @@ namespace MelonDSAndroid
         std::atomic_bool rendererDebugToolsEnabled = false;
         std::atomic_bool rendererDebugBgObjEnabled = false;
         std::atomic_uint vulkanDiagnosticFlags = 0;
+        std::atomic_uint forcedVulkanRasterDispatchOverride = VulkanRasterDispatchAuto;
 
         bool EqualsIgnoreCase(const char* lhs, const char* rhs)
         {
@@ -97,6 +98,38 @@ namespace MelonDSAndroid
                 flags |= VulkanDiagnosticLegacyFinalAaMask;
 
             return flags;
+        }
+
+        u32 ResolveForcedVulkanRasterDispatchOverride()
+        {
+            char value[PROP_VALUE_MAX]{};
+            const int length = __system_property_get("debug.melonds.vulkan.force_raster_dispatch", value);
+            if (length <= 0)
+                return VulkanRasterDispatchAuto;
+
+            if (EqualsIgnoreCase(value, "cpu"))
+                return VulkanRasterDispatchCpu;
+            if (EqualsIgnoreCase(value, "direct"))
+                return VulkanRasterDispatchDirect;
+            if (EqualsIgnoreCase(value, "legacy"))
+                return VulkanRasterDispatchLegacy;
+            return VulkanRasterDispatchAuto;
+        }
+
+        const char* VulkanRasterDispatchOverrideName(u32 overrideValue)
+        {
+            switch (overrideValue)
+            {
+                case VulkanRasterDispatchCpu:
+                    return "cpu";
+                case VulkanRasterDispatchDirect:
+                    return "direct";
+                case VulkanRasterDispatchLegacy:
+                    return "legacy";
+                case VulkanRasterDispatchAuto:
+                default:
+                    return "auto";
+            }
         }
 
         bool ResolveRendererDebugToolsEnabled(const EmulatorConfiguration& configuration)
@@ -266,6 +299,16 @@ namespace MelonDSAndroid
         rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*currentConfiguration), std::memory_order_relaxed);
         rendererDebugBgObjEnabled.store(ResolveRendererDebugBgObjEnabled(*currentConfiguration), std::memory_order_relaxed);
         vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
+        forcedVulkanRasterDispatchOverride.store(ResolveForcedVulkanRasterDispatchOverride(), std::memory_order_relaxed);
+
+        if (currentConfiguration->renderer == Renderer::Vulkan)
+        {
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "VulkanRuntime[Dispatch]: override=%s",
+                VulkanRasterDispatchOverrideName(forcedVulkanRasterDispatchOverride.load(std::memory_order_relaxed))
+            );
+        }
 
         net = std::make_shared<Net>();
         net->SetDriver(std::make_unique<Net_Slirp>([](const u8* data, int len) {
@@ -386,6 +429,16 @@ namespace MelonDSAndroid
         rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*sharedConfig), std::memory_order_relaxed);
         rendererDebugBgObjEnabled.store(ResolveRendererDebugBgObjEnabled(*sharedConfig), std::memory_order_relaxed);
         vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
+        forcedVulkanRasterDispatchOverride.store(ResolveForcedVulkanRasterDispatchOverride(), std::memory_order_relaxed);
+
+        if (sharedConfig->renderer == Renderer::Vulkan)
+        {
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "VulkanRuntime[Dispatch]: override=%s",
+                VulkanRasterDispatchOverrideName(forcedVulkanRasterDispatchOverride.load(std::memory_order_relaxed))
+            );
+        }
     }
 
     int loadRom(std::string romPath, std::string sramPath, RomGbaSlotConfig* gbaSlotConfig)
@@ -562,6 +615,11 @@ namespace MelonDSAndroid
         return vulkanDiagnosticFlags.load(std::memory_order_relaxed);
     }
 
+    u32 getForcedVulkanRasterDispatchOverride()
+    {
+        return forcedVulkanRasterDispatchOverride.load(std::memory_order_relaxed);
+    }
+
     bool hasVulkanDiagnosticFlag(VulkanDiagnosticFlag flag)
     {
         return (getVulkanDiagnosticFlags() & static_cast<u32>(flag)) != 0u;
@@ -589,6 +647,22 @@ namespace MelonDSAndroid
             return {};
 
         return instance->captureCurrentPackedBottomPrimaryForDebug();
+    }
+
+    bool isCurrentFrameReadyForDebug()
+    {
+        if (!instance)
+            return false;
+
+        return instance->isCurrentFrameReadyForDebug();
+    }
+
+    int getCurrentFrameIndexForDebug()
+    {
+        if (!instance)
+            return -1;
+
+        return instance->getCurrentFrameIndexForDebug();
     }
 
     std::vector<u32> captureCurrent3dDimensionsForDebug()
