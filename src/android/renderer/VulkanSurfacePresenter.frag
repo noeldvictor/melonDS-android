@@ -83,8 +83,9 @@ Rgba6 sample3DColor(int x3D, int y3D)
         return zero;
 
     uint safeScale = max(pushConstants.scale, 1u);
-    int sampleX = int(min(uint(x3D) * safeScale, pushConstants.rendererWidth - 1u));
-    int sampleY = int(min(uint(y3D) * safeScale, pushConstants.rendererHeight - 1u));
+    uint captureSampleOffset = safeScale > 1u ? (safeScale / 2u) : 0u;
+    int sampleX = int(min(uint(x3D) * safeScale + captureSampleOffset, pushConstants.rendererWidth - 1u));
+    int sampleY = int(min(uint(y3D) * safeScale + captureSampleOffset, pushConstants.rendererHeight - 1u));
     vec4 color3d = imageLoad(u3dImage, ivec2(sampleX, sampleY));
 
     Rgba6 color;
