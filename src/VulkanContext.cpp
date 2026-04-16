@@ -404,7 +404,11 @@ bool VulkanContext::initializeLocked()
         if (selectedQueueFamily < 0)
             continue;
 
-        const bool queueSupportsTimestamps = queueFamilies[static_cast<u32>(selectedQueueFamily)].timestampValidBits > 0;
+        const VkQueueFamilyProperties& selectedQueueFamilyProps = queueFamilies[static_cast<u32>(selectedQueueFamily)];
+        const bool queueSupportsTimestamps = selectedQueueFamilyProps.timestampValidBits > 0;
+        const u32 availableQueueCount = std::max<u32>(1u, selectedQueueFamilyProps.queueCount);
+        const bool canUseDedicatedPresenterQueue = availableQueueCount > 1u;
+        const u32 queueCountToCreate = canUseDedicatedPresenterQueue ? 2u : 1u;
 
         VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeaturesAvailable{};
         timelineFeaturesAvailable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
@@ -569,12 +573,12 @@ bool VulkanContext::initializeLocked()
         if (enableTimelineSemaphores && !apiAtLeast12)
             enabledDeviceExtensions.push_back(kTimelineSemaphoreExtension);
 
-        float queuePriority = 1.0f;
+        float queuePriorities[2] = {1.0f, 1.0f};
         VkDeviceQueueCreateInfo queueCreateInfo{};
         queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         queueCreateInfo.queueFamilyIndex = static_cast<u32>(selectedQueueFamily);
-        queueCreateInfo.queueCount = 1;
-        queueCreateInfo.pQueuePriorities = &queuePriority;
+        queueCreateInfo.queueCount = queueCountToCreate;
+        queueCreateInfo.pQueuePriorities = queuePriorities;
 
         VkDeviceCreateInfo deviceCreateInfo{};
         deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -599,6 +603,20 @@ bool VulkanContext::initializeLocked()
         PhysicalDevice = candidate;
         QueueFamilyIndex = static_cast<u32>(selectedQueueFamily);
         vkGetDeviceQueue(Device, QueueFamilyIndex, 0, &Queue);
+        PresenterQueue = VK_NULL_HANDLE;
+        if (queueCountToCreate > 1u)
+        {
+            vkGetDeviceQueue(Device, QueueFamilyIndex, 1, &PresenterQueue);
+            if (PresenterQueue == VK_NULL_HANDLE)
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanContext: queue family %u reported >=2 queues on '%s' but queue index 1 is null; presenter will share queue 0",
+                    QueueFamilyIndex,
+                    deviceProperties.deviceName
+                );
+            }
+        }
         TimestampPeriod = deviceProperties.limits.timestampPeriod;
         TimestampQueriesSupported = queueSupportsTimestamps;
         TimelineSemaphoresSupported = enableTimelineSemaphores;
@@ -632,7 +650,7 @@ bool VulkanContext::initializeLocked()
         }
         Platform::Log(
             Platform::LogLevel::Warn,
-            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d g52=%d timeline=%d dynamicIndexing=%d nonUniformTextures=%d ahbInterop=%d forceTimelineOff=%d forceDynamicOff=%d)",
+            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d g52=%d timeline=%d dynamicIndexing=%d nonUniformTextures=%d ahbInterop=%d forceTimelineOff=%d forceDynamicOff=%d queueFamily=%u queueCount=%u dedicatedPresenterQueue=%d)",
             deviceProperties.deviceName,
             deviceProperties.vendorID,
             deviceProperties.deviceID,
@@ -644,7 +662,10 @@ bool VulkanContext::initializeLocked()
             NonUniformTextureIndexingSupported ? 1 : 0,
             enableAhbInterop ? 1 : 0,
             ForceDisableTimelineSemaphores ? 1 : 0,
-            ForceDisableDynamicTextureIndexing ? 1 : 0
+            ForceDisableDynamicTextureIndexing ? 1 : 0,
+            QueueFamilyIndex,
+            queueCountToCreate,
+            PresenterQueue != VK_NULL_HANDLE ? 1 : 0
         );
         ahbInteropRequested = enableAhbInterop;
         break;
@@ -728,6 +749,7 @@ void VulkanContext::shutdownLocked()
     PhysicalDevice = VK_NULL_HANDLE;
     Device = VK_NULL_HANDLE;
     Queue = VK_NULL_HANDLE;
+    PresenterQueue = VK_NULL_HANDLE;
     QueueFamilyIndex = 0;
     AhbProperties = nullptr;
     WaitSemaphores = nullptr;

@@ -266,7 +266,7 @@ bool VulkanSurfacePresenter::init()
     instance = melonDS::VulkanContext::Get().GetInstance();
     physicalDevice = melonDS::VulkanContext::Get().GetPhysicalDevice();
     device = melonDS::VulkanContext::Get().GetDevice();
-    queue = melonDS::VulkanContext::Get().GetQueue();
+    queue = melonDS::VulkanContext::Get().GetPresenterQueue();
     queueFamilyIndex = melonDS::VulkanContext::Get().GetQueueFamilyIndex();
     resetQueryPool = melonDS::VulkanContext::Get().GetResetQueryPool();
     timestampPeriodNs = melonDS::VulkanContext::Get().GetTimestampPeriod();
@@ -292,7 +292,7 @@ void VulkanSurfacePresenter::shutdown()
 {
     if (device != VK_NULL_HANDLE)
     {
-        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetQueueLock());
+        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetPresenterQueueLock());
         vkQueueWaitIdle(queue);
     }
 
@@ -1762,7 +1762,7 @@ bool VulkanSurfacePresenter::createTextureFromPixels(BackgroundResource& resourc
     submitInfo.pCommandBuffers = &uploadCommandBuffer;
 
     {
-        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetQueueLock());
+        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetPresenterQueueLock());
         if (vkQueueSubmit(queue, 1, &submitInfo, uploadFence) != VK_SUCCESS)
             return false;
     }
@@ -2340,7 +2340,7 @@ bool VulkanSurfacePresenter::submitSurfaceCommands(SurfaceState& surfaceState, u
         return false;
 
     {
-        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetQueueLock());
+        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetPresenterQueueLock());
         submitResult = vkQueueSubmit(queue, 1, &submitInfo, surfaceState.inFlightFence);
         if (submitResult == VK_SUCCESS)
         {
