@@ -604,29 +604,27 @@ bool VulkanContext::initializeLocked()
         TimelineSemaphoresSupported = enableTimelineSemaphores;
         DynamicTextureIndexingSupported = enableDynamicTextureIndexing;
         DeviceProfile = makeDeviceProfile(deviceProperties);
-        // Adreno 740 can sustain the non-uniform path in simple scenes, but display-capture
-        // workloads have shown intermittent VK_ERROR_DEVICE_LOST with the textured raster path.
-        // Keep Qualcomm on the compatibility descriptor path there until the driver interaction
-        // is better isolated.
-        const bool allowNonUniformOnAdreno740 = false;
+        // Keep a strict denylist for known-unstable non-uniform paths.
+        // Adreno 740 (0x43050a01) has shown intermittent VK_ERROR_DEVICE_LOST
+        // under display-capture textured raster workloads.
         const bool forceCompatTexturePath =
-            (DeviceProfile.IsQualcomm || DeviceProfile.IsAdreno) && !allowNonUniformOnAdreno740;
+            DeviceProfile.IsAdreno && deviceProperties.deviceID == 0x43050a01u;
         NonUniformTextureIndexingSupported = enableDescriptorIndexing && !forceCompatTexturePath;
         if (enableDescriptorIndexing && forceCompatTexturePath)
         {
             Platform::Log(
                 Platform::LogLevel::Warn,
-                "VulkanContext: forcing compatibility texture path on '%s' (vendor=%#x device=%#x)",
+                "VulkanContext: forcing compatibility texture path on known-unstable device '%s' (vendor=%#x device=%#x)",
                 deviceProperties.deviceName,
                 deviceProperties.vendorID,
                 deviceProperties.deviceID
             );
         }
-        if (enableDescriptorIndexing && allowNonUniformOnAdreno740)
+        if (enableDescriptorIndexing && NonUniformTextureIndexingSupported && DeviceProfile.IsAdreno)
         {
             Platform::Log(
                 Platform::LogLevel::Warn,
-                "VulkanContext: enabling non-uniform texture path on '%s' (vendor=%#x device=%#x)",
+                "VulkanContext: enabling non-uniform texture path on Adreno '%s' (vendor=%#x device=%#x)",
                 deviceProperties.deviceName,
                 deviceProperties.vendorID,
                 deviceProperties.deviceID

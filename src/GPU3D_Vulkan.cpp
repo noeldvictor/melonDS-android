@@ -323,8 +323,10 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
     }
 
     const u64 renderStartNs = PerfNowNs();
+    CurrentFrameContextWaitNs = 0;
     auto renderPerfScope = MakeScopeExit([&]() {
         RenderCpuWindow.Add(PerfNowNs() - renderStartNs);
+        RenderAcquireWaitCpuWindow.Add(CurrentFrameContextWaitNs);
         logPerformanceIfNeeded();
     });
 
@@ -377,7 +379,6 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
         return;
     }
 
-    CurrentFrameContextWaitNs = 0;
     CurrentFrameHadContextMiss = false;
 
     RenderContext* renderContext = nullptr;
@@ -388,16 +389,17 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
         bool renderContextReady = renderContext != nullptr;
         if (!renderContextReady)
         {
-            renderContext = &acquireNextRenderContext();
             const bool useNonBlockingAcquire = MelonDSAndroid::isFastForwardActive() || PostFastForwardDrainFrames > 0;
             if (useNonBlockingAcquire)
             {
+                renderContext = &acquireNextRenderContext();
                 renderContextReady = renderContext != nullptr && tryAcquireRenderContext(*renderContext);
             }
             else
             {
                 const u64 contextWaitStartNs = PerfNowNs();
-                renderContextReady = renderContext != nullptr && waitForRenderContext(*renderContext);
+                renderContext = waitForAnyReadyRenderContext();
+                renderContextReady = renderContext != nullptr;
                 CurrentFrameContextWaitNs = PerfNowNs() - contextWaitStartNs;
                 if (InEarlySubmitAttempt)
                     CurrentEarlySubmitContextWaitNs += CurrentFrameContextWaitNs;
@@ -1191,6 +1193,55 @@ bool VulkanRenderer3D::tryAcquireRenderContext(RenderContext& context, bool coun
     return false;
 }
 
+VulkanRenderer3D::RenderContext* VulkanRenderer3D::waitForAnyReadyRenderContext() noexcept
+{
+    if (!Threaded || Device == VK_NULL_HANDLE)
+        return nullptr;
+
+    constexpr size_t activeContextCount = DefaultAsyncRenderContextCount;
+    std::array<VkFence, MaxAsyncRenderContextCount> fences{};
+    for (size_t i = 0; i < activeContextCount; i++)
+    {
+        RenderContext& context = RenderContexts[i];
+        if (context.FrameFence == VK_NULL_HANDLE)
+            return nullptr;
+        fences[i] = context.FrameFence;
+    }
+
+    ContextMissCount++;
+    const u64 waitStartNs = PerfNowNs();
+    const VkResult waitResult = vkWaitForFences(
+        Device,
+        static_cast<u32>(activeContextCount),
+        fences.data(),
+        VK_FALSE,
+        UINT64_MAX
+    );
+    if (waitResult != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: any-context fence wait failed (%d)", static_cast<int>(waitResult));
+        return nullptr;
+    }
+
+    const u64 waitDurationNs = PerfNowNs() - waitStartNs;
+    FenceWaitCpuWindow.Add(waitDurationNs);
+    if (waitDurationNs >= 1000000ull)
+        LateFrameCount++;
+
+    for (size_t i = 0; i < activeContextCount; i++)
+    {
+        const size_t contextIndex = (NextRenderContextIndex + i) % activeContextCount;
+        RenderContext& context = RenderContexts[contextIndex];
+        if (!tryAcquireRenderContext(context, false))
+            continue;
+
+        NextRenderContextIndex = (contextIndex + 1) % activeContextCount;
+        return &context;
+    }
+
+    return nullptr;
+}
+
 VulkanRenderer3D::RenderContext* VulkanRenderer3D::tryAcquireReadyRenderContext() noexcept
 {
     if (!Threaded || Device == VK_NULL_HANDLE)
@@ -1240,12 +1291,15 @@ bool VulkanRenderer3D::finalizeCaptureReadback(bool blocking)
     if (!CaptureReadbackPending)
         return HasCpuFrame;
 
+    u64 captureReadbackWaitNs = 0;
     bool waitOk = false;
     if (PendingCaptureReadbackContext != nullptr)
     {
         if (blocking)
         {
+            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForRenderContext(*PendingCaptureReadbackContext);
+            captureReadbackWaitNs = PerfNowNs() - waitStartNs;
         }
         else if (Device != VK_NULL_HANDLE && PendingCaptureReadbackContext->FrameFence != VK_NULL_HANDLE)
         {
@@ -1277,10 +1331,17 @@ bool VulkanRenderer3D::finalizeCaptureReadback(bool blocking)
     else
     {
         if (blocking)
+        {
+            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForReadbackSource();
+            captureReadbackWaitNs = PerfNowNs() - waitStartNs;
+        }
         else
             return false;
     }
+
+    if (blocking)
+        CaptureReadbackWaitCpuWindow.Add(captureReadbackWaitNs);
 
     if (!waitOk || ReadbackMapped == nullptr || RawReadbackWidth == 0 || RawReadbackHeight == 0)
     {
@@ -1314,12 +1375,15 @@ bool VulkanRenderer3D::finalizeCaptureLineFrame(bool blocking)
     if (!CaptureLinePending)
         return CaptureLineReady;
 
+    u64 captureLineWaitNs = 0;
     bool waitOk = false;
     if (PendingCaptureLineContext != nullptr)
     {
         if (blocking)
         {
+            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForRenderContext(*PendingCaptureLineContext);
+            captureLineWaitNs = PerfNowNs() - waitStartNs;
         }
         else if (Device != VK_NULL_HANDLE && PendingCaptureLineContext->FrameFence != VK_NULL_HANDLE)
         {
@@ -1349,10 +1413,18 @@ bool VulkanRenderer3D::finalizeCaptureLineFrame(bool blocking)
     else
     {
         if (blocking)
+        {
+            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForReadbackSource();
+            captureLineWaitNs = PerfNowNs() - waitStartNs;
+        }
         else
             return false;
     }
+
+    if (blocking)
+        CaptureLineWaitCpuWindow.Add(captureLineWaitNs);
+
     if (!waitOk)
     {
         resetCaptureLineState();
@@ -1457,6 +1529,9 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
         return;
 
     const PerfSampleWindow<120>::Summary renderSummary = RenderCpuWindow.SummarizeAndReset();
+    const PerfSampleWindow<120>::Summary renderAcquireWaitSummary = RenderAcquireWaitCpuWindow.SummarizeAndReset();
+    const PerfSampleWindow<120>::Summary captureLineWaitSummary = CaptureLineWaitCpuWindow.SummarizeAndReset();
+    const PerfSampleWindow<120>::Summary captureReadbackWaitSummary = CaptureReadbackWaitCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary waitSummary = FenceWaitCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary gpuSummary = GpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary triangleSummary = TriangleCountWindow.SummarizeAndReset();
@@ -1483,6 +1558,9 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
     const PerfSampleWindow<120>::Summary captureLineExportGpuSummary = CaptureLineExportGpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary earlySubmitCpuSummary = EarlySubmitCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary earlySubmitWaitSummary = EarlySubmitContextWaitCpuWindow.SummarizeAndReset();
+    const u64 otherWaitMeanNs = waitSummary.MeanNs > renderAcquireWaitSummary.MeanNs
+        ? waitSummary.MeanNs - renderAcquireWaitSummary.MeanNs
+        : 0;
     const double cpuTileCoveragePercent = cpuTileCountSummary.MeanNs > 0
         ? (static_cast<double>(cpuActiveTileSummary.MeanNs) * 100.0 / static_cast<double>(cpuTileCountSummary.MeanNs))
         : 0.0;
@@ -1571,6 +1649,23 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
         PerfNsToMs(finalGpuSummary.MeanNs),
         PerfNsToMs(captureLineExportCpuSummary.MeanNs),
         PerfNsToMs(captureLineExportGpuSummary.MeanNs)
+    );
+    Log(
+        LogLevel::Warn,
+        "VulkanPerf[GPU3DWaits]: renderAcquire avg=%.3fms p95=%.3fms max=%.3fms captureLine avg=%.3fms p95=%.3fms max=%.3fms captureReadback avg=%.3fms p95=%.3fms max=%.3fms fenceTotal avg=%.3fms p95=%.3fms max=%.3fms otherMean=%.3fms",
+        PerfNsToMs(renderAcquireWaitSummary.MeanNs),
+        PerfNsToMs(renderAcquireWaitSummary.P95Ns),
+        PerfNsToMs(renderAcquireWaitSummary.MaxNs),
+        PerfNsToMs(captureLineWaitSummary.MeanNs),
+        PerfNsToMs(captureLineWaitSummary.P95Ns),
+        PerfNsToMs(captureLineWaitSummary.MaxNs),
+        PerfNsToMs(captureReadbackWaitSummary.MeanNs),
+        PerfNsToMs(captureReadbackWaitSummary.P95Ns),
+        PerfNsToMs(captureReadbackWaitSummary.MaxNs),
+        PerfNsToMs(waitSummary.MeanNs),
+        PerfNsToMs(waitSummary.P95Ns),
+        PerfNsToMs(waitSummary.MaxNs),
+        PerfNsToMs(otherWaitMeanNs)
     );
 
     ContextMissCount = 0;

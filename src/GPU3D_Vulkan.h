@@ -319,6 +319,7 @@ private:
     u32 findMemoryType(u32 typeBits, VkMemoryPropertyFlags properties) const;
     bool tryAcquireRenderContext(RenderContext& context, bool countMisses = true);
     bool waitForRenderContext(RenderContext& context);
+    RenderContext* waitForAnyReadyRenderContext() noexcept;
     RenderContext* tryAcquireReadyRenderContext() noexcept;
     bool waitForAllRenderContexts();
     bool waitForReadbackSource();
@@ -509,6 +510,9 @@ private:
     float TimestampPeriodNs = 0.0f;
     bool TimestampQueriesSupported = false;
     PerfSampleWindow<120> RenderCpuWindow;
+    PerfSampleWindow<120> RenderAcquireWaitCpuWindow;
+    PerfSampleWindow<120> CaptureLineWaitCpuWindow;
+    PerfSampleWindow<120> CaptureReadbackWaitCpuWindow;
     PerfSampleWindow<120> FenceWaitCpuWindow;
     PerfSampleWindow<120> GpuWindow;
     PerfSampleWindow<120> TriangleCountWindow;
