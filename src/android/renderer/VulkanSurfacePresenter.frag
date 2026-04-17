@@ -71,7 +71,7 @@ void applyBrightnessDown(inout Rgba6 color, int evy, int roundingBias)
     color.b = clampColor6(color.b - (((color.b * evy) + roundingBias) >> 4));
 }
 
-Rgba6 sample3DColor(int x3D, int y3D)
+Rgba6 sample3DColorAtScaledCoord(float scaledX, float scaledY)
 {
     Rgba6 zero;
     zero.r = 0;
@@ -79,14 +79,13 @@ Rgba6 sample3DColor(int x3D, int y3D)
     zero.b = 0;
     zero.a = 0;
 
-    if (x3D < 0 || x3D >= 256 || y3D < 0 || y3D >= 192)
+    if (scaledX < 0.0
+        || scaledX >= float(pushConstants.rendererWidth)
+        || scaledY < 0.0
+        || scaledY >= float(pushConstants.rendererHeight))
         return zero;
 
-    uint safeScale = max(pushConstants.scale, 1u);
-    uint captureSampleOffset = safeScale > 1u ? (safeScale / 2u) : 0u;
-    int sampleX = int(min(uint(x3D) * safeScale + captureSampleOffset, pushConstants.rendererWidth - 1u));
-    int sampleY = int(min(uint(y3D) * safeScale + captureSampleOffset, pushConstants.rendererHeight - 1u));
-    vec4 color3d = imageLoad(u3dImage, ivec2(sampleX, sampleY));
+    vec4 color3d = imageLoad(u3dImage, ivec2(int(scaledX), int(scaledY)));
 
     Rgba6 color;
     color.r = int(clamp(color3d.r * 255.0 + 0.5, 0.0, 255.0)) >> 2;
@@ -136,6 +135,8 @@ vec4 composeScreenColor(bool topScreen)
 {
     float sourceXFloat = clamp(fragUv.x * 256.0, 0.0, 255.0);
     float sourceYFloat = clamp((1.0 - fragUv.y) * 192.0, 0.0, 191.0);
+    float scaledXFloat = clamp(fragUv.x * float(pushConstants.rendererWidth), 0.0, float(pushConstants.rendererWidth - 1u));
+    float scaledYFloat = clamp((1.0 - fragUv.y) * float(pushConstants.rendererHeight), 0.0, float(pushConstants.rendererHeight - 1u));
     int sourceX = int(sourceXFloat);
     int sourceY = int(sourceYFloat);
 
@@ -155,7 +156,12 @@ vec4 composeScreenColor(bool topScreen)
         Rgba6 val3 = unpackColor6(readPacked(topScreen, sourceY, 512 + sourceX));
 
         int compMode = val3.a & 0xF;
-        Rgba6 pixel3D = sample3DColor(sourceX + xOffset, sourceY);
+        // Match the offscreen compositor contract: packed buffers stay DS-sized,
+        // while the 3D sample comes from the true IR-scaled pixel position.
+        Rgba6 pixel3D = sample3DColorAtScaledCoord(
+            scaledXFloat + (float(xOffset) * float(max(pushConstants.scale, 1u))),
+            scaledYFloat
+        );
 
         if (compMode == 4)
         {

@@ -68,7 +68,7 @@ void applyBrightnessDown(inout Rgba6 color, int evy, int roundingBias)
     color.b = clampColor6(color.b - (((color.b * evy) + roundingBias) >> 4));
 }
 
-Rgba6 sample3DColor(int x3D, int y3D)
+Rgba6 sample3DColorAtScaledPixel(int scaledX, int scaledY)
 {
     Rgba6 zero;
     zero.r = 0;
@@ -76,15 +76,13 @@ Rgba6 sample3DColor(int x3D, int y3D)
     zero.b = 0;
     zero.a = 0;
 
-    if (x3D < 0 || x3D >= 256 || y3D < 0 || y3D >= 192)
+    if (scaledX < 0
+        || scaledX >= int(pc.rendererWidth)
+        || scaledY < 0
+        || scaledY >= int(pc.rendererHeight))
         return zero;
 
-    uint safeScale = max(pc.scale, 1u);
-    uint captureSampleOffset = safeScale > 1u ? (safeScale / 2u) : 0u;
-    int sampleX = int(min(uint(x3D) * safeScale + captureSampleOffset, pc.rendererWidth - 1u));
-    int sampleY = int(min(uint(y3D) * safeScale + captureSampleOffset, pc.rendererHeight - 1u));
-
-    vec4 color3d = imageLoad(image3dInput, ivec2(sampleX, sampleY));
+    vec4 color3d = imageLoad(image3dInput, ivec2(scaledX, scaledY));
 
     Rgba6 color;
     color.r = int(clamp(color3d.r * 255.0 + 0.5, 0.0, 255.0)) >> 2;
@@ -126,6 +124,9 @@ void main()
 
     int dsY = isTopScreen ? sourceY : (sourceY - 194);
     bool topScreen = isTopScreen;
+    int scaledY = int(gid.y);
+    if (!topScreen)
+        scaledY -= int((192u + 2u) * safeScale);
 
     uint masterBrightness = readPacked(topScreen, dsY, 256 * 3);
     int displayMode = int((masterBrightness >> 16u) & 0x3u);
@@ -143,9 +144,10 @@ void main()
         Rgba6 val3 = unpackColor6(readPacked(topScreen, dsY, 512 + sourceX));
 
         int compMode = val3.a & 0xF;
-        int y3D = dsY;
-        int x3D = sourceX + xOffset;
-        Rgba6 pixel3D = sample3DColor(x3D, y3D);
+        // Keep packed/2D reads in DS coordinates, but sample 3D in the actual
+        // internal-resolution pixel space so IR > 1 preserves real detail.
+        int scaledX = int(gid.x) + (xOffset * int(safeScale));
+        Rgba6 pixel3D = sample3DColorAtScaledPixel(scaledX, scaledY);
 
         if (compMode == 4)
         {
