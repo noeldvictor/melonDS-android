@@ -1185,8 +1185,8 @@ VulkanRenderer3D::RenderContext* VulkanRenderer3D::waitForAnyReadyRenderContext(
     if (!Threaded || Device == VK_NULL_HANDLE)
         return nullptr;
 
-    constexpr size_t activeContextCount = DefaultAsyncRenderContextCount;
-    std::array<VkFence, MaxAsyncRenderContextCount> fences{};
+    constexpr size_t activeContextCount = AsyncRenderContextCount;
+    std::array<VkFence, AsyncRenderContextCount> fences{};
     for (size_t i = 0; i < activeContextCount; i++)
     {
         RenderContext& context = RenderContexts[i];
