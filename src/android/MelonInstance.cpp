@@ -965,8 +965,11 @@ bool MelonInstance::presentVulkanFrame(
 
     auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
     const int renderScale = std::max(renderer3D.GetScaleFactor(), 1);
-    const bool lateRealtimePresentation = !isFastForwardActive() && isPresentationDeadlineExpired(deadline);
+    const bool fastForwardActive = isFastForwardActive();
+    const bool lateRealtimePresentation = !fastForwardActive && isPresentationDeadlineExpired(deadline);
     const std::optional<std::chrono::time_point<std::chrono::steady_clock>> effectiveBudgetDeadline = [&]() -> std::optional<std::chrono::time_point<std::chrono::steady_clock>> {
+        if (fastForwardActive)
+            return std::nullopt;
         if (budgetDeadline.has_value() && deadline.has_value())
             return std::min(*budgetDeadline, *deadline);
         if (budgetDeadline.has_value())
@@ -976,6 +979,14 @@ bool MelonInstance::presentVulkanFrame(
     const FrameQueuePolicy frameQueuePolicy = lateRealtimePresentation
         ? makeVulkanLateRealtimeFrameQueuePolicy(renderScale)
         : makeFrameQueuePolicy(Renderer::Vulkan, renderScale);
+    const FrameQueuePolicy deferFrameQueuePolicy = [&]() -> FrameQueuePolicy {
+        if (!fastForwardActive)
+            return frameQueuePolicy;
+
+        FrameQueuePolicy policy = frameQueuePolicy;
+        policy.AllowDropForDeadline = false;
+        return policy;
+    }();
     const int maxPresentAttempts = frameQueuePolicy.AllowDropForDeadline
         ? static_cast<int>(std::max<u64>(1u, frameQueuePolicy.MaxBacklogDepth + 1))
         : 1;
@@ -988,7 +999,7 @@ bool MelonInstance::presentVulkanFrame(
 
         if (frameQueuePolicy.AllowDropForDeadline && !vulkanOutput->isFrameReady(frame))
         {
-            frameQueue.deferPresentedFrame(frame, frameQueuePolicy);
+            frameQueue.deferPresentedFrame(frame, deferFrameQueuePolicy);
             if (frameQueuePolicy.PreferOldestFrame)
                 break;
             continue;
@@ -1017,7 +1028,7 @@ bool MelonInstance::presentVulkanFrame(
                 false,
                 compositionInputs))
         {
-            frameQueue.deferPresentedFrame(frame, frameQueuePolicy);
+            frameQueue.deferPresentedFrame(frame, deferFrameQueuePolicy);
             if (!frameQueuePolicy.AllowDropForDeadline || frameQueuePolicy.PreferOldestFrame)
                 return false;
             continue;
@@ -1030,7 +1041,7 @@ bool MelonInstance::presentVulkanFrame(
             return true;
         }
 
-        frameQueue.deferPresentedFrame(frame, frameQueuePolicy);
+        frameQueue.deferPresentedFrame(frame, deferFrameQueuePolicy);
         if (!frameQueuePolicy.AllowDropForDeadline || frameQueuePolicy.PreferOldestFrame)
             return false;
     }
