@@ -75,7 +75,7 @@ public:
     [[nodiscard]] bool IsCoverageFixClampEnabled() const noexcept { return CoverageFixApplyClamp; }
     [[nodiscard]] float GetPassiveCoverageFixRepeatPx() const noexcept { return PassiveCoverageFixRepeatPx; }
     [[nodiscard]] bool IsDebug3dClearMagentaEnabled() const noexcept { return Debug3dClearMagenta; }
-    [[nodiscard]] size_t GetAsyncRenderContextCount() const noexcept { return DefaultAsyncRenderContextCount; }
+    [[nodiscard]] size_t GetAsyncRenderContextCount() const noexcept { return AsyncRenderContextCount; }
     [[nodiscard]] bool WaitsForReadbackSourceOnly() const noexcept { return true; }
     [[nodiscard]] bool EnsureVulkanReadyForValidation();
     [[nodiscard]] bool HasColorTarget() const noexcept { return ColorImage != VK_NULL_HANDLE && ColorImageView != VK_NULL_HANDLE; }
@@ -99,23 +99,6 @@ private:
     {
         DirectTiles = 0,
         LegacyWorklist = 1,
-    };
-
-    enum class RasterExecutionPath : u8
-    {
-        CpuDirectTiles = 0,
-        DirectTiles = 1,
-        LegacyWorklist = 2,
-    };
-
-    struct PreviousRasterDispatchMetrics
-    {
-        bool Valid = false;
-        u32 CoveragePercent = 0;
-        u32 ActiveDispatchPercent = 0;
-        bool HadContextMiss = false;
-        u64 FenceWaitNs = 0;
-        u32 RasterPassCount = 1;
     };
 
     enum class TextureSamplingPath : u8
@@ -329,15 +312,6 @@ private:
     void consumeGpuTiming(RenderContext* context);
     void logPerformanceIfNeeded();
     bool useCpuTileBinning() const noexcept;
-    RasterExecutionPath resolveRasterExecutionPath(bool isAdrenoDevice, RenderContext* context) noexcept;
-    void recordRasterDispatchMetrics(
-        bool isAdrenoDevice,
-        RasterExecutionPath executionPath,
-        u64 activeTileCount,
-        u64 totalTileCount,
-        u32 activeDispatchPercent,
-        u32 rasterPassCount) noexcept;
-    void resetRasterDispatchDecisionState() noexcept;
     bool prepareCpuTileBins(RenderContext& context, const RasterPushConstants& pushConstants);
 
     void WarmTextureCache(GPU& gpu);
@@ -423,20 +397,13 @@ private:
     std::array<VkPipeline, FinalPipelineVariantCount> FinalPipelines{};
     VkPipeline CaptureLineExportPipeline = VK_NULL_HANDLE;
     static constexpr u32 ResultLayerCount = 8;
-    static constexpr size_t DefaultAsyncRenderContextCount = 6;
-    static constexpr size_t MaxAsyncRenderContextCount = DefaultAsyncRenderContextCount;
+    static constexpr size_t AsyncRenderContextCount = 6;
     static constexpr u32 TimestampQueryCount = 9;
-    std::array<RenderContext, MaxAsyncRenderContextCount> RenderContexts{};
+    std::array<RenderContext, AsyncRenderContextCount> RenderContexts{};
     size_t NextRenderContextIndex = 0;
     RenderContext* LastSubmittedRenderContext = nullptr;
     RasterDispatchPath ActiveRasterDispatchPath = RasterDispatchPath::DirectTiles;
     bool CpuTileBinningEnabled = false;
-    bool DenseBypassActive = true;
-    u32 ConsecutiveDenseFrames = 0;
-    u32 ConsecutiveSparseFrames = 0;
-    PreviousRasterDispatchMetrics PreviousRasterDispatchFrame{};
-    u64 CurrentFrameContextWaitNs = 0;
-    bool CurrentFrameHadContextMiss = false;
 
     VkImage ColorImage = VK_NULL_HANDLE;
     VkDeviceMemory ColorImageMemory = VK_NULL_HANDLE;
@@ -546,13 +513,6 @@ private:
     u64 CpuDirectTilesPathCount = 0;
     u64 DirectTilesPathCount = 0;
     u64 LegacyWorklistPathCount = 0;
-    u64 AutoDecisionCpuCount = 0;
-    u64 AutoDecisionDirectCount = 0;
-    u64 ForcedCpuDecisionCount = 0;
-    u64 ForcedDirectDecisionCount = 0;
-    u64 ForcedLegacyDecisionCount = 0;
-    u64 DenseBypassEnterCount = 0;
-    u64 DenseBypassExitCount = 0;
     u64 ReadbackColorRequestCount = 0;
     u64 ReadbackResultRequestCount = 0;
     u64 CapturePrepareRequestCount = 0;

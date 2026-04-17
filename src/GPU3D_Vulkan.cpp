@@ -46,7 +46,6 @@ namespace MelonDSAndroid
 bool isFastForwardActive();
 bool areRendererDebugToolsEnabled();
 melonDS::u32 getVulkanDiagnosticFlags();
-melonDS::u32 getForcedVulkanRasterDispatchOverride();
 }
 
 namespace melonDS
@@ -70,10 +69,6 @@ constexpr u32 kWorkActiveTileCount = 6u;
 constexpr u32 kWorkActiveGroupCount = 7u;
 constexpr u32 kWorkTileOffsetsBase = 8u;
 constexpr u32 kCpuActiveTileDispatchMaxCoveragePercent = 90u;
-constexpr u32 kForcedRasterDispatchAuto = 0u;
-constexpr u32 kForcedRasterDispatchCpu = 1u;
-constexpr u32 kForcedRasterDispatchDirect = 2u;
-constexpr u32 kForcedRasterDispatchLegacy = 3u;
 
 u64 fnv1a64(const char* value)
 {
@@ -274,7 +269,6 @@ void VulkanRenderer3D::Reset(GPU& gpu)
     EarlySubmitHitCount = 0;
     EarlySubmitMissCount = 0;
     EarlySubmitSkipVCount215Count = 0;
-    resetRasterDispatchDecisionState();
 }
 
 void VulkanRenderer3D::VCount144(GPU& gpu)
@@ -323,10 +317,10 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
     }
 
     const u64 renderStartNs = PerfNowNs();
-    CurrentFrameContextWaitNs = 0;
+    u64 currentFrameContextWaitNs = 0;
     auto renderPerfScope = MakeScopeExit([&]() {
         RenderCpuWindow.Add(PerfNowNs() - renderStartNs);
-        RenderAcquireWaitCpuWindow.Add(CurrentFrameContextWaitNs);
+        RenderAcquireWaitCpuWindow.Add(currentFrameContextWaitNs);
         logPerformanceIfNeeded();
     });
 
@@ -379,12 +373,9 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
         return;
     }
 
-    CurrentFrameHadContextMiss = false;
-
     RenderContext* renderContext = nullptr;
     if (Threaded)
     {
-        const u64 contextMissCountBeforeAcquire = ContextMissCount;
         renderContext = tryAcquireReadyRenderContext();
         bool renderContextReady = renderContext != nullptr;
         if (!renderContextReady)
@@ -400,12 +391,11 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
                 const u64 contextWaitStartNs = PerfNowNs();
                 renderContext = waitForAnyReadyRenderContext();
                 renderContextReady = renderContext != nullptr;
-                CurrentFrameContextWaitNs = PerfNowNs() - contextWaitStartNs;
+                currentFrameContextWaitNs = PerfNowNs() - contextWaitStartNs;
                 if (InEarlySubmitAttempt)
-                    CurrentEarlySubmitContextWaitNs += CurrentFrameContextWaitNs;
+                    CurrentEarlySubmitContextWaitNs += (PerfNowNs() - contextWaitStartNs);
             }
         }
-        CurrentFrameHadContextMiss = ContextMissCount > contextMissCountBeforeAcquire;
         if (PostFastForwardDrainFrames > 0)
             PostFastForwardDrainFrames--;
         if (!renderContextReady)
@@ -690,8 +680,6 @@ void VulkanRenderer3D::SetRenderSettings(
         resetCaptureLineState();
         clearLineCache();
     }
-
-    resetRasterDispatchDecisionState();
 }
 
 void VulkanRenderer3D::SetThreaded(bool threaded, GPU& gpu) noexcept
@@ -712,7 +700,6 @@ void VulkanRenderer3D::SetThreaded(bool threaded, GPU& gpu) noexcept
     HasCpuFrame = false;
     resetCaptureLineState();
     clearLineCache();
-    resetRasterDispatchDecisionState();
     if (MelonDSAndroid::areRendererDebugToolsEnabled())
         Log(LogLevel::Warn, "VulkanRenderer3D: threaded rendering %s", Threaded ? "enabled" : "disabled");
 }
@@ -1247,15 +1234,14 @@ VulkanRenderer3D::RenderContext* VulkanRenderer3D::tryAcquireReadyRenderContext(
     if (!Threaded || Device == VK_NULL_HANDLE)
         return nullptr;
 
-    const size_t activeContextCount = DefaultAsyncRenderContextCount;
-    for (size_t i = 0; i < activeContextCount; i++)
+    for (size_t i = 0; i < AsyncRenderContextCount; i++)
     {
-        const size_t contextIndex = (NextRenderContextIndex + i) % activeContextCount;
+        const size_t contextIndex = (NextRenderContextIndex + i) % AsyncRenderContextCount;
         RenderContext& context = RenderContexts[contextIndex];
         if (!tryAcquireRenderContext(context, false))
             continue;
 
-        NextRenderContextIndex = (contextIndex + 1) % activeContextCount;
+        NextRenderContextIndex = (contextIndex + 1) % AsyncRenderContextCount;
         return &context;
     }
 
@@ -1464,9 +1450,8 @@ bool VulkanRenderer3D::waitForDeviceIdle(const char* reason)
 
 VulkanRenderer3D::RenderContext& VulkanRenderer3D::acquireNextRenderContext() noexcept
 {
-    const size_t activeContextCount = DefaultAsyncRenderContextCount;
-    RenderContext& renderContext = RenderContexts[NextRenderContextIndex % activeContextCount];
-    NextRenderContextIndex = (NextRenderContextIndex + 1) % activeContextCount;
+    RenderContext& renderContext = RenderContexts[NextRenderContextIndex];
+    NextRenderContextIndex = (NextRenderContextIndex + 1) % AsyncRenderContextCount;
     return renderContext;
 }
 
@@ -1475,7 +1460,7 @@ void VulkanRenderer3D::requestPostFastForwardDrain()
     if (!Threaded)
         return;
 
-    PostFastForwardDrainFrames = static_cast<u32>(DefaultAsyncRenderContextCount * 3);
+    PostFastForwardDrainFrames = static_cast<u32>(AsyncRenderContextCount * 3);
 }
 
 void VulkanRenderer3D::consumeGpuTiming(RenderContext* context)
@@ -1567,7 +1552,7 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
 
     Log(
         LogLevel::Warn,
-        "VulkanPerf[GPU3D]: path=%s scale=%d render cpu avg=%.3fms p95=%.3fms max=%.3fms wait avg=%.3fms p95=%.3fms max=%.3fms gpu avg=%.3fms p95=%.3fms max=%.3fms triangles avg=%llu passes avg=%llu p95=%llu cpuTiles avg=%llu/%llu (%.1f%%) cpuGroups avg=%llu activeDispatch=%llu%% decisionAutoCpu=%llu decisionAutoDirect=%llu forcedCpu=%llu forcedDirect=%llu forcedLegacy=%llu enterDenseBypass=%llu exitDenseBypass=%llu contextMisses=%llu late=%llu dropped=%llu readbackColor=%llu readbackResult=%llu capturePrepare=%llu captureEnabled=%llu captureSrc3d=%llu capMode=%llu/%llu/%llu/%llu capSize=%llu/%llu/%llu/%llu capExport=%llu capExportCpu avg=%.3fms p95=%.3fms capExportGpu avg=%.3fms p95=%.3fms rasterSpec tex=%llu alpha=%llu shade=%llu all=%llu earlySubmit hit=%llu/%llu miss=%llu skip215=%llu cpu avg=%.3fms p95=%.3fms wait avg=%.3fms p95=%.3fms",
+        "VulkanPerf[GPU3D]: path=%s scale=%d render cpu avg=%.3fms p95=%.3fms max=%.3fms wait avg=%.3fms p95=%.3fms max=%.3fms gpu avg=%.3fms p95=%.3fms max=%.3fms triangles avg=%llu passes avg=%llu p95=%llu cpuTiles avg=%llu/%llu (%.1f%%) cpuGroups avg=%llu activeDispatch=%llu%% contextMisses=%llu late=%llu dropped=%llu readbackColor=%llu readbackResult=%llu capturePrepare=%llu captureEnabled=%llu captureSrc3d=%llu capMode=%llu/%llu/%llu/%llu capSize=%llu/%llu/%llu/%llu capExport=%llu capExportCpu avg=%.3fms p95=%.3fms capExportGpu avg=%.3fms p95=%.3fms rasterSpec tex=%llu alpha=%llu shade=%llu all=%llu earlySubmit hit=%llu/%llu miss=%llu skip215=%llu cpu avg=%.3fms p95=%.3fms wait avg=%.3fms p95=%.3fms",
         CpuDirectTilesPathCount > 0 && DirectTilesPathCount == 0 && LegacyWorklistPathCount == 0
             ? "cpu_direct_tiles"
             : (LegacyWorklistPathCount > 0 && DirectTilesPathCount == 0 ? "legacy" : "direct_tiles"),
@@ -1589,13 +1574,6 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
         cpuTileCoveragePercent,
         static_cast<unsigned long long>(cpuActiveGroupSummary.MeanNs),
         static_cast<unsigned long long>(cpuActiveDispatchSummary.MeanNs),
-        static_cast<unsigned long long>(AutoDecisionCpuCount),
-        static_cast<unsigned long long>(AutoDecisionDirectCount),
-        static_cast<unsigned long long>(ForcedCpuDecisionCount),
-        static_cast<unsigned long long>(ForcedDirectDecisionCount),
-        static_cast<unsigned long long>(ForcedLegacyDecisionCount),
-        static_cast<unsigned long long>(DenseBypassEnterCount),
-        static_cast<unsigned long long>(DenseBypassExitCount),
         static_cast<unsigned long long>(ContextMissCount),
         static_cast<unsigned long long>(LateFrameCount),
         static_cast<unsigned long long>(DroppedFrameCount),
@@ -1674,13 +1652,6 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
     CpuDirectTilesPathCount = 0;
     DirectTilesPathCount = 0;
     LegacyWorklistPathCount = 0;
-    AutoDecisionCpuCount = 0;
-    AutoDecisionDirectCount = 0;
-    ForcedCpuDecisionCount = 0;
-    ForcedDirectDecisionCount = 0;
-    ForcedLegacyDecisionCount = 0;
-    DenseBypassEnterCount = 0;
-    DenseBypassExitCount = 0;
     ReadbackColorRequestCount = 0;
     ReadbackResultRequestCount = 0;
     CapturePrepareRequestCount = 0;
@@ -1697,76 +1668,6 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
     EarlySubmitHitCount = 0;
     EarlySubmitMissCount = 0;
     EarlySubmitSkipVCount215Count = 0;
-}
-
-void VulkanRenderer3D::resetRasterDispatchDecisionState() noexcept
-{
-    DenseBypassActive = true;
-    ConsecutiveDenseFrames = 0;
-    ConsecutiveSparseFrames = 0;
-    PreviousRasterDispatchFrame = {};
-    CurrentFrameContextWaitNs = 0;
-    CurrentFrameHadContextMiss = false;
-}
-
-VulkanRenderer3D::RasterExecutionPath VulkanRenderer3D::resolveRasterExecutionPath(
-    bool isAdrenoDevice,
-    RenderContext* context) noexcept
-{
-    const u32 forcedOverride = MelonDSAndroid::getForcedVulkanRasterDispatchOverride();
-    switch (forcedOverride)
-    {
-        case kForcedRasterDispatchCpu:
-            ForcedCpuDecisionCount++;
-            return (context != nullptr && CpuTileBinningEnabled)
-                ? RasterExecutionPath::CpuDirectTiles
-                : RasterExecutionPath::DirectTiles;
-        case kForcedRasterDispatchDirect:
-            ForcedDirectDecisionCount++;
-            return RasterExecutionPath::DirectTiles;
-        case kForcedRasterDispatchLegacy:
-            ForcedLegacyDecisionCount++;
-            return RasterExecutionPath::LegacyWorklist;
-        case kForcedRasterDispatchAuto:
-        default:
-            break;
-    }
-
-    const bool canUseAutoCpuTiles = isAdrenoDevice && CpuTileBinningEnabled && context != nullptr;
-    if (canUseAutoCpuTiles)
-    {
-        AutoDecisionCpuCount++;
-        return RasterExecutionPath::CpuDirectTiles;
-    }
-
-    AutoDecisionDirectCount++;
-    return RasterExecutionPath::DirectTiles;
-}
-
-void VulkanRenderer3D::recordRasterDispatchMetrics(
-    bool isAdrenoDevice,
-    RasterExecutionPath executionPath,
-    u64 activeTileCount,
-    u64 totalTileCount,
-    u32 activeDispatchPercent,
-    u32 rasterPassCount) noexcept
-{
-    if (!isAdrenoDevice)
-        return;
-
-    const bool eligibleForAutoState = executionPath == RasterExecutionPath::CpuDirectTiles
-        || executionPath == RasterExecutionPath::DirectTiles;
-    if (!eligibleForAutoState)
-        return;
-
-    PreviousRasterDispatchFrame.Valid = true;
-    PreviousRasterDispatchFrame.CoveragePercent = totalTileCount > 0
-        ? static_cast<u32>(std::min<u64>(100u, (activeTileCount * 100u) / totalTileCount))
-        : 0u;
-    PreviousRasterDispatchFrame.ActiveDispatchPercent = std::min<u32>(activeDispatchPercent, 100u);
-    PreviousRasterDispatchFrame.HadContextMiss = CurrentFrameHadContextMiss;
-    PreviousRasterDispatchFrame.FenceWaitNs = CurrentFrameContextWaitNs;
-    PreviousRasterDispatchFrame.RasterPassCount = std::max<u32>(1u, rasterPassCount);
 }
 
 bool VulkanRenderer3D::useCpuTileBinning() const noexcept
@@ -2132,7 +2033,7 @@ bool VulkanRenderer3D::createDescriptorObjects()
 
     const bool singleTexturePath = usesSingleDescriptorTexturePath();
     const u32 descriptorSetsPerContext = singleTexturePath ? MaxTextureDescriptors : 1u;
-    const u32 descriptorSetCount = static_cast<u32>((MaxAsyncRenderContextCount + 1u) * descriptorSetsPerContext);
+    const u32 descriptorSetCount = static_cast<u32>((AsyncRenderContextCount + 1u) * descriptorSetsPerContext);
     std::array<VkDescriptorPoolSize, 3> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     poolSizes[0].descriptorCount = descriptorSetCount;
@@ -4432,7 +4333,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         return true;
     };
 
-    const VulkanDeviceProfile& deviceProfile = VulkanContext::Get().GetDeviceProfile();
     const bool useSynchronousContext = context == nullptr;
     const VkCommandBuffer CommandBuffer = context != nullptr ? context->CommandBuffer : this->CommandBuffer;
     const VkFence FrameFence = context != nullptr ? context->FrameFence : this->FrameFence;
@@ -4469,10 +4369,8 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     const VkBuffer CaptureLineBuffer = context != nullptr ? context->CaptureLineBuffer : this->CaptureLineBuffer;
     void* captureLineMapped = context != nullptr ? context->CaptureLineMapped : CaptureLineMapped;
     const bool exportCaptureLine = captureReadbackPath;
-    const RasterExecutionPath rasterExecutionPath = resolveRasterExecutionPath(deviceProfile.IsAdreno, context);
-    const bool useCpuDirectTiles = rasterExecutionPath == RasterExecutionPath::CpuDirectTiles;
-    const bool useLegacyRasterWorklist = rasterExecutionPath == RasterExecutionPath::LegacyWorklist;
-    ActiveRasterDispatchPath = useLegacyRasterWorklist ? RasterDispatchPath::LegacyWorklist : RasterDispatchPath::DirectTiles;
+    const bool useCpuDirectTiles = context != nullptr && useCpuTileBinning();
+    const bool useLegacyRasterWorklist = ActiveRasterDispatchPath == RasterDispatchPath::LegacyWorklist;
     bool useCpuActiveTileDispatch = false;
 
     if (Device == VK_NULL_HANDLE
@@ -5394,14 +5292,10 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     }
 
     const u64 rasterPassCount = std::max<u64>(1u, static_cast<u64>(rasterPasses.size()));
-    const u64 averageActiveTileCount = cpuActiveTileCountAccum / rasterPassCount;
-    const u64 averageTileCount = cpuTileCountAccum / rasterPassCount;
-    const u64 averageActiveGroupCount = cpuActiveGroupCountAccum / rasterPassCount;
-    const u32 averageActiveDispatchPercent = static_cast<u32>(cpuActiveDispatchAccum / rasterPassCount);
-    CpuActiveTileCountWindow.Add(averageActiveTileCount);
-    CpuTileCountWindow.Add(averageTileCount);
-    CpuActiveGroupCountWindow.Add(averageActiveGroupCount);
-    CpuActiveDispatchWindow.Add(averageActiveDispatchPercent);
+    CpuActiveTileCountWindow.Add(cpuActiveTileCountAccum / rasterPassCount);
+    CpuTileCountWindow.Add(cpuTileCountAccum / rasterPassCount);
+    CpuActiveGroupCountWindow.Add(cpuActiveGroupCountAccum / rasterPassCount);
+    CpuActiveDispatchWindow.Add(cpuActiveDispatchAccum / rasterPassCount);
 
     useCpuActiveTileDispatch = canUseFinalActiveTileDispatch && finalUsesCpuActiveTileDispatch;
     pushConstants.variantKey = kVariantWildcard;
@@ -5940,13 +5834,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
 
     ColorImageInitialized = true;
     HasCpuFrame = readbackToCpu && !deferCaptureReadbackCompletion;
-    recordRasterDispatchMetrics(
-        deviceProfile.IsAdreno,
-        rasterExecutionPath,
-        averageActiveTileCount,
-        averageTileCount,
-        averageActiveDispatchPercent,
-        static_cast<u32>(rasterPassCount));
     return true;
 }
 

@@ -33,13 +33,6 @@ namespace MelonDSAndroid {
         VulkanDiagnosticLegacyFinalAaMask = 1u << 2u,
     };
 
-    enum VulkanRasterDispatchOverride : u32 {
-        VulkanRasterDispatchAuto = 0u,
-        VulkanRasterDispatchCpu = 1u,
-        VulkanRasterDispatchDirect = 2u,
-        VulkanRasterDispatchLegacy = 3u,
-    };
-
     typedef enum {
         ROM,
         FIRMWARE
@@ -101,13 +94,10 @@ namespace MelonDSAndroid {
     extern bool areRendererDebugToolsEnabled();
     extern bool areRendererDebugBgObjLogsEnabled();
     extern u32 getVulkanDiagnosticFlags();
-    extern u32 getForcedVulkanRasterDispatchOverride();
     extern bool hasVulkanDiagnosticFlag(VulkanDiagnosticFlag flag);
     extern std::vector<u32> captureCurrentFrameForDebug();
     extern std::vector<u32> captureCurrentPackedTopPrimaryForDebug();
     extern std::vector<u32> captureCurrentPackedBottomPrimaryForDebug();
-    extern bool isCurrentFrameReadyForDebug();
-    extern int getCurrentFrameIndexForDebug();
     extern std::vector<u32> captureCurrent3dDimensionsForDebug();
     extern std::vector<u32> captureCurrent3dFrameForDebug();
     extern std::vector<u32> captureCurrent3dCaptureFrameForDebug();

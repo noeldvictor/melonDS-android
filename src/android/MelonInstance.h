@@ -70,8 +70,6 @@ public:
     std::vector<u32> captureCurrentFrameForDebug();
     std::vector<u32> captureCurrentPackedTopPrimaryForDebug();
     std::vector<u32> captureCurrentPackedBottomPrimaryForDebug();
-    bool isCurrentFrameReadyForDebug() const;
-    int getCurrentFrameIndexForDebug() const;
     std::vector<u32> captureCurrent3dDimensionsForDebug();
     std::vector<u32> captureCurrent3dFrameForDebug();
     std::vector<u32> captureCurrent3dCaptureFrameForDebug();

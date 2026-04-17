@@ -1124,25 +1124,6 @@ std::vector<u32> MelonInstance::captureCurrentPackedBottomPrimaryForDebug()
     return captureCurrentPackedPrimaryForDebug(false);
 }
 
-bool MelonInstance::isCurrentFrameReadyForDebug() const
-{
-    if (!areRendererDebugToolsEnabled() || nds == nullptr)
-        return false;
-
-    if (currentRenderer != Renderer::Vulkan)
-        return true;
-
-    return lastCompletedVulkanFrame != nullptr;
-}
-
-int MelonInstance::getCurrentFrameIndexForDebug() const
-{
-    if (nds == nullptr)
-        return -1;
-
-    return frame;
-}
-
 std::vector<u32> MelonInstance::captureCurrentPackedPrimaryForDebug(bool topScreen)
 {
     if (!areRendererDebugToolsEnabled())
@@ -1713,10 +1694,7 @@ bool MelonInstance::loadState(Savestate* state)
     if (!retroAchievementsManager->DoSavestate(state))
         return false;
 
-    const bool result = nds->DoSavestate(state);
-    if (result && currentRenderer == Renderer::Vulkan)
-        requestVulkanPresentationResync();
-    return result;
+    return nds->DoSavestate(state);
 }
 
 RewindWindow MelonInstance::getRewindWindow()
