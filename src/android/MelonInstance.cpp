@@ -42,6 +42,7 @@ const int kVulkanCompileStageInitRenderer = 1;
 const int kVulkanCompileStageBuildPipelines = 2;
 const int kVulkanCompileStageInitOutput = 3;
 const int kVulkanCompileStageWarmupSubmission = 4;
+const u64 kVulkanHighResolutionRealtimePresenterBudgetFloorNs = 4'000'000ull;
 
 u32 expandPackedColor6ToRgba8(u32 packedColor)
 {
@@ -107,7 +108,7 @@ FrameQueuePolicy makeLegacyFrameQueuePolicy()
 FrameQueuePolicy makeVulkanRealtimeFrameQueuePolicy(int renderScale)
 {
     FrameQueuePolicy policy{};
-    policy.MaxBacklogDepth = renderScale > 1 ? 2 : 1;
+    policy.MaxBacklogDepth = renderScale > 4 ? 5 : (renderScale > 1 ? 2 : 1);
     policy.AllowStealPending = false;
     policy.AllowPreviousFrameReuse = true;
     policy.AllowDropForDeadline = false;
@@ -119,8 +120,7 @@ FrameQueuePolicy makeVulkanRealtimeFrameQueuePolicy(int renderScale)
 FrameQueuePolicy makeVulkanLateRealtimeFrameQueuePolicy(int renderScale)
 {
     FrameQueuePolicy policy{};
-    const bool highResolutionRealtime = renderScale > 1;
-    policy.MaxBacklogDepth = highResolutionRealtime ? 2 : 1;
+    policy.MaxBacklogDepth = renderScale > 4 ? 5 : (renderScale > 1 ? 2 : 1);
     policy.AllowStealPending = false;
     policy.AllowPreviousFrameReuse = true;
     policy.AllowDropForDeadline = true;
@@ -987,15 +987,41 @@ bool MelonInstance::presentVulkanFrame(
         policy.AllowDropForDeadline = false;
         return policy;
     }();
-    const int maxPresentAttempts = frameQueuePolicy.AllowDropForDeadline
-        ? static_cast<int>(std::max<u64>(1u, frameQueuePolicy.MaxBacklogDepth + 1))
-        : 1;
+    const bool shouldProbeRealtimeBacklog = !frameQueuePolicy.AllowDropForDeadline
+        && frameQueuePolicy.MaxBacklogDepth > 1;
+    const bool shouldAllowBlockingHighResolutionRealtimePresentation = !frameQueuePolicy.AllowDropForDeadline
+        && frameQueuePolicy.MaxBacklogDepth > 2;
+    const FrameQueuePolicy candidateQueuePolicy = [&]() -> FrameQueuePolicy {
+        FrameQueuePolicy policy = frameQueuePolicy;
+        if (shouldProbeRealtimeBacklog)
+        {
+            policy.PreserveBacklogOnPresent = true;
+            policy.PreferOldestFrame = false;
+        }
+        return policy;
+    }();
+    const int maxPresentAttempts = [&]() -> int {
+        if (shouldProbeRealtimeBacklog)
+            return static_cast<int>(std::max<u64>(1u, frameQueuePolicy.MaxBacklogDepth));
+        if (frameQueuePolicy.AllowDropForDeadline)
+            return static_cast<int>(std::max<u64>(1u, frameQueuePolicy.MaxBacklogDepth + 1));
+        return 1;
+    }();
 
     for (int attempt = 0; attempt < maxPresentAttempts; attempt++)
     {
-        Frame* frame = frameQueue.getPresentCandidate(frameQueuePolicy, effectiveBudgetDeadline);
+        Frame* frame = frameQueue.getPresentCandidate(candidateQueuePolicy, effectiveBudgetDeadline);
         if (frame == nullptr)
             return false;
+
+        const bool shouldContinueRealtimeProbe = shouldProbeRealtimeBacklog
+            && attempt + 1 < maxPresentAttempts
+            && !vulkanOutput->isFrameReady(frame);
+        if (shouldContinueRealtimeProbe)
+        {
+            frameQueue.deferPresentedFrame(frame, candidateQueuePolicy);
+            continue;
+        }
 
         if (frameQueuePolicy.AllowDropForDeadline && !vulkanOutput->isFrameReady(frame))
         {
@@ -1034,10 +1060,20 @@ bool MelonInstance::presentVulkanFrame(
             continue;
         }
 
-        const bool presented = vulkanSurfacePresenter->presentFrame(frame, *vulkanOutput, compositionInputs, waitTimeoutNs);
+        const u64 presenterTimeoutNs = [&]() -> u64 {
+            if (shouldAllowBlockingHighResolutionRealtimePresentation)
+                return UINT64_MAX;
+
+            if (!shouldProbeRealtimeBacklog || waitTimeoutNs == UINT64_MAX)
+                return waitTimeoutNs;
+
+            return std::max(waitTimeoutNs, kVulkanHighResolutionRealtimePresenterBudgetFloorNs);
+        }();
+
+        const bool presented = vulkanSurfacePresenter->presentFrame(frame, *vulkanOutput, compositionInputs, presenterTimeoutNs);
         if (presented)
         {
-            frameQueue.commitPresentedFrame(frame, frameQueuePolicy);
+            frameQueue.commitPresentedFrame(frame, shouldProbeRealtimeBacklog ? candidateQueuePolicy : frameQueuePolicy);
             return true;
         }
 
