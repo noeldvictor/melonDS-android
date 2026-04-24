@@ -43,6 +43,7 @@ struct VulkanRenderSettings : public RenderSettings
     bool threadedRendering;
     bool betterPolygons;
     int scale;
+    bool useSimplePipeline = true;
     bool rendererDebugToolsEnabled;
     bool rendererDebugBgObjEnabled;
     bool conservativeCoverageEnabled;

@@ -38,6 +38,9 @@ public:
         u32 CaptureBit24 = 0;
         u32 Direct3DLines = 0;
         u32 SourceACompositeLines = 0;
+        u32 CaptureLineUses3dLines = 0;
+        u32 CaptureLineUsefulAlphaLines = 0;
+        u32 CaptureDestinationBlankLines = 0;
         u32 Opaque3DSourcePixels = 0;
         u32 Opaque3DBackdropPixels = 0;
         u32 CompModeCounts[8] {};
@@ -51,6 +54,7 @@ public:
     void VBlankEnd(Unit* unitA, Unit* unitB) override;
     [[nodiscard]] const DebugCaptureStats& GetDebugCaptureStats() const noexcept { return LastDebugCaptureStats; }
     [[nodiscard]] const u32* GetDebugCapture3dSource() const noexcept { return HasLastDebugCapture3dSource ? LastDebugCapture3dSource : nullptr; }
+    [[nodiscard]] const std::array<u8, 192>& GetDebugCaptureLineUses3dMask() const noexcept { return CaptureLineUses3d; }
 private:
     melonDS::GPU& GPU;
     alignas(8) u32 BGOBJLine[256*3];
@@ -161,6 +165,7 @@ private:
     DebugCaptureStats LastDebugCaptureStats {};
     bool HasLastDebugCapture3dSource = false;
     alignas(8) u32 LastDebugCapture3dSource[256 * 192] {};
+    std::array<u8, 192> CaptureLineUses3d {};
 };
 
 }

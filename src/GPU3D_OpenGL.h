@@ -20,6 +20,7 @@
 
 #ifdef OGLRENDERER_ENABLED
 #include "GPU3D.h"
+#include "GPU3D_AcceleratedFrontend.h"
 #include "GPU_OpenGL.h"
 #include "OpenGLSupport.h"
 #include <vector>
@@ -77,6 +78,7 @@ private:
     struct RendererPolygon
     {
         Polygon* PolyData;
+        AcceleratedPolygonMeta Meta;
 
         u32 NumIndices;
         u32 IndicesOffset;
@@ -84,19 +86,18 @@ private:
 
         u32 NumEdgeIndices;
         u32 EdgeIndicesOffset;
-
-        u32 RenderKey;
     };
 
     GLCompositor CurGLCompositor;
     RendererPolygon PolygonList[2048] {};
+    AcceleratedScene SharedScene{};
 
     bool BuildRenderShader(u32 flags, const std::string& vs, const std::string& fs);
     void UseRenderShader(u32 flags);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 x, u32 y, u32* vptr) const;
-    void BuildPolygons(RendererPolygon* polygons, int npolys);
+    void BuildPolygons(const AcceleratedScene& scene);
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;
     int RenderPolygonEdgeBatch(int i) const;

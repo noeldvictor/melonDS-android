@@ -4,6 +4,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outImage;
 layout(set = 0, binding = 1, rgba8) uniform readonly image2D image3dInput;
+layout(set = 0, binding = 4, rgba8) uniform readonly image2D image3dPreviousTopInput;
+layout(set = 0, binding = 6, rgba8) uniform readonly image2D image3dPreviousBottomInput;
 
 layout(set = 0, binding = 2, std430) readonly buffer TopPackedBuffer
 {
@@ -15,6 +17,11 @@ layout(set = 0, binding = 3, std430) readonly buffer BottomPackedBuffer
     uint bottomPacked[];
 };
 
+layout(set = 0, binding = 5, std430) readonly buffer Capture3dBuffer
+{
+    uint capture3dPacked[];
+};
+
 layout(push_constant) uniform PushConsts
 {
     uint outputWidth;
@@ -23,7 +30,15 @@ layout(push_constant) uniform PushConsts
     uint rendererWidth;
     uint rendererHeight;
     uint packedStride;
+    uint screenSwap;
+    uint previousTopSourceValid;
+    uint previousBottomSourceValid;
+    uint captureSourceValid;
 } pc;
+
+const uint kMetaFlagRegularCaptureUses3d = 1u << 21u;
+const uint kMetaFlagVramCaptureUses3d = 1u << 22u;
+const uint kMetaFlagForceLive3dCompMode7 = 1u << 18u;
 
 struct Rgba6
 {
@@ -32,6 +47,30 @@ struct Rgba6
     int b;
     int a;
 };
+
+bool isPacked3dPlaceholder(Rgba6 color)
+{
+    return color.r == 0
+        && color.g == 0
+        && color.b == 0
+        && color.a == 0x20;
+}
+
+bool hasPackedVisibleColor(Rgba6 color)
+{
+    return !isPacked3dPlaceholder(color)
+        && ((color.r | color.g | color.b) != 0);
+}
+
+Rgba6 makeScreenWhite()
+{
+    Rgba6 color;
+    color.r = 63;
+    color.g = 63;
+    color.b = 63;
+    color.a = 0;
+    return color;
+}
 
 int clampColor6(int value)
 {
@@ -92,11 +131,227 @@ Rgba6 sample3DColorAtScaledPixel(int scaledX, int scaledY)
     return color;
 }
 
-uint readPacked(bool topScreen, int y, int x)
+Rgba6 samplePreviousTop3DColorAtScaledPixel(int scaledX, int scaledY)
+{
+    Rgba6 zero;
+    zero.r = 0;
+    zero.g = 0;
+    zero.b = 0;
+    zero.a = 0;
+
+    if (scaledX < 0
+        || scaledX >= int(pc.rendererWidth)
+        || scaledY < 0
+        || scaledY >= int(pc.rendererHeight))
+        return zero;
+
+    vec4 color3d = imageLoad(image3dPreviousTopInput, ivec2(scaledX, scaledY));
+
+    Rgba6 color;
+    color.r = int(clamp(color3d.r * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.g = int(clamp(color3d.g * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.b = int(clamp(color3d.b * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.a = int(clamp(color3d.a * 255.0 + 0.5, 0.0, 255.0)) >> 3;
+    return color;
+}
+
+Rgba6 samplePreviousBottom3DColorAtScaledPixel(int scaledX, int scaledY)
+{
+    Rgba6 zero;
+    zero.r = 0;
+    zero.g = 0;
+    zero.b = 0;
+    zero.a = 0;
+
+    if (scaledX < 0
+        || scaledX >= int(pc.rendererWidth)
+        || scaledY < 0
+        || scaledY >= int(pc.rendererHeight))
+        return zero;
+
+    vec4 color3d = imageLoad(image3dPreviousBottomInput, ivec2(scaledX, scaledY));
+
+    Rgba6 color;
+    color.r = int(clamp(color3d.r * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.g = int(clamp(color3d.g * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.b = int(clamp(color3d.b * 255.0 + 0.5, 0.0, 255.0)) >> 2;
+    color.a = int(clamp(color3d.a * 255.0 + 0.5, 0.0, 255.0)) >> 3;
+    return color;
+}
+
+Rgba6 sampleCapture3DColorAtDsPixel(int dsX, int dsY)
+{
+    Rgba6 zero;
+    zero.r = 0;
+    zero.g = 0;
+    zero.b = 0;
+    zero.a = 0;
+
+    if (pc.captureSourceValid == 0u
+        || dsX < 0
+        || dsX >= 256
+        || dsY < 0
+        || dsY >= 192)
+        return zero;
+
+    return unpackColor6(capture3dPacked[uint(dsY) * 256u + uint(dsX)]);
+}
+
+uint readTopPacked(int y, int x)
 {
     uint offset = uint(y) * pc.packedStride + uint(x);
-    return topScreen ? topPacked[offset] : bottomPacked[offset];
+    return topPacked[offset];
 }
+
+uint readBottomPacked(int y, int x)
+{
+    uint offset = uint(y) * pc.packedStride + uint(x);
+    return bottomPacked[offset];
+}
+
+#define DEFINE_COMPOSE_SCREEN_PIXEL(FUNC_NAME, READ_PACKED_FN, SCREEN_IS_TOP) \
+Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale) \
+{ \
+    uint masterBrightness = READ_PACKED_FN(dsY, 256 * 3); \
+    int displayMode = int((masterBrightness >> 16u) & 0x3u); \
+    int brightnessMode = int(((masterBrightness >> 8u) & 0xFFu) >> 6u); \
+    int brightnessFactor = min(16, int(masterBrightness & 0x1Fu)); \
+    int xOffset = int((masterBrightness >> 24u) & 0xFFu) \
+        - ((((masterBrightness >> 16u) & 0x80u) != 0u) ? 256 : 0); \
+    bool regularCaptureUses3d = (masterBrightness & kMetaFlagRegularCaptureUses3d) != 0u; \
+    bool vramCaptureUses3d = (masterBrightness & kMetaFlagVramCaptureUses3d) != 0u; \
+    bool forceLive3dCompMode7 = (masterBrightness & kMetaFlagForceLive3dCompMode7) != 0u; \
+    bool frameLineUsesCapture3d = regularCaptureUses3d || vramCaptureUses3d; \
+    bool screenOwnsLive3D = SCREEN_IS_TOP ? (pc.screenSwap != 0u) : (pc.screenSwap == 0u); \
+    Rgba6 pixel = unpackColor6(READ_PACKED_FN(dsY, sourceX)); \
+    if (displayMode == 1) \
+    { \
+        Rgba6 val1 = pixel; \
+        Rgba6 val2 = unpackColor6(READ_PACKED_FN(dsY, 256 + sourceX)); \
+        Rgba6 val3 = unpackColor6(READ_PACKED_FN(dsY, 512 + sourceX)); \
+        int compMode = val3.a & 0xF; \
+        bool both3dPlaceholders = isPacked3dPlaceholder(val1) && isPacked3dPlaceholder(val2); \
+        bool captureBackedComp4 = compMode == 4 && both3dPlaceholders; \
+        bool allowTemporalCompMode7 = compMode == 7 && forceLive3dCompMode7; \
+        bool compModeSamples3D = compMode <= 4 || allowTemporalCompMode7; \
+        bool screenUsesLive3D = screenOwnsLive3D && compModeSamples3D; \
+        bool screenUsesPrevious3D = !screenOwnsLive3D && compModeSamples3D; \
+        bool screenHasPrevious3D = SCREEN_IS_TOP ? (pc.previousTopSourceValid != 0u) : (pc.previousBottomSourceValid != 0u); \
+        bool screenCanUsePrevious3D = screenHasPrevious3D \
+            && (screenUsesPrevious3D || screenUsesLive3D); \
+        int shiftedScaledX = scaledX + (xOffset * int(safeScale)); \
+        Rgba6 pixel3D; \
+        pixel3D.r = 0; \
+        pixel3D.g = 0; \
+        pixel3D.b = 0; \
+        pixel3D.a = 0; \
+        if (screenUsesLive3D) \
+            pixel3D = sample3DColorAtScaledPixel(shiftedScaledX, scaledY); \
+        if ((pixel3D.a & 0x1F) == 0 && screenCanUsePrevious3D) \
+            pixel3D = SCREEN_IS_TOP \
+                ? samplePreviousTop3DColorAtScaledPixel(shiftedScaledX, scaledY) \
+                : samplePreviousBottom3DColorAtScaledPixel(shiftedScaledX, scaledY); \
+        Rgba6 capture3D = sampleCapture3DColorAtDsPixel(sourceX, dsY); \
+        bool pixel3DHasUsefulColor = ((pixel3D.a & 0x1F) > 0) || hasPackedVisibleColor(pixel3D); \
+        bool captureBackedComp4Valid = captureBackedComp4 && ((capture3D.a & 0x1F) > 0); \
+        if (compMode == 4 && both3dPlaceholders && pixel3DHasUsefulColor) \
+        { \
+            val1 = pixel3D; \
+        } \
+        else if (compMode == 4 && both3dPlaceholders) \
+        { \
+            if (captureBackedComp4Valid) \
+                pixel3D = capture3D; \
+        } \
+        else if ((pixel3D.a & 0x1F) == 0 && captureBackedComp4Valid) \
+        { \
+            pixel3D = capture3D; \
+        } \
+        if (compMode == 4) \
+        { \
+            if (both3dPlaceholders && pixel3DHasUsefulColor) \
+            { \
+                val1 = pixel3D; \
+            } \
+            else if (both3dPlaceholders && captureBackedComp4Valid) \
+            { \
+                val1 = capture3D; \
+            } \
+            else if (both3dPlaceholders && brightnessFactor > 0) \
+            { \
+                val1 = val2; \
+            } \
+            else if ((pixel3D.a & 0x1F) > 0) \
+            { \
+                int eva = (pixel3D.a & 0x1F) + 1; \
+                int evb = 32 - eva; \
+                val1.r = clampColor6(((pixel3D.r * eva) + (val1.r * evb) + 0x10) >> 5); \
+                val1.g = clampColor6(((pixel3D.g * eva) + (val1.g * evb) + 0x10) >> 5); \
+                val1.b = clampColor6(((pixel3D.b * eva) + (val1.b * evb) + 0x10) >> 5); \
+            } \
+            else \
+            { \
+                val1 = val2; \
+            } \
+        } \
+        else if (compMode == 1) \
+        { \
+            if ((pixel3D.a & 0x1F) > 0) \
+            { \
+                int eva = val3.g; \
+                int evb = val3.b; \
+                val1.r = clampColor6(((val1.r * eva) + (pixel3D.r * evb) + 0x8) >> 4); \
+                val1.g = clampColor6(((val1.g * eva) + (pixel3D.g * evb) + 0x8) >> 4); \
+                val1.b = clampColor6(((val1.b * eva) + (pixel3D.b * evb) + 0x8) >> 4); \
+            } \
+            else \
+            { \
+                val1 = val2; \
+            } \
+        } \
+        else if (compMode <= 3) \
+        { \
+            if ((pixel3D.a & 0x1F) > 0) \
+            { \
+                val1 = pixel3D; \
+                int evy = val3.g; \
+                if (compMode == 2) \
+                { \
+                    val1.r = clampColor6(val1.r + ((((63 - val1.r) * evy) + 0x8) >> 4)); \
+                    val1.g = clampColor6(val1.g + ((((63 - val1.g) * evy) + 0x8) >> 4)); \
+                    val1.b = clampColor6(val1.b + ((((63 - val1.b) * evy) + 0x8) >> 4)); \
+                } \
+                else if (compMode == 3) \
+                { \
+                    applyBrightnessDown(val1, evy, 0x7); \
+                } \
+            } \
+            else \
+            { \
+                val1 = val2; \
+            } \
+        } \
+        else if (compMode == 7) \
+        { \
+            if (allowTemporalCompMode7 && (pixel3D.a & 0x1F) > 0) \
+                val1 = pixel3D; \
+        } \
+        pixel = val1; \
+    } \
+    if (displayMode != 0) \
+    { \
+        if (brightnessMode == 1) \
+            applyBrightnessUp(pixel, brightnessFactor); \
+        else if (brightnessMode == 2) \
+            applyBrightnessDown(pixel, brightnessFactor, 0xF); \
+    } \
+    return pixel; \
+}
+
+DEFINE_COMPOSE_SCREEN_PIXEL(composeTopScreenPixel, readTopPacked, true)
+DEFINE_COMPOSE_SCREEN_PIXEL(composeBottomScreenPixel, readBottomPacked, false)
+
+#undef DEFINE_COMPOSE_SCREEN_PIXEL
 
 void main()
 {
@@ -123,95 +378,15 @@ void main()
     }
 
     int dsY = isTopScreen ? sourceY : (sourceY - 194);
-    bool topScreen = isTopScreen;
     int scaledY = int(gid.y);
-    if (!topScreen)
+    if (isBottomScreen)
         scaledY -= int((192u + 2u) * safeScale);
 
-    uint masterBrightness = readPacked(topScreen, dsY, 256 * 3);
-    int displayMode = int((masterBrightness >> 16u) & 0x3u);
-    int brightnessMode = int(((masterBrightness >> 8u) & 0xFFu) >> 6u);
-    int brightnessFactor = min(16, int(masterBrightness & 0x1Fu));
-    int xOffset = int((masterBrightness >> 24u) & 0xFFu)
-        - ((((masterBrightness >> 16u) & 0x80u) != 0u) ? 256 : 0);
-
-    Rgba6 pixel = unpackColor6(readPacked(topScreen, dsY, sourceX));
-
-    if (displayMode == 1)
-    {
-        Rgba6 val1 = pixel;
-        Rgba6 val2 = unpackColor6(readPacked(topScreen, dsY, 256 + sourceX));
-        Rgba6 val3 = unpackColor6(readPacked(topScreen, dsY, 512 + sourceX));
-
-        int compMode = val3.a & 0xF;
-        // Keep packed/2D reads in DS coordinates, but sample 3D in the actual
-        // internal-resolution pixel space so IR > 1 preserves real detail.
-        int scaledX = int(gid.x) + (xOffset * int(safeScale));
-        Rgba6 pixel3D = sample3DColorAtScaledPixel(scaledX, scaledY);
-
-        if (compMode == 4)
-        {
-            if ((pixel3D.a & 0x1F) > 0)
-            {
-                int eva = (pixel3D.a & 0x1F) + 1;
-                int evb = 32 - eva;
-                val1.r = clampColor6(((pixel3D.r * eva) + (val1.r * evb) + 0x10) >> 5);
-                val1.g = clampColor6(((pixel3D.g * eva) + (val1.g * evb) + 0x10) >> 5);
-                val1.b = clampColor6(((pixel3D.b * eva) + (val1.b * evb) + 0x10) >> 5);
-            }
-            else
-            {
-                val1 = val2;
-            }
-        }
-        else if (compMode == 1)
-        {
-            if ((pixel3D.a & 0x1F) > 0)
-            {
-                int eva = val3.g;
-                int evb = val3.b;
-                val1.r = clampColor6(((val1.r * eva) + (pixel3D.r * evb) + 0x8) >> 4);
-                val1.g = clampColor6(((val1.g * eva) + (pixel3D.g * evb) + 0x8) >> 4);
-                val1.b = clampColor6(((val1.b * eva) + (pixel3D.b * evb) + 0x8) >> 4);
-            }
-            else
-            {
-                val1 = val2;
-            }
-        }
-        else if (compMode <= 3)
-        {
-            if ((pixel3D.a & 0x1F) > 0)
-            {
-                val1 = pixel3D;
-                int evy = val3.g;
-                if (compMode == 2)
-                {
-                    val1.r = clampColor6(val1.r + ((((63 - val1.r) * evy) + 0x8) >> 4));
-                    val1.g = clampColor6(val1.g + ((((63 - val1.g) * evy) + 0x8) >> 4));
-                    val1.b = clampColor6(val1.b + ((((63 - val1.b) * evy) + 0x8) >> 4));
-                }
-                else if (compMode == 3)
-                {
-                    applyBrightnessDown(val1, evy, 0x7);
-                }
-            }
-            else
-            {
-                val1 = val2;
-            }
-        }
-
-        pixel = val1;
-    }
-
-    if (displayMode != 0)
-    {
-        if (brightnessMode == 1)
-            applyBrightnessUp(pixel, brightnessFactor);
-        else if (brightnessMode == 2)
-            applyBrightnessDown(pixel, brightnessFactor, 0xF);
-    }
+    Rgba6 pixel;
+    if (isTopScreen)
+        pixel = composeTopScreenPixel(sourceX, dsY, int(gid.x), scaledY, safeScale);
+    else
+        pixel = composeBottomScreenPixel(sourceX, dsY, int(gid.x), scaledY, safeScale);
 
     int r = toColor8(pixel.r);
     int g = toColor8(pixel.g);

@@ -40,7 +40,6 @@ namespace MelonDSAndroid
         std::atomic_bool rendererDebugToolsEnabled = false;
         std::atomic_bool rendererDebugBgObjEnabled = false;
         std::atomic_uint vulkanDiagnosticFlags = 0;
-
         bool EqualsIgnoreCase(const char* lhs, const char* rhs)
         {
             if (lhs == nullptr || rhs == nullptr)
@@ -591,6 +590,62 @@ namespace MelonDSAndroid
         return instance->captureCurrentPackedBottomPrimaryForDebug();
     }
 
+    std::vector<u32> captureCurrentPackedPlaneForDebug(int screenIndex, int planeIndex)
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentPackedPlaneForDebug(screenIndex, planeIndex);
+    }
+
+    std::vector<u32> captureCurrentCapture3dSourceForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentCapture3dSourceForDebug();
+    }
+
+    std::vector<u32> captureCurrentCaptureLineUses3dMaskForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentCaptureLineUses3dMaskForDebug();
+    }
+
+    std::vector<u32> captureCurrentComp4TopPlaceholderForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentComp4TopPlaceholderForDebug();
+    }
+
+    std::vector<u32> captureCurrentComp4BottomPlaceholderForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentComp4BottomPlaceholderForDebug();
+    }
+
+    std::vector<u32> captureCurrentCaptureFallbackMaskForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentCaptureFallbackMaskForDebug();
+    }
+
+    std::string captureCurrentSoftPackedFrameMetaJsonForDebug()
+    {
+        if (!instance)
+            return {};
+
+        return instance->captureCurrentSoftPackedFrameMetaJsonForDebug();
+    }
+
     std::vector<u32> captureCurrent3dDimensionsForDebug()
     {
         if (!instance)
@@ -639,6 +694,88 @@ namespace MelonDSAndroid
         return instance->captureCurrent3dCoverageForDebug();
     }
 
+    bool isCurrentFrameReadyForDebug()
+    {
+        if (!instance)
+            return false;
+
+        return instance->isCurrentFrameReadyForDebug();
+    }
+
+    int getCurrentFrameIndexForDebug()
+    {
+        if (!instance)
+            return -1;
+
+        return instance->getCurrentFrameIndexForDebug();
+    }
+
+    void clearPreparedRendererDebugSnapshot()
+    {
+        if (instance)
+            instance->clearPreparedRendererDebugSnapshotForDebug();
+    }
+
+    void startDenseScreenBurstCaptureForDebug(int frameCount, int stepFrames, u32 captureKindsMask)
+    {
+        if (instance)
+            instance->startDenseScreenBurstCaptureForDebug(frameCount, stepFrames, captureKindsMask);
+    }
+
+    bool isDenseScreenBurstCaptureCompleteForDebug()
+    {
+        if (!instance)
+            return false;
+
+        return instance->isDenseScreenBurstCaptureCompleteForDebug();
+    }
+
+    int getDenseScreenBurstCaptureFrameCountForDebug()
+    {
+        if (!instance)
+            return 0;
+
+        return instance->getDenseScreenBurstCaptureFrameCountForDebug();
+    }
+
+    std::vector<u32> getDenseScreenBurstCaptureFrameForDebug(int index)
+    {
+        if (!instance)
+            return {};
+
+        return instance->getDenseScreenBurstCaptureFrameForDebug(index);
+    }
+
+    std::vector<u32> getDenseScreenBurstPackedTopFrameForDebug(int index)
+    {
+        if (!instance)
+            return {};
+
+        return instance->getDenseScreenBurstPackedTopFrameForDebug(index);
+    }
+
+    std::vector<u32> getDenseScreenBurstPackedBottomFrameForDebug(int index)
+    {
+        if (!instance)
+            return {};
+
+        return instance->getDenseScreenBurstPackedBottomFrameForDebug(index);
+    }
+
+    std::vector<u32> getDenseScreenBurstRenderer3dCaptureFrameForDebug(int index)
+    {
+        if (!instance)
+            return {};
+
+        return instance->getDenseScreenBurstRenderer3dCaptureFrameForDebug(index);
+    }
+
+    void clearDenseScreenBurstCaptureForDebug()
+    {
+        if (instance)
+            instance->clearDenseScreenBurstCaptureForDebug();
+    }
+
     void dumpCurrentRendererDebugSnapshot()
     {
         if (instance)
@@ -672,6 +809,12 @@ namespace MelonDSAndroid
 
     bool saveState(const char* path)
     {
+        if (instance == nullptr)
+        {
+            Platform::Log(Platform::LogLevel::Warn, "Savestate save denied: emulator instance unavailable\n");
+            return false;
+        }
+
         Platform::FileHandle* saveStateFile = Platform::OpenFile(path, Platform::FileMode::Write);
 
         if (!saveStateFile)
@@ -705,6 +848,12 @@ namespace MelonDSAndroid
 
     bool loadState(const char* path)
     {
+        if (instance == nullptr)
+        {
+            Platform::Log(Platform::LogLevel::Warn, "Savestate load denied: emulator instance unavailable\n");
+            return false;
+        }
+
         if (!instance->areSaveStatesAllowed())
         {
             Platform::Log(Platform::LogLevel::Warn, "Savestate load denied: RetroAchievements hardcore session active\n");
@@ -763,6 +912,12 @@ namespace MelonDSAndroid
 
     bool loadRewindState(melonDS::RewindSaveState rewindSaveState)
     {
+        if (instance == nullptr)
+        {
+            Platform::Log(Platform::LogLevel::Warn, "Rewind load denied: emulator instance unavailable\n");
+            return false;
+        }
+
         if (!instance->areSaveStatesAllowed())
         {
             Platform::Log(Platform::LogLevel::Warn, "Rewind load denied: RetroAchievements hardcore session active\n");
@@ -798,11 +953,17 @@ namespace MelonDSAndroid
 
     RewindWindow getRewindWindow()
     {
+        if (instance == nullptr)
+            return RewindWindow{};
+
         return instance->getRewindWindow();
     }
 
     void stop()
     {
+        if (instance == nullptr)
+            return;
+
         instance->stop();
         cleanupOpenGlContext();
     }

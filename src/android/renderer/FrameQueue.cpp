@@ -29,7 +29,9 @@ Frame* FrameQueue::getRenderFrame(const FrameQueuePolicy& requestedPolicy)
     {
         Frame* frame = freeQueue.front();
         freeQueue.pop();
+        frame->frameId = nextFrameId++;
         frame->queuedAtNs = 0;
+        frame->presentTimelineValue = 0;
         return frame;
     }
 
@@ -38,6 +40,8 @@ Frame* FrameQueue::getRenderFrame(const FrameQueuePolicy& requestedPolicy)
         const u64 nowNs = MelonDSAndroid::PerfNowNs();
         Frame* frame = presentQueue.back();
         presentQueue.pop_back();
+        frame->frameId = nextFrameId++;
+        frame->presentTimelineValue = 0;
         stats.PendingFramesStolenForRender++;
         stats.PresentFramesDroppedByPolicy++;
         recordDroppedFrameLocked(frame, PresentDropCause::StealForRender, nowNs);
@@ -168,6 +172,16 @@ Frame* FrameQueue::getPresentCandidate(
     return frame;
 }
 
+void FrameQueue::recycleRenderFrame(Frame* frame)
+{
+    std::unique_lock lock(frameLock);
+    if (frame == nullptr)
+        return;
+
+    frame->queuedAtNs = 0;
+    freeQueue.push(frame);
+}
+
 void FrameQueue::commitPresentedFrame(Frame* frame, const FrameQueuePolicy& requestedPolicy)
 {
     std::unique_lock lock(frameLock);
@@ -270,7 +284,9 @@ void FrameQueue::validateRenderFrame(Frame* frame, int requiredWidth, int requir
         frame->backend = backend;
         frame->width = 0;
         frame->height = 0;
+        frame->frameId = 0;
         frame->renderTimelineValue = 0;
+        frame->presentTimelineValue = 0;
         frame->queuedAtNs = 0;
     }
 
@@ -355,7 +371,19 @@ void FrameQueue::requestPresentationResync()
         freeQueue.push(pendingPresentFrame);
         pendingPresentFrame = nullptr;
     }
-    suppressPreviousFrameReuse = previousFrame == nullptr;
+
+    if (previousFrame != nullptr)
+    {
+        previousFrame->queuedAtNs = 0;
+        freeQueue.push(previousFrame);
+        previousFrame = nullptr;
+    }
+
+    // A resync invalidates the presentation contract for all in-flight frames:
+    // scale, backend, packed buffers, and 3D source image may all have changed.
+    // Reusing the previous frame after this point mixes old frame ownership with
+    // the new configuration and reopens flicker/corruption on IR changes.
+    suppressPreviousFrameReuse = true;
     updateBacklogStatsLocked();
 }
 
@@ -397,9 +425,11 @@ void FrameQueue::clear()
         frame.frameTexture = 0;
         frame.width = 0;
         frame.height = 0;
+        frame.frameId = 0;
         frame.renderFence = 0;
         frame.presentFence = 0;
         frame.renderTimelineValue = 0;
+        frame.presentTimelineValue = 0;
         frame.queuedAtNs = 0;
     }
 }

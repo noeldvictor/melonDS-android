@@ -38,11 +38,8 @@ public:
     VkPhysicalDevice GetPhysicalDevice() const { return PhysicalDevice; }
     VkDevice GetDevice() const { return Device; }
     VkQueue GetQueue() const { return Queue; }
-    VkQueue GetPresenterQueue() const { return PresenterQueue != VK_NULL_HANDLE ? PresenterQueue : Queue; }
     u32 GetQueueFamilyIndex() const { return QueueFamilyIndex; }
     std::mutex& GetQueueLock() { return QueueLock; }
-    std::mutex& GetPresenterQueueLock() { return PresenterQueue != VK_NULL_HANDLE ? PresenterQueueLock : QueueLock; }
-    bool HasDedicatedPresenterQueue() const { return PresenterQueue != VK_NULL_HANDLE; }
     bool SupportsTimestamps() const { return TimestampQueriesSupported && ResetQueryPool != nullptr; }
     float GetTimestampPeriod() const { return TimestampPeriod; }
     const VulkanDeviceProfile& GetDeviceProfile() const { return DeviceProfile; }
@@ -76,10 +73,8 @@ private:
     VkPhysicalDevice PhysicalDevice = VK_NULL_HANDLE;
     VkDevice Device = VK_NULL_HANDLE;
     VkQueue Queue = VK_NULL_HANDLE;
-    VkQueue PresenterQueue = VK_NULL_HANDLE;
     u32 QueueFamilyIndex = 0;
     std::mutex QueueLock;
-    std::mutex PresenterQueueLock;
 
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID AhbProperties = nullptr;
     PFN_vkWaitSemaphoresKHR WaitSemaphores = nullptr;

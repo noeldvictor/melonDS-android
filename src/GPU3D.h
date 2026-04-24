@@ -353,6 +353,7 @@ public:
 
     virtual void SetupAccelFrame() {}
     virtual void PrepareCaptureFrame() {}
+    virtual void BeginCaptureFrame() {}
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
 

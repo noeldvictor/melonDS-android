@@ -27,11 +27,19 @@
 #include <vector>
 
 #include "GPU.h"
+#include "GPU3D_AcceleratedFrontend.h"
 #include "GPU3D_Vulkan_BinCombinedShaderData.h"
 #include "GPU3D_Vulkan_CalculateWorkOffsetsShaderData.h"
 #include "GPU3D_Vulkan_CaptureLineExportShaderData.h"
 #include "GPU3D_Vulkan_DepthBlendShaderData.h"
 #include "GPU3D_Vulkan_FinalPassShaderData.h"
+#include "GPU3D_Vulkan_GraphicsEdgeShaderData.h"
+#include "GPU3D_Vulkan_GraphicsFinalShaderVertexData.h"
+#include "GPU3D_Vulkan_GraphicsFogShaderData.h"
+#include "GPU3D_Vulkan_GraphicsClearShaderData.h"
+#include "GPU3D_Vulkan_GraphicsNoColorShaderData.h"
+#include "GPU3D_Vulkan_GraphicsRasterShaderFragmentData.h"
+#include "GPU3D_Vulkan_GraphicsRasterShaderVertexData.h"
 #include "GPU3D_Vulkan_InterpSpansShaderData.h"
 #include "GPU3D_Vulkan_SortWorkShaderData.h"
 #include "GPU3D_Vulkan_TriRasterBaseShaderData.h"
@@ -55,7 +63,7 @@ using Platform::LogLevel;
 
 namespace
 {
-constexpr u32 kPipelineCacheFileVersion = 2;
+constexpr u32 kPipelineCacheFileVersion = 4;
 constexpr u32 kVulkanDiagnosticDisablePassiveRepeatCoverageExpand = 1u << 0u;
 constexpr float kTriangleAreaEpsilon = 0.000001f;
 constexpr float kTileOverlapEpsilon = 0.00001f;
@@ -69,6 +77,42 @@ constexpr u32 kWorkActiveTileCount = 6u;
 constexpr u32 kWorkActiveGroupCount = 7u;
 constexpr u32 kWorkTileOffsetsBase = 8u;
 constexpr u32 kCpuActiveTileDispatchMaxCoveragePercent = 90u;
+
+void logCaptureDebugState(
+    const char* stage,
+    bool exactCaptureOnly,
+    bool captureLinePending,
+    bool captureLineReady,
+    bool hasCpuFrame,
+    bool exactLineFresh,
+    bool usedPreviousValidFill,
+    bool usedFallbackFill,
+    const std::array<u32, 256 * 192>& lineCache,
+    u32& remainingLogs)
+{
+    if (!MelonDSAndroid::areRendererDebugToolsEnabled() || remainingLogs == 0)
+        return;
+
+    const u32 topLeft = lineCache[0];
+    const u32 topMid = lineCache[128];
+    const u32 center = lineCache[(96u * 256u) + 128u];
+    Platform::Log(
+        Platform::LogLevel::Warn,
+        "VulkanCapture[%s]: exact=%u pending=%u ready=%u hasCpu=%u fresh=%u fallback=%u topLeft=%08X topMid=%08X center=%08X remaining=%u",
+        stage,
+        exactCaptureOnly ? 1u : 0u,
+        captureLinePending ? 1u : 0u,
+        captureLineReady ? 1u : 0u,
+        hasCpuFrame ? 1u : 0u,
+        exactLineFresh ? 1u : 0u,
+        usedPreviousValidFill ? 2u : (usedFallbackFill ? 1u : 0u),
+        topLeft,
+        topMid,
+        center,
+        remainingLogs
+    );
+    remainingLogs--;
+}
 
 u64 fnv1a64(const char* value)
 {
@@ -231,7 +275,221 @@ bool createBufferAllocation(
 
     return true;
 }
+
+VkShaderModule createShaderModule(VkDevice device, const unsigned char* spirvBytes, size_t spirvLength)
+{
+    if (device == VK_NULL_HANDLE || spirvBytes == nullptr || spirvLength == 0)
+        return VK_NULL_HANDLE;
+
+    std::vector<u32> shaderWords((spirvLength + sizeof(u32) - 1u) / sizeof(u32));
+    std::memcpy(shaderWords.data(), spirvBytes, spirvLength);
+
+    VkShaderModuleCreateInfo shaderCreateInfo{};
+    shaderCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderCreateInfo.codeSize = spirvLength;
+    shaderCreateInfo.pCode = shaderWords.data();
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &shaderCreateInfo, nullptr, &shaderModule) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+
+    return shaderModule;
 }
+
+u32 ConvertBgraToRgba8(u32 packedColor)
+{
+    const u32 rb = packedColor & 0x00FF00FFu;
+    const u32 g = packedColor & 0x0000FF00u;
+    const u32 a = packedColor & 0xFF000000u;
+    return ((rb & 0x000000FFu) << 16) | g | ((rb & 0x00FF0000u) >> 16) | a;
+}
+
+u32 PackOpenGlAttrToLogical(u32 packedColor)
+{
+    const u32 polyIdByte = packedColor & 0xFFu;
+    const u32 edgeByte = (packedColor >> 8u) & 0xFFu;
+    const u32 fogByte = (packedColor >> 16u) & 0xFFu;
+
+    const u32 polyId = ((polyIdByte * 63u) + 127u) / 255u;
+    u32 attr = (polyId & 0x3Fu) << 24u;
+    if (fogByte >= 0x80u)
+        attr |= 1u << 15u;
+    if (edgeByte >= 0x80u)
+    {
+        attr |= 0xFu;
+        attr |= 0x10u << 8u;
+    }
+    return attr;
+}
+
+u32 BitCastFloatToU32(float value)
+{
+    static_assert(sizeof(float) == sizeof(u32));
+    u32 bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+}
+
+class VulkanRenderer3D::IVulkan3DBackend
+{
+public:
+    explicit IVulkan3DBackend(VulkanRenderer3D& renderer) noexcept
+        : Renderer(renderer)
+    {
+    }
+
+    virtual ~IVulkan3DBackend() = default;
+
+    virtual BackendMode mode() const noexcept = 0;
+    virtual void Reset(GPU& gpu) = 0;
+    virtual void VCount144(GPU& gpu) = 0;
+    virtual void RenderFrame(GPU& gpu) = 0;
+    virtual void RestartFrame(GPU& gpu) = 0;
+    virtual u32* GetLine(int line) = 0;
+    virtual void SetupAccelFrame() = 0;
+    virtual void PrepareCaptureFrame() = 0;
+    virtual void Blit(const GPU& gpu) = 0;
+    virtual void Stop(const GPU& gpu) = 0;
+
+protected:
+    void activate() noexcept
+    {
+        Renderer.activateBackendMode(mode());
+    }
+
+    VulkanRenderer3D& Renderer;
+};
+
+class VulkanRenderer3D::ComputeLegacyBackend final : public VulkanRenderer3D::IVulkan3DBackend
+{
+public:
+    using IVulkan3DBackend::IVulkan3DBackend;
+
+    BackendMode mode() const noexcept override
+    {
+        return BackendMode::ComputeLegacy;
+    }
+
+    void Reset(GPU& gpu) override
+    {
+        activate();
+        Renderer.ResetActiveBackend(gpu);
+    }
+
+    void VCount144(GPU& gpu) override
+    {
+        activate();
+        Renderer.VCount144ActiveBackend(gpu);
+    }
+
+    void RenderFrame(GPU& gpu) override
+    {
+        activate();
+        Renderer.RenderFrameActiveBackend(gpu);
+    }
+
+    void RestartFrame(GPU& gpu) override
+    {
+        activate();
+        Renderer.RestartFrameActiveBackend(gpu);
+    }
+
+    u32* GetLine(int line) override
+    {
+        activate();
+        return Renderer.GetLineActiveBackend(line);
+    }
+
+    void SetupAccelFrame() override
+    {
+        activate();
+        Renderer.SetupAccelFrameActiveBackend();
+    }
+
+    void PrepareCaptureFrame() override
+    {
+        activate();
+        Renderer.PrepareCaptureFrameActiveBackend();
+    }
+
+    void Blit(const GPU& gpu) override
+    {
+        activate();
+        Renderer.BlitActiveBackend(gpu);
+    }
+
+    void Stop(const GPU& gpu) override
+    {
+        activate();
+        Renderer.StopActiveBackend(gpu);
+    }
+};
+
+class VulkanRenderer3D::SimpleGraphicsBackend final : public VulkanRenderer3D::IVulkan3DBackend
+{
+public:
+    using IVulkan3DBackend::IVulkan3DBackend;
+
+    BackendMode mode() const noexcept override
+    {
+        return BackendMode::GraphicsHardware;
+    }
+
+    void Reset(GPU& gpu) override
+    {
+        activate();
+        Renderer.ResetActiveBackend(gpu);
+    }
+
+    void VCount144(GPU& gpu) override
+    {
+        activate();
+        Renderer.VCount144ActiveBackend(gpu);
+    }
+
+    void RenderFrame(GPU& gpu) override
+    {
+        activate();
+        Renderer.RenderFrameActiveBackend(gpu);
+    }
+
+    void RestartFrame(GPU& gpu) override
+    {
+        activate();
+        Renderer.RestartFrameActiveBackend(gpu);
+    }
+
+    u32* GetLine(int line) override
+    {
+        activate();
+        return Renderer.GetLineActiveBackend(line);
+    }
+
+    void SetupAccelFrame() override
+    {
+        activate();
+        Renderer.SetupAccelFrameActiveBackend();
+    }
+
+    void PrepareCaptureFrame() override
+    {
+        activate();
+        Renderer.PrepareCaptureFrameActiveBackend();
+    }
+
+    void Blit(const GPU& gpu) override
+    {
+        activate();
+        Renderer.BlitActiveBackend(gpu);
+    }
+
+    void Stop(const GPU& gpu) override
+    {
+        activate();
+        Renderer.StopActiveBackend(gpu);
+    }
+};
 
 std::unique_ptr<VulkanRenderer3D> VulkanRenderer3D::New() noexcept
 {
@@ -241,6 +499,8 @@ std::unique_ptr<VulkanRenderer3D> VulkanRenderer3D::New() noexcept
 VulkanRenderer3D::VulkanRenderer3D() noexcept
     : Renderer3D(true)
     , Texcache(TexcacheVulkanLoader())
+    , ComputeLegacyBackendInstance(std::make_unique<ComputeLegacyBackend>(*this))
+    , SimpleGraphicsBackendInstance(std::make_unique<SimpleGraphicsBackend>(*this))
 {
     clearLineCache();
 }
@@ -250,12 +510,31 @@ VulkanRenderer3D::~VulkanRenderer3D()
     destroyVulkan();
 }
 
+VulkanRenderer3D::IVulkan3DBackend& VulkanRenderer3D::activeBackend() noexcept
+{
+    refreshActiveBackendMode();
+    return ActiveBackendMode == BackendMode::GraphicsHardware
+        ? *SimpleGraphicsBackendInstance
+        : *ComputeLegacyBackendInstance;
+}
+
+void VulkanRenderer3D::activateBackendMode(BackendMode mode) noexcept
+{
+    ActiveBackendMode = mode;
+}
+
 void VulkanRenderer3D::Reset(GPU& gpu)
+{
+    activeBackend().Reset(gpu);
+}
+
+void VulkanRenderer3D::ResetActiveBackend(GPU& gpu)
 {
     (void)gpu;
     Texcache.Reset();
     HasCpuFrame = false;
     FrameIdentical = false;
+    LastSubmittedRenderPolygonCount = 0;
     LastSubmittedRenderContext = nullptr;
     SkipRenderAtVCount215 = false;
     InEarlySubmitAttempt = false;
@@ -264,6 +543,8 @@ void VulkanRenderer3D::Reset(GPU& gpu)
     PendingCaptureReadbackContext = nullptr;
     resetCaptureLineState();
     clearLineCache();
+    LastValidExactCaptureLineCache.fill(0);
+    HasLastValidExactCapture = false;
     CaptureLineExportCount = 0;
     EarlySubmitAttemptCount = 0;
     EarlySubmitHitCount = 0;
@@ -272,6 +553,11 @@ void VulkanRenderer3D::Reset(GPU& gpu)
 }
 
 void VulkanRenderer3D::VCount144(GPU& gpu)
+{
+    activeBackend().VCount144(gpu);
+}
+
+void VulkanRenderer3D::VCount144ActiveBackend(GPU& gpu)
 {
     SkipRenderAtVCount215 = false;
 
@@ -295,7 +581,7 @@ void VulkanRenderer3D::VCount144(GPU& gpu)
     InEarlySubmitAttempt = true;
     CurrentEarlySubmitContextWaitNs = 0;
     const u64 earlySubmitStartNs = PerfNowNs();
-    RenderFrame(gpu);
+    RenderFrameActiveBackend(gpu);
     EarlySubmitCpuWindow.Add(PerfNowNs() - earlySubmitStartNs);
     EarlySubmitContextWaitCpuWindow.Add(CurrentEarlySubmitContextWaitNs);
     InEarlySubmitAttempt = false;
@@ -309,6 +595,13 @@ void VulkanRenderer3D::VCount144(GPU& gpu)
 
 void VulkanRenderer3D::RenderFrame(GPU& gpu)
 {
+    activeBackend().RenderFrame(gpu);
+}
+
+void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
+{
+    refreshActiveBackendMode();
+
     if (SkipRenderAtVCount215 && gpu.VCount == 215u)
     {
         SkipRenderAtVCount215 = false;
@@ -317,10 +610,8 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
     }
 
     const u64 renderStartNs = PerfNowNs();
-    u64 currentFrameContextWaitNs = 0;
     auto renderPerfScope = MakeScopeExit([&]() {
         RenderCpuWindow.Add(PerfNowNs() - renderStartNs);
-        RenderAcquireWaitCpuWindow.Add(currentFrameContextWaitNs);
         logPerformanceIfNeeded();
     });
 
@@ -331,14 +622,29 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
     const u32 targetWidth = 256u * scale;
     const u32 targetHeight = 192u * scale;
     FrameIdentical = !textureCacheChanged && gpu.GPU3D.RenderFrameIdentical;
+    const bool needsZeroGeometryRefresh =
+        gpu.GPU3D.RenderNumPolygons == 0u && LastSubmittedRenderPolygonCount != 0u;
     const bool canReuseIdenticalFrame = FrameIdentical
         && Initialized
         && ColorImageInitialized
         && HasColorTarget()
         && ColorImageWidth == targetWidth
-        && ColorImageHeight == targetHeight;
+        && ColorImageHeight == targetHeight
+        && !needsZeroGeometryRefresh;
     if (canReuseIdenticalFrame)
         return;
+
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        // Each newly rendered graphics_hw frame must invalidate the previous
+        // exact DS-sized capture cache. Keeping ExactCaptureLineCachePrepared
+        // latched across frames allows PrepareCaptureFrame()/GetLine() to
+        // reuse stale capture lines with pending=0/ready=0, which shows up as
+        // deterministic A/B oscillation in Phantom Hourglass.
+        ExactCaptureLineCachePrepared = false;
+        ExactCaptureLineCacheFresh = false;
+        HasCpuFrame = false;
+    }
 
     if (!ensureInitialized())
     {
@@ -347,19 +653,108 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
     }
 
     const VulkanDeviceProfile& deviceProfile = VulkanContext::Get().GetDeviceProfile();
+    const bool hadCpuFrame = HasCpuFrame;
     const u32 captureCnt = gpu.GPU2D_A.CaptureCnt;
     const bool captureEnabled = (captureCnt & (1u << 31u)) != 0u;
     const u32 captureMode = (captureCnt >> 29u) & 0x3u;
     const u32 captureSizeMode = (captureCnt >> 20u) & 0x3u;
     const bool captureSource3d = (captureCnt & (1u << 24u)) != 0u;
-    const bool preservePreparedCpuCapture = HasCpuFrame && captureEnabled && (captureMode != 1u);
-    const bool captureNeedsCpuReadback = captureEnabled && (captureMode != 1u) && deviceProfile.IsAdreno;
-    // Keep CPU readback on Adreno for diagnostics/snapshot parity, but always
-    // export capture lines from the final Vulkan pass so GetLine() has valid
-    // source-A data when both DS screens depend on 3D capture in one frame.
-    const bool captureNeedsGpuCaptureLine = captureEnabled && (captureMode != 1u);
+    const bool sourceAContributes = captureMode == 0u
+        || ((captureMode >= 2u) && ((captureCnt & 0x1Fu) != 0u));
+    const bool bg0Uses3d = (gpu.GPU2D_A.DispCnt & 0x0108u) == 0x0108u;
+    const bool captureNeedsCpuReadback = false;
+    // software 2D still resolves accelerated 3D through GetLine()/PrepareCaptureFrame().
+    // In graphics_hw, keep the exact same "capture uses source A 3D" gate that
+    // software/OpenGL use for PrepareCaptureFrame(). Exporting a DS-sized 3D
+    // capture on frames that do not actually consume source A leaves stale
+    // intro/previous-scene data available for the next capture-backed screen.
+    const bool captureNeedsGpuCaptureLineBase =
+        captureEnabled
+        && (captureMode != 1u)
+        && (captureSource3d || (bg0Uses3d && sourceAContributes));
+    bool deferGpuCaptureLineExport = false;
+    if (ActiveBackendMode == BackendMode::GraphicsHardware && captureNeedsGpuCaptureLineBase)
+    {
+        const auto captureLineSlotBusy = [&](u32 slot) {
+            return (CaptureLinePending
+                    && PendingCaptureLineContext == nullptr
+                    && PendingCaptureLineBufferSlot == static_cast<int>(slot))
+                || (CaptureLineReady
+                    && ReadyCaptureLineBufferSlot == static_cast<int>(slot));
+        };
 
-    CpuTileBinningEnabled = Threaded && deviceProfile.IsAdreno;
+        u32 desiredSlot = ActiveCaptureLineBufferSlot;
+        if (captureLineSlotBusy(desiredSlot))
+        {
+            const u32 alternateSlot = (desiredSlot + 1u) % CaptureLineBufferSlotCount;
+            if (!captureLineSlotBusy(alternateSlot))
+                desiredSlot = alternateSlot;
+            else
+                deferGpuCaptureLineExport = true;
+        }
+
+        if (!deferGpuCaptureLineExport)
+            selectActiveCaptureLineBufferSlot(desiredSlot);
+    }
+    const bool captureNeedsGpuCaptureLine = captureNeedsGpuCaptureLineBase && !deferGpuCaptureLineExport;
+    struct FrameRasterSelection
+    {
+        RasterExecutionProfile Profile;
+        RasterDispatchPath DispatchPath;
+        bool UseCpuTileBinning;
+    };
+    const auto selectFrameRaster = [&](const VulkanDeviceProfile& profile) -> FrameRasterSelection {
+        if (Threaded && profile.IsAdreno)
+        {
+            return {
+                RasterExecutionProfile::AdrenoCpuDense,
+                RasterDispatchPath::DirectTiles,
+                true,
+            };
+        }
+
+        if (Threaded && profile.IsMaliG52Class)
+        {
+            return {
+                RasterExecutionProfile::MaliCpuDense,
+                RasterDispatchPath::DirectTiles,
+                true,
+            };
+        }
+
+        if (profile.IsArmMali)
+        {
+            return {
+                RasterExecutionProfile::MaliDenseScan,
+                RasterDispatchPath::DirectTiles,
+                false,
+            };
+        }
+
+        if (ActiveTextureSamplingPath == TextureSamplingPath::NonUniform)
+        {
+            return {
+                RasterExecutionProfile::GeneralNonUniform,
+                RasterDispatchPath::DirectTiles,
+                false,
+            };
+        }
+
+        return {
+            RasterExecutionProfile::LegacyFallback,
+            RasterDispatchPath::LegacyWorklist,
+            false,
+        };
+    };
+    const FrameRasterSelection frameRasterSelection = selectFrameRaster(deviceProfile);
+    ActiveRasterExecutionProfile = frameRasterSelection.Profile;
+    ActiveRasterDispatchPath = frameRasterSelection.DispatchPath;
+    CpuTileBinningEnabled = frameRasterSelection.UseCpuTileBinning;
+    if (!captureNeedsGpuCaptureLineBase)
+    {
+        ActiveCapturePathMode = CapturePathMode::Disabled;
+        CapturePathModeCounts[static_cast<size_t>(CapturePathMode::Disabled)]++;
+    }
 
     if (!ensureRenderTarget(targetWidth, targetHeight))
     {
@@ -367,14 +762,15 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
         return;
     }
 
-    if (!ensureResultBuffer(targetWidth, targetHeight))
+    if (ActiveBackendMode != BackendMode::GraphicsHardware && !ensureResultBuffer(targetWidth, targetHeight))
     {
         HasCpuFrame = false;
         return;
     }
 
+    const bool useThreadedRenderContexts = Threaded && ActiveBackendMode != BackendMode::GraphicsHardware;
     RenderContext* renderContext = nullptr;
-    if (Threaded)
+    if (useThreadedRenderContexts)
     {
         renderContext = tryAcquireReadyRenderContext();
         bool renderContextReady = renderContext != nullptr;
@@ -389,9 +785,8 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
             else
             {
                 const u64 contextWaitStartNs = PerfNowNs();
-                renderContext = waitForAnyReadyRenderContext();
-                renderContextReady = renderContext != nullptr;
-                currentFrameContextWaitNs = PerfNowNs() - contextWaitStartNs;
+                renderContext = &acquireNextRenderContext();
+                renderContextReady = renderContext != nullptr && waitForRenderContext(*renderContext);
                 if (InEarlySubmitAttempt)
                     CurrentEarlySubmitContextWaitNs += (PerfNowNs() - contextWaitStartNs);
             }
@@ -412,53 +807,34 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
         return;
     }
 
-    const bool useContextCpuTileBinning = renderContext != nullptr && useCpuTileBinning();
-    if (!useContextCpuTileBinning && !ensureBinMaskBuffer(Triangles.size(), targetWidth, targetHeight))
-    {
-        HasCpuFrame = false;
-        return;
-    }
-
-    if (!useContextCpuTileBinning && !ensureGroupListBuffer(Triangles.size(), targetWidth, targetHeight))
-    {
-        HasCpuFrame = false;
-        return;
-    }
-
-    if (useContextCpuTileBinning && !ensureCpuBinBuffers(*renderContext, Triangles.size(), targetWidth, targetHeight))
-    {
-        HasCpuFrame = false;
-        return;
-    }
-
-    if (useContextCpuTileBinning && !ensureCpuSpanSetupBuffer(*renderContext, Triangles.size()))
-    {
-        HasCpuFrame = false;
-        return;
-    }
-
-    if (!useContextCpuTileBinning && !ensureSpanSetupBuffer(Triangles.size()))
-    {
-        HasCpuFrame = false;
-        return;
-    }
-
-    if (useContextCpuTileBinning && !ensureCpuWorkOffsetBuffer(*renderContext, targetWidth, targetHeight, Triangles.size()))
-    {
-        HasCpuFrame = false;
-        return;
-    }
-
-    if (!useContextCpuTileBinning && !ensureWorkOffsetBuffer(targetWidth, targetHeight, Triangles.size()))
-    {
-        HasCpuFrame = false;
-        return;
-    }
-
     if (!ensureToonBuffer(renderContext))
     {
         HasCpuFrame = false;
         return;
+    }
+
+    if (ActiveBackendMode == BackendMode::GraphicsHardware
+        && !ensureGraphicsVertexBuffer(renderContext, GraphicsVertices.size()))
+    {
+        HasCpuFrame = false;
+        return;
+    }
+
+    if (ActiveBackendMode == BackendMode::GraphicsHardware
+        && (!ensureGraphicsSceneVertexBuffer(GraphicsSceneVertices.size())
+            || !ensureGraphicsEdgeIndexBuffer(SharedGraphicsScene.EdgeIndices.size())))
+    {
+        HasCpuFrame = false;
+        return;
+    }
+
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        if (!ensureGraphicsClearBuffer(renderContext) || !updateGraphicsClearBuffer(renderContext, gpu))
+        {
+            HasCpuFrame = false;
+            return;
+        }
     }
 
     if (!ensureCaptureLineBuffer(renderContext))
@@ -467,7 +843,63 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
         return;
     }
 
-    updateDescriptorSet(renderContext);
+    if (ActiveBackendMode != BackendMode::GraphicsHardware)
+    {
+        if (!ensureResultBuffer(targetWidth, targetHeight))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        const bool useContextCpuTileBinning = renderContext != nullptr && useCpuTileBinning();
+        if (!useContextCpuTileBinning && !ensureBinMaskBuffer(Triangles.size(), targetWidth, targetHeight))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        if (!useContextCpuTileBinning && !ensureGroupListBuffer(Triangles.size(), targetWidth, targetHeight))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        if (useContextCpuTileBinning && !ensureCpuBinBuffers(*renderContext, Triangles.size(), targetWidth, targetHeight))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        if (useContextCpuTileBinning && !ensureCpuSpanSetupBuffer(*renderContext, Triangles.size()))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        if (!useContextCpuTileBinning && !ensureSpanSetupBuffer(Triangles.size()))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        if (useContextCpuTileBinning && !ensureCpuWorkOffsetBuffer(*renderContext, targetWidth, targetHeight, Triangles.size()))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        if (!useContextCpuTileBinning && !ensureWorkOffsetBuffer(targetWidth, targetHeight, Triangles.size()))
+        {
+            HasCpuFrame = false;
+            return;
+        }
+
+        updateDescriptorSet(renderContext);
+    }
+    else
+    {
+        updateGraphicsDescriptorSet(renderContext);
+    }
 
     if (captureEnabled)
     {
@@ -479,6 +911,18 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
     }
 
     const u32 clearColor = Debug3dClearMagenta ? 0xFFFF00FFu : buildClearColorRgba8(gpu);
+    {
+        const u32 r = clearColor & 0xFFu;
+        const u32 g = (clearColor >> 8u) & 0xFFu;
+        const u32 b = (clearColor >> 16u) & 0xFFu;
+        const u32 a = (clearColor >> 24u) & 0xFFu;
+        ExactCaptureFallbackPackedColor =
+            (r >> 2u)
+            | ((g >> 2u) << 8u)
+            | ((b >> 2u) << 16u)
+            | ((a >> 3u) << 24u);
+        ExactCaptureFallbackValid = true;
+    }
     const u32 clearDepth = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFFu) * 0x200u) + 0x1FFu;
     if (!dispatchRasterAndReadback(
             renderContext,
@@ -500,78 +944,168 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
         return;
     }
 
-    if (!captureNeedsCpuReadback)
-        HasCpuFrame = preservePreparedCpuCapture;
+    if (ActiveBackendMode == BackendMode::GraphicsHardware
+        && (captureNeedsGpuCaptureLine || deferGpuCaptureLineExport))
+    {
+        // graphics_hw must let PrepareCaptureFrame() latch the exact DS-sized
+        // export for the current frame. Reusing a previous CPU buffer here is
+        // fine temporarily, but it must be cleared before the exact capture is
+        // consumed so that GPU2D_Soft never mixes old and new lines.
+        HasCpuFrame = hadCpuFrame;
+    }
+    else if (!captureNeedsCpuReadback)
+        HasCpuFrame = false;
 
-    if (!captureNeedsGpuCaptureLine)
+    if (!captureNeedsGpuCaptureLineBase)
     {
         if (!captureNeedsCpuReadback)
-        {
-            CaptureReadbackPending = false;
-            PendingCaptureReadbackContext = nullptr;
-        }
+            clearRawReadbackState();
         resetCaptureLineState();
     }
+
+    LastSubmittedRenderPolygonCount = gpu.GPU3D.RenderNumPolygons;
 }
 
 void VulkanRenderer3D::RestartFrame(GPU& gpu)
+{
+    activeBackend().RestartFrame(gpu);
+}
+
+void VulkanRenderer3D::RestartFrameActiveBackend(GPU& gpu)
 {
     (void)gpu;
 }
 
 u32* VulkanRenderer3D::GetLine(int line)
 {
-    if (CaptureLinePending)
-    {
-        if (!finalizeCaptureLineFrame())
-            resetCaptureLineState();
-    }
-    else if (CaptureLineReady && ReadyCaptureLineData == nullptr)
-    {
-        resetCaptureLineState();
-    }
+    return activeBackend().GetLine(line);
+}
 
-    if (CaptureLineReady && ReadyCaptureLineData != nullptr)
-        HasCpuFrame = copyReadyCaptureLineToLineCache();
-
-    if (!HasCpuFrame && CaptureReadbackPending && finalizeCaptureReadback(true))
-        convertReadbackToLineCache();
-
-    if (!HasCpuFrame)
-    {
-        if (CaptureLineReady && ReadyCaptureLineData != nullptr)
-        {
-            // Latch capture export to a stable CPU buffer. Returning the
-            // persistently mapped GPU buffer directly can flicker when threaded
-            // contexts rotate and overwrite capture lines mid-composition.
-            HasCpuFrame = copyReadyCaptureLineToLineCache();
-        }
-        else if (readbackColorTargetToCpu(true))
-            convertReadbackToLineCache();
-        // Keep the last valid line cache if capture readback is temporarily
-        // unavailable; clearing here causes visible black flashes on capture
-        // driven screens.
-    }
+u32* VulkanRenderer3D::GetLineActiveBackend(int line)
+{
+    const bool exactCaptureOnly = ActiveBackendMode == BackendMode::GraphicsHardware;
+    const bool needsExactCaptureLatch = exactCaptureOnly && !ExactCaptureLineCachePrepared;
 
     if (line < 0)
         line = 0;
     else if (line > 191)
         line = 191;
 
+    // Match OpenGL capture contract: latch the full 256x192 source only on the
+    // first requested line. Some capture scenes do not request 3D on line 0,
+    // so graphics_hw must latch on the first actual GetLine() consumer, not
+    // only when that consumer happens to ask for row 0.
+    if (line == 0 || needsExactCaptureLatch)
+    {
+        bool usedFallbackFill = false;
+        bool usedPreviousValidFill = false;
+        if (CaptureLinePending)
+        {
+            if (!finalizeCaptureLineFrame())
+                resetCaptureLineState();
+        }
+        else if (CaptureLineReady && ReadyCaptureLineData == nullptr)
+        {
+            resetCaptureLineState();
+        }
+
+        if (!HasCpuFrame && CaptureLineReady && ReadyCaptureLineData != nullptr)
+        {
+            HasCpuFrame = copyReadyCaptureLineToLineCache();
+        }
+
+        if (exactCaptureOnly && !ExactCaptureLineCachePrepared)
+        {
+            // graphics_hw should only expose an exact capture produced for this
+            // frame. Preserve a line cache already latched for this frame
+            // (exact export or same-frame fallback), but never expose stale CPU
+            // data carried from an older frame.
+            HasCpuFrame = false;
+        }
+
+        if (!HasCpuFrame && !exactCaptureOnly && CaptureReadbackPending && finalizeCaptureReadback(true))
+            convertReadbackToLineCache();
+
+        if (!HasCpuFrame)
+        {
+            if (CaptureLineReady && ReadyCaptureLineData != nullptr)
+            {
+                // Latch capture export to a stable CPU buffer. Returning the
+                // persistently mapped GPU buffer directly can flicker when threaded
+                // contexts rotate and overwrite capture lines mid-composition.
+                HasCpuFrame = copyReadyCaptureLineToLineCache();
+            }
+            else if (!exactCaptureOnly && readbackColorTargetToCpu(true))
+            {
+                convertReadbackToLineCache();
+            }
+            else
+            {
+                if (exactCaptureOnly && restoreLastValidExactCaptureToLineCache())
+                {
+                    HasCpuFrame = true;
+                    usedPreviousValidFill = true;
+                }
+                else if (exactCaptureOnly && ExactCaptureFallbackValid)
+                {
+                    fillLineCacheWithCaptureFallbackColor();
+                    HasCpuFrame = true;
+                    usedFallbackFill = true;
+                }
+                else
+                {
+                    clearLineCache();
+                }
+            }
+        }
+
+        logCaptureDebugState(
+            "GetLine",
+            exactCaptureOnly,
+            CaptureLinePending,
+            CaptureLineReady,
+            HasCpuFrame,
+            ExactCaptureLineCacheFresh,
+            usedPreviousValidFill,
+            usedFallbackFill,
+            LineCache,
+            CaptureDebugLogsRemaining
+        );
+    }
+
     return &LineCache[static_cast<size_t>(line) * 256u];
 }
 
 void VulkanRenderer3D::SetupAccelFrame()
 {
+    activeBackend().SetupAccelFrame();
+}
+
+void VulkanRenderer3D::SetupAccelFrameActiveBackend()
+{
 }
 
 void VulkanRenderer3D::PrepareCaptureFrame()
 {
+    activeBackend().PrepareCaptureFrame();
+}
+
+void VulkanRenderer3D::BeginCaptureFrame()
+{
+    BeginCaptureFrameActiveBackend();
+}
+
+void VulkanRenderer3D::PrepareCaptureFrameActiveBackend()
+{
     CapturePrepareRequestCount++;
+    const bool exactCaptureOnly = ActiveBackendMode == BackendMode::GraphicsHardware;
+
+    if (exactCaptureOnly && !ExactCaptureLineCachePrepared)
+        HasCpuFrame = false;
 
     if (CaptureLinePending || CaptureLineReady)
     {
-        if (finalizeCaptureLineFrame(false))
+        if (finalizeCaptureLineFrame(exactCaptureOnly))
         {
             HasCpuFrame = copyReadyCaptureLineToLineCache();
             return;
@@ -597,6 +1131,30 @@ void VulkanRenderer3D::PrepareCaptureFrame()
         return;
     }
 
+    if (exactCaptureOnly && HasCpuFrame && ExactCaptureLineCachePrepared)
+        return;
+
+    // graphics_hw must not submit a second late capture export or force a
+    // fallback readback from here. The exact capture line export for this
+    // frame is the only valid source for software 2D composition.
+    if (exactCaptureOnly)
+    {
+        if (restoreLastValidExactCaptureToLineCache())
+        {
+            HasCpuFrame = true;
+        }
+        else if (ExactCaptureFallbackValid)
+        {
+            fillLineCacheWithCaptureFallbackColor();
+            HasCpuFrame = true;
+        }
+        else
+        {
+            clearLineCache();
+        }
+        return;
+    }
+
     if (!readbackColorTargetToCpu(true))
     {
         HasCpuFrame = false;
@@ -606,12 +1164,96 @@ void VulkanRenderer3D::PrepareCaptureFrame()
     convertReadbackToLineCache();
 }
 
+void VulkanRenderer3D::BeginCaptureFrameActiveBackend()
+{
+    if (ActiveBackendMode != BackendMode::GraphicsHardware)
+        return;
+
+    // GPU2D_Soft::VBlankEnd() is the boundary for the next DS-sized capture
+    // consumer. Preserve the most recently latched exact export across that
+    // boundary until a newer export is actually ready; otherwise GetLine() can
+    // see pending=0/ready=0 and hand software 2D an all-black DS source even
+    // though the previous frame already exported the correct capture.
+    //
+    // The cache is still invalidated when a new frame render actually starts,
+    // so this only carries the immediately previous exact export into the next
+    // capture consumer instead of keeping arbitrarily stale data alive.
+    if (!ExactCaptureLineCachePrepared)
+        HasCpuFrame = false;
+    ExactCaptureLineCacheFresh = false;
+
+    if (MelonDSAndroid::areRendererDebugToolsEnabled() && CaptureDebugLogsRemaining > 0u)
+    {
+        Log(
+            LogLevel::Warn,
+            "VulkanCapture[FrameStart]: pending=%u ready=%u hasCpu=%u fresh=%u fallbackValid=%u mode=%s",
+            CaptureLinePending ? 1u : 0u,
+            CaptureLineReady ? 1u : 0u,
+            HasCpuFrame ? 1u : 0u,
+            ExactCaptureLineCacheFresh ? 1u : 0u,
+            ExactCaptureFallbackValid ? 1u : 0u,
+            backendModeName(ActiveBackendMode));
+        CaptureDebugLogsRemaining--;
+    }
+}
+
 void VulkanRenderer3D::Blit(const GPU& gpu)
 {
-    (void)gpu;
+    activeBackend().Blit(gpu);
+}
+
+void VulkanRenderer3D::BlitActiveBackend(const GPU& gpu)
+{
+    if (ActiveBackendMode != BackendMode::GraphicsHardware
+        || !Initialized
+        || !ColorImageInitialized
+        || Device == VK_NULL_HANDLE
+        || Queue == VK_NULL_HANDLE
+        || CommandBuffer == VK_NULL_HANDLE
+        || FrameFence == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    const u32 captureCnt = gpu.GPU2D_A.CaptureCnt;
+    const bool captureEnabled = (captureCnt & (1u << 31u)) != 0u;
+    const u32 captureMode = (captureCnt >> 29u) & 0x3u;
+    const bool captureSource3d = (captureCnt & (1u << 24u)) != 0u;
+    const bool sourceAContributes = captureMode == 0u
+        || ((captureMode >= 2u) && ((captureCnt & 0x1Fu) != 0u));
+    const bool bg0Uses3d = (gpu.GPU2D_A.DispCnt & 0x0108u) == 0x0108u;
+    const bool captureNeedsGpuCaptureLine =
+        captureEnabled
+        && (captureMode != 1u)
+        && (captureSource3d || (bg0Uses3d && sourceAContributes));
+    if (!captureNeedsGpuCaptureLine)
+        return;
+
+    // Match the OpenGL timing contract more closely: prime the DS-sized export
+    // during VBlank, before GPU2D_Soft starts the next frame's capture path.
+    // This avoids relying on a later GetLine() consumer to resurrect the
+    // correct frame after packed buffers have already been composed.
+    //
+    // If the main render submission already left an exact capture export
+    // pending/ready for this frame, keep that state intact. Resetting it here
+    // can discard the same-frame DS-sized source and force software 2D to
+    // consume a stale/empty replacement on the next capture pass.
+    if (CaptureLinePending || CaptureLineReady)
+        return;
+
+    resetCaptureLineState();
+    ExactCaptureLineCachePrepared = false;
+    ExactCaptureLineCacheFresh = false;
+    HasCpuFrame = false;
+    (void)submitGraphicsCaptureExportForCurrentFrame();
 }
 
 void VulkanRenderer3D::Stop(const GPU& gpu)
+{
+    activeBackend().Stop(gpu);
+}
+
+void VulkanRenderer3D::StopActiveBackend(const GPU& gpu)
 {
     (void)gpu;
     Texcache.Reset();
@@ -621,8 +1263,13 @@ void VulkanRenderer3D::Stop(const GPU& gpu)
     SkipRenderAtVCount215 = false;
     InEarlySubmitAttempt = false;
     CurrentEarlySubmitContextWaitNs = 0;
+    LastSubmittedRenderPolygonCount = 0;
+    ExactCaptureFallbackPackedColor = 0;
+    ExactCaptureFallbackValid = false;
     resetCaptureLineState();
     clearLineCache();
+    LastValidExactCaptureLineCache.fill(0);
+    HasLastValidExactCapture = false;
     CaptureLineExportCount = 0;
     EarlySubmitAttemptCount = 0;
     EarlySubmitHitCount = 0;
@@ -634,6 +1281,7 @@ void VulkanRenderer3D::SetRenderSettings(
     bool threaded,
     bool betterPolygons,
     int scale,
+    bool useSimplePipeline,
     bool conservativeCoverageEnabled,
     float conservativeCoveragePx,
     float conservativeCoverageDepthBias,
@@ -647,6 +1295,7 @@ void VulkanRenderer3D::SetRenderSettings(
     const int oldScale = ScaleFactor;
     BetterPolygons = betterPolygons;
     ScaleFactor = std::max(1, scale);
+    UseSimplePipeline = useSimplePipeline;
     CoverageFixEnabled = conservativeCoverageEnabled;
     CoverageFixPx = std::clamp(conservativeCoveragePx, 0.0f, 2.0f);
     CoverageFixDepthBias = std::clamp(conservativeCoverageDepthBias, 0.0f, 0.01f);
@@ -664,21 +1313,25 @@ void VulkanRenderer3D::SetRenderSettings(
             destroyCpuBinBuffers(renderContext);
             destroyCpuWorkOffsetBuffer(renderContext);
             destroyTriangleBuffer(&renderContext);
+            destroyCaptureLineBuffer(&renderContext);
         }
         destroyBinMaskBuffer();
         destroyGroupListBuffer();
         destroySpanSetupBuffer();
         destroyWorkOffsetBuffer();
         destroyToonBuffer(nullptr);
+        destroyGraphicsClearBuffer(nullptr);
         for (RenderContext& renderContext : RenderContexts)
+        {
             destroyToonBuffer(&renderContext);
+            destroyGraphicsClearBuffer(&renderContext);
+        }
         destroyResultBuffer();
         destroyRenderTarget();
         destroyReadbackBuffer();
-        FrameIdentical = false;
-        HasCpuFrame = false;
-        resetCaptureLineState();
-        clearLineCache();
+        destroyCaptureReadbackImage();
+        destroyAllCaptureLineBuffers();
+        InvalidatePresentationState(true);
     }
 }
 
@@ -694,14 +1347,28 @@ void VulkanRenderer3D::SetThreaded(bool threaded, GPU& gpu) noexcept
 
     Threaded = enableThreaded;
     NextRenderContextIndex = 0;
-    LastSubmittedRenderContext = nullptr;
-    CaptureReadbackPending = false;
-    PendingCaptureReadbackContext = nullptr;
-    HasCpuFrame = false;
-    resetCaptureLineState();
-    clearLineCache();
+    InvalidatePresentationState(false);
     if (MelonDSAndroid::areRendererDebugToolsEnabled())
         Log(LogLevel::Warn, "VulkanRenderer3D: threaded rendering %s", Threaded ? "enabled" : "disabled");
+}
+
+void VulkanRenderer3D::SetBackendMode(BackendMode mode) noexcept
+{
+    const bool modeChanged = RequestedBackendMode != mode;
+    RequestedBackendMode = mode;
+    refreshActiveBackendMode();
+    if (modeChanged)
+        InvalidatePresentationState(true);
+    if (MelonDSAndroid::areRendererDebugToolsEnabled())
+    {
+        Log(
+            LogLevel::Warn,
+            "VulkanRuntime[Backend]: backendConfigured=%s backendActive=%s simplePipeline=%d",
+            backendModeName(RequestedBackendMode),
+            backendModeName(ActiveBackendMode),
+            UseSimplePipeline ? 1 : 0
+        );
+    }
 }
 
 bool VulkanRenderer3D::IsThreaded() const noexcept
@@ -722,10 +1389,18 @@ std::vector<u32> VulkanRenderer3D::CaptureColorTargetForDebug()
 
 std::vector<u32> VulkanRenderer3D::CaptureTopDepthForDebug()
 {
-    if (!ensureInitialized() || ResultBuffer == VK_NULL_HANDLE || ColorImageWidth == 0 || ColorImageHeight == 0)
+    if (!ensureInitialized() || ColorImageWidth == 0 || ColorImageHeight == 0)
         return {};
 
-    if (!readbackResultBufferToCpu())
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        std::vector<u32> depthPixels;
+        if (!readbackGraphicsDepthImageToCpu(depthPixels))
+            return {};
+        return depthPixels;
+    }
+
+    if (ResultBuffer == VK_NULL_HANDLE || !readbackResultBufferToCpu())
         return {};
 
     const size_t pixelCount = static_cast<size_t>(ColorImageWidth) * static_cast<size_t>(ColorImageHeight);
@@ -738,10 +1413,18 @@ std::vector<u32> VulkanRenderer3D::CaptureTopDepthForDebug()
 
 std::vector<u32> VulkanRenderer3D::CaptureTopAttrForDebug()
 {
-    if (!ensureInitialized() || ResultBuffer == VK_NULL_HANDLE || ColorImageWidth == 0 || ColorImageHeight == 0)
+    if (!ensureInitialized() || ColorImageWidth == 0 || ColorImageHeight == 0)
         return {};
 
-    if (!readbackResultBufferToCpu())
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        std::vector<u32> attrPixels;
+        if (!readbackGraphicsAttrImageToCpu(attrPixels))
+            return {};
+        return attrPixels;
+    }
+
+    if (ResultBuffer == VK_NULL_HANDLE || !readbackResultBufferToCpu())
         return {};
 
     const size_t pixelCount = static_cast<size_t>(ColorImageWidth) * static_cast<size_t>(ColorImageHeight);
@@ -778,6 +1461,12 @@ bool VulkanRenderer3D::EnsureVulkanReadyForValidation()
         return false;
     if (!ensureTriangleBuffer(nullptr, 1))
         return false;
+    if (!ensureGraphicsVertexBuffer(nullptr, 1))
+        return false;
+    if (!ensureGraphicsSceneVertexBuffer(1))
+        return false;
+    if (!ensureGraphicsEdgeIndexBuffer(1))
+        return false;
     if (!ensureBinMaskBuffer(0, kValidationWidth, kValidationHeight))
         return false;
     if (!ensureGroupListBuffer(0, kValidationWidth, kValidationHeight))
@@ -791,7 +1480,17 @@ bool VulkanRenderer3D::EnsureVulkanReadyForValidation()
     if (!ensureCaptureLineBuffer(nullptr))
         return false;
 
+    const VulkanDeviceProfile& deviceProfile = VulkanContext::Get().GetDeviceProfile();
+    if (ActiveBackendMode == BackendMode::GraphicsHardware && deviceProfile.IsMaliG52Class)
+    {
+        // The synthetic validation draw below is not part of the graphics_hw
+        // runtime path and triggers Mali-G52 driver faults. Real validation
+        // still happens on the first prepared frame once gameplay starts.
+        return true;
+    }
+
     Triangles.clear();
+    GraphicsVertices.clear();
     ActiveTextureDescriptorCount = 0;
     ActiveTextureDescriptors.fill(VkDescriptorImageInfo{});
     updateDescriptorSet(nullptr);
@@ -851,7 +1550,17 @@ bool VulkanRenderer3D::ensureInitialized()
         return false;
     }
 
+    if (!createGraphicsDescriptorObjects())
+    {
+        Log(LogLevel::Warn, "VulkanRenderer3D: graphics descriptor initialization failed, falling back to compute backend");
+    }
+    else if (!createGraphicsPipelines())
+    {
+        Log(LogLevel::Warn, "VulkanRenderer3D: graphics pipeline initialization failed, falling back to compute backend");
+    }
+
     Initialized = true;
+    refreshActiveBackendMode();
     return true;
 }
 
@@ -867,12 +1576,16 @@ void VulkanRenderer3D::destroyVulkan()
     destroyCaptureReadbackImage();
     destroyResultReadbackBuffer();
     destroyTriangleBuffer(nullptr);
+    destroyGraphicsVertexBuffer(nullptr);
+    destroyGraphicsSceneVertexBuffer();
+    destroyGraphicsEdgeIndexBuffer();
     destroyBinMaskBuffer();
     destroyGroupListBuffer();
     destroySpanSetupBuffer();
     destroyWorkOffsetBuffer();
     destroyToonBuffer(nullptr);
-    destroyCaptureLineBuffer(nullptr);
+    destroyGraphicsClearBuffer(nullptr);
+    destroyAllCaptureLineBuffers();
     destroyResultBuffer();
     destroyFallbackTexture();
     destroyRenderTarget();
@@ -931,6 +1644,111 @@ void VulkanRenderer3D::destroyVulkan()
         CaptureLineExportPipeline = VK_NULL_HANDLE;
     }
 
+    if (GraphicsFinalFogPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsFinalFogPipeline, nullptr);
+        GraphicsFinalFogPipeline = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsFinalEdgePipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsFinalEdgePipeline, nullptr);
+        GraphicsFinalEdgePipeline = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsClearPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsClearPipeline, nullptr);
+        GraphicsClearPipeline = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsStencilBitClearPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsStencilBitClearPipeline, nullptr);
+        GraphicsStencilBitClearPipeline = VK_NULL_HANDLE;
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowBlendBgZeroPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowBlendPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsEdgeMarkPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowClearPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowMaskBgZeroPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowMaskPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsTranslucentPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsBgZeroTranslucentPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaquePipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
     savePipelineCache();
     if (ComputePipelineCache != VK_NULL_HANDLE)
     {
@@ -945,19 +1763,52 @@ void VulkanRenderer3D::destroyVulkan()
         PipelineLayout = VK_NULL_HANDLE;
     }
 
+    if (GraphicsPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(Device, GraphicsPipelineLayout, nullptr);
+        GraphicsPipelineLayout = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsAttachmentSampler != VK_NULL_HANDLE)
+    {
+        vkDestroySampler(Device, GraphicsAttachmentSampler, nullptr);
+        GraphicsAttachmentSampler = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsFinalRenderPass != VK_NULL_HANDLE)
+    {
+        vkDestroyRenderPass(Device, GraphicsFinalRenderPass, nullptr);
+        GraphicsFinalRenderPass = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsRasterRenderPass != VK_NULL_HANDLE)
+    {
+        vkDestroyRenderPass(Device, GraphicsRasterRenderPass, nullptr);
+        GraphicsRasterRenderPass = VK_NULL_HANDLE;
+    }
+
     if (DescriptorPool != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorPool(Device, DescriptorPool, nullptr);
         DescriptorPool = VK_NULL_HANDLE;
     }
 
+    if (GraphicsDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(Device, GraphicsDescriptorPool, nullptr);
+        GraphicsDescriptorPool = VK_NULL_HANDLE;
+    }
+
     DescriptorSet = VK_NULL_HANDLE;
     SingleTextureDescriptorSets.fill(VK_NULL_HANDLE);
     invalidateAllDescriptorSetCaches();
+    GraphicsDescriptorSet = VK_NULL_HANDLE;
+    invalidateAllGraphicsDescriptorSetCaches();
     for (RenderContext& renderContext : RenderContexts)
     {
         renderContext.DescriptorSet = VK_NULL_HANDLE;
         renderContext.SingleTextureDescriptorSets.fill(VK_NULL_HANDLE);
+        renderContext.GraphicsDescriptorSet = VK_NULL_HANDLE;
     }
 
     if (DescriptorSetLayout != VK_NULL_HANDLE)
@@ -966,13 +1817,21 @@ void VulkanRenderer3D::destroyVulkan()
         DescriptorSetLayout = VK_NULL_HANDLE;
     }
 
+    if (GraphicsDescriptorSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(Device, GraphicsDescriptorSetLayout, nullptr);
+        GraphicsDescriptorSetLayout = VK_NULL_HANDLE;
+    }
+
     for (RenderContext& renderContext : RenderContexts)
     {
         destroyCpuSpanSetupBuffer(renderContext);
         destroyCpuBinBuffers(renderContext);
         destroyCpuWorkOffsetBuffer(renderContext);
         destroyTriangleBuffer(&renderContext);
+        destroyGraphicsVertexBuffer(&renderContext);
         destroyToonBuffer(&renderContext);
+        destroyGraphicsClearBuffer(&renderContext);
         destroyCaptureLineBuffer(&renderContext);
         if (renderContext.TimestampQueryPool != VK_NULL_HANDLE)
         {
@@ -1028,6 +1887,7 @@ void VulkanRenderer3D::destroyVulkan()
     TimestampQueriesSupported = false;
     Initialized = false;
     ColorImageInitialized = false;
+    GraphicsReady = false;
     ActiveTextureDescriptorCount = 0;
     ActiveTextureDescriptors.fill(VkDescriptorImageInfo{});
     ActiveTextureSamplingPath = TextureSamplingPath::CompatDynamicUniform;
@@ -1180,55 +2040,6 @@ bool VulkanRenderer3D::tryAcquireRenderContext(RenderContext& context, bool coun
     return false;
 }
 
-VulkanRenderer3D::RenderContext* VulkanRenderer3D::waitForAnyReadyRenderContext() noexcept
-{
-    if (!Threaded || Device == VK_NULL_HANDLE)
-        return nullptr;
-
-    constexpr size_t activeContextCount = AsyncRenderContextCount;
-    std::array<VkFence, AsyncRenderContextCount> fences{};
-    for (size_t i = 0; i < activeContextCount; i++)
-    {
-        RenderContext& context = RenderContexts[i];
-        if (context.FrameFence == VK_NULL_HANDLE)
-            return nullptr;
-        fences[i] = context.FrameFence;
-    }
-
-    ContextMissCount++;
-    const u64 waitStartNs = PerfNowNs();
-    const VkResult waitResult = vkWaitForFences(
-        Device,
-        static_cast<u32>(activeContextCount),
-        fences.data(),
-        VK_FALSE,
-        UINT64_MAX
-    );
-    if (waitResult != VK_SUCCESS)
-    {
-        Log(LogLevel::Error, "VulkanRenderer3D: any-context fence wait failed (%d)", static_cast<int>(waitResult));
-        return nullptr;
-    }
-
-    const u64 waitDurationNs = PerfNowNs() - waitStartNs;
-    FenceWaitCpuWindow.Add(waitDurationNs);
-    if (waitDurationNs >= 1000000ull)
-        LateFrameCount++;
-
-    for (size_t i = 0; i < activeContextCount; i++)
-    {
-        const size_t contextIndex = (NextRenderContextIndex + i) % activeContextCount;
-        RenderContext& context = RenderContexts[contextIndex];
-        if (!tryAcquireRenderContext(context, false))
-            continue;
-
-        NextRenderContextIndex = (contextIndex + 1) % activeContextCount;
-        return &context;
-    }
-
-    return nullptr;
-}
-
 VulkanRenderer3D::RenderContext* VulkanRenderer3D::tryAcquireReadyRenderContext() noexcept
 {
     if (!Threaded || Device == VK_NULL_HANDLE)
@@ -1261,8 +2072,46 @@ bool VulkanRenderer3D::waitForAllRenderContexts()
 
 bool VulkanRenderer3D::waitForReadbackSource()
 {
-    if (!Threaded)
+    if (Device == VK_NULL_HANDLE)
+        return false;
+
+    const bool usePrimaryFrameFence =
+        !Threaded
+        || ActiveBackendMode == BackendMode::GraphicsHardware
+        || LastSubmittedRenderContext == nullptr;
+    if (usePrimaryFrameFence)
+    {
+        if (FrameFence == VK_NULL_HANDLE)
+            return false;
+
+        const VkResult fenceStatus = vkGetFenceStatus(Device, FrameFence);
+        if (fenceStatus == VK_SUCCESS)
+        {
+            FenceWaitCpuWindow.Add(0);
+            consumeGpuTiming(nullptr);
+            return true;
+        }
+        if (fenceStatus != VK_NOT_READY)
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: frame fence status failed (%d)", static_cast<int>(fenceStatus));
+            return false;
+        }
+
+        const u64 waitStartNs = PerfNowNs();
+        const VkResult waitResult = vkWaitForFences(Device, 1, &FrameFence, VK_TRUE, UINT64_MAX);
+        if (waitResult != VK_SUCCESS)
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: frame fence wait failed (%d)", static_cast<int>(waitResult));
+            return false;
+        }
+
+        const u64 waitDurationNs = PerfNowNs() - waitStartNs;
+        FenceWaitCpuWindow.Add(waitDurationNs);
+        if (waitDurationNs >= 1000000ull)
+            LateFrameCount++;
+        consumeGpuTiming(nullptr);
         return true;
+    }
 
     // Render and presentation share one queue. Waiting for the newest submitted
     // render context fence guarantees all older submissions are finished too.
@@ -1277,16 +2126,11 @@ bool VulkanRenderer3D::finalizeCaptureReadback(bool blocking)
     if (!CaptureReadbackPending)
         return HasCpuFrame;
 
-    u64 captureReadbackWaitNs = 0;
     bool waitOk = false;
     if (PendingCaptureReadbackContext != nullptr)
     {
         if (blocking)
-        {
-            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForRenderContext(*PendingCaptureReadbackContext);
-            captureReadbackWaitNs = PerfNowNs() - waitStartNs;
-        }
         else if (Device != VK_NULL_HANDLE && PendingCaptureReadbackContext->FrameFence != VK_NULL_HANDLE)
         {
             const VkResult fenceStatus = vkGetFenceStatus(Device, PendingCaptureReadbackContext->FrameFence);
@@ -1317,22 +2161,34 @@ bool VulkanRenderer3D::finalizeCaptureReadback(bool blocking)
     else
     {
         if (blocking)
-        {
-            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForReadbackSource();
-            captureReadbackWaitNs = PerfNowNs() - waitStartNs;
+        else if (Device != VK_NULL_HANDLE && FrameFence != VK_NULL_HANDLE)
+        {
+            const VkResult fenceStatus = vkGetFenceStatus(Device, FrameFence);
+            if (fenceStatus == VK_SUCCESS)
+            {
+                FenceWaitCpuWindow.Add(0);
+                consumeGpuTiming(nullptr);
+                waitOk = true;
+            }
+            else if (fenceStatus == VK_NOT_READY)
+            {
+                return false;
+            }
+            else
+            {
+                CaptureReadbackPending = false;
+                PendingCaptureReadbackContext = nullptr;
+                return false;
+            }
         }
         else
             return false;
     }
 
-    if (blocking)
-        CaptureReadbackWaitCpuWindow.Add(captureReadbackWaitNs);
-
     if (!waitOk || ReadbackMapped == nullptr || RawReadbackWidth == 0 || RawReadbackHeight == 0)
     {
-        CaptureReadbackPending = false;
-        PendingCaptureReadbackContext = nullptr;
+        clearRawReadbackState();
         return false;
     }
 
@@ -1348,12 +2204,51 @@ bool VulkanRenderer3D::finalizeCaptureReadback(bool blocking)
     return true;
 }
 
+void VulkanRenderer3D::syncActiveCaptureLineBufferSlot()
+{
+    CaptureLineBuffer = CaptureLineBuffers[ActiveCaptureLineBufferSlot];
+    CaptureLineMemory = CaptureLineMemories[ActiveCaptureLineBufferSlot];
+    CaptureLineBufferSize = CaptureLineBufferSizes[ActiveCaptureLineBufferSlot];
+    CaptureLineMapped = CaptureLineMappedSlots[ActiveCaptureLineBufferSlot];
+}
+
+void VulkanRenderer3D::storeActiveCaptureLineBufferSlot()
+{
+    CaptureLineBuffers[ActiveCaptureLineBufferSlot] = CaptureLineBuffer;
+    CaptureLineMemories[ActiveCaptureLineBufferSlot] = CaptureLineMemory;
+    CaptureLineBufferSizes[ActiveCaptureLineBufferSlot] = CaptureLineBufferSize;
+    CaptureLineMappedSlots[ActiveCaptureLineBufferSlot] = CaptureLineMapped;
+}
+
+void VulkanRenderer3D::selectActiveCaptureLineBufferSlot(u32 slot)
+{
+    slot %= CaptureLineBufferSlotCount;
+    if (ActiveCaptureLineBufferSlot == slot)
+        return;
+
+    storeActiveCaptureLineBufferSlot();
+    ActiveCaptureLineBufferSlot = slot;
+    syncActiveCaptureLineBufferSlot();
+}
+
 void VulkanRenderer3D::resetCaptureLineState()
 {
     CaptureLinePending = false;
     CaptureLineReady = false;
+    CaptureLineDataIsRgba8 = false;
     PendingCaptureLineContext = nullptr;
     ReadyCaptureLineData = nullptr;
+    PendingCaptureLineBufferSlot = -1;
+    ReadyCaptureLineBufferSlot = -1;
+}
+
+void VulkanRenderer3D::clearRawReadbackState()
+{
+    CaptureReadbackPending = false;
+    PendingCaptureReadbackContext = nullptr;
+    RawReadbackWidth = 0;
+    RawReadbackHeight = 0;
+    RawReadbackRgba.clear();
 }
 
 bool VulkanRenderer3D::finalizeCaptureLineFrame(bool blocking)
@@ -1361,16 +2256,11 @@ bool VulkanRenderer3D::finalizeCaptureLineFrame(bool blocking)
     if (!CaptureLinePending)
         return CaptureLineReady;
 
-    u64 captureLineWaitNs = 0;
     bool waitOk = false;
     if (PendingCaptureLineContext != nullptr)
     {
         if (blocking)
-        {
-            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForRenderContext(*PendingCaptureLineContext);
-            captureLineWaitNs = PerfNowNs() - waitStartNs;
-        }
         else if (Device != VK_NULL_HANDLE && PendingCaptureLineContext->FrameFence != VK_NULL_HANDLE)
         {
             const VkResult fenceStatus = vkGetFenceStatus(Device, PendingCaptureLineContext->FrameFence);
@@ -1399,17 +2289,29 @@ bool VulkanRenderer3D::finalizeCaptureLineFrame(bool blocking)
     else
     {
         if (blocking)
-        {
-            const u64 waitStartNs = PerfNowNs();
             waitOk = waitForReadbackSource();
-            captureLineWaitNs = PerfNowNs() - waitStartNs;
+        else if (Device != VK_NULL_HANDLE && FrameFence != VK_NULL_HANDLE)
+        {
+            const VkResult fenceStatus = vkGetFenceStatus(Device, FrameFence);
+            if (fenceStatus == VK_SUCCESS)
+            {
+                FenceWaitCpuWindow.Add(0);
+                consumeGpuTiming(nullptr);
+                waitOk = true;
+            }
+            else if (fenceStatus == VK_NOT_READY)
+            {
+                return false;
+            }
+            else
+            {
+                resetCaptureLineState();
+                return false;
+            }
         }
         else
             return false;
     }
-
-    if (blocking)
-        CaptureLineWaitCpuWindow.Add(captureLineWaitNs);
 
     if (!waitOk)
     {
@@ -1418,12 +2320,25 @@ bool VulkanRenderer3D::finalizeCaptureLineFrame(bool blocking)
     }
 
     if (PendingCaptureLineContext != nullptr)
+    {
         ReadyCaptureLineData = reinterpret_cast<const u32*>(PendingCaptureLineContext->CaptureLineMapped);
+        ReadyCaptureLineBufferSlot = -1;
+    }
+    else if (PendingCaptureLineBufferSlot >= 0)
+    {
+        ReadyCaptureLineData = reinterpret_cast<const u32*>(
+            CaptureLineMappedSlots[static_cast<size_t>(PendingCaptureLineBufferSlot)]);
+        ReadyCaptureLineBufferSlot = PendingCaptureLineBufferSlot;
+    }
     else
+    {
         ReadyCaptureLineData = reinterpret_cast<const u32*>(CaptureLineMapped);
+        ReadyCaptureLineBufferSlot = static_cast<int>(ActiveCaptureLineBufferSlot);
+    }
 
     CaptureLinePending = false;
     PendingCaptureLineContext = nullptr;
+    PendingCaptureLineBufferSlot = -1;
     CaptureLineReady = ReadyCaptureLineData != nullptr;
     return CaptureLineReady;
 }
@@ -1514,9 +2429,6 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
         return;
 
     const PerfSampleWindow<120>::Summary renderSummary = RenderCpuWindow.SummarizeAndReset();
-    const PerfSampleWindow<120>::Summary renderAcquireWaitSummary = RenderAcquireWaitCpuWindow.SummarizeAndReset();
-    const PerfSampleWindow<120>::Summary captureLineWaitSummary = CaptureLineWaitCpuWindow.SummarizeAndReset();
-    const PerfSampleWindow<120>::Summary captureReadbackWaitSummary = CaptureReadbackWaitCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary waitSummary = FenceWaitCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary gpuSummary = GpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary triangleSummary = TriangleCountWindow.SummarizeAndReset();
@@ -1526,6 +2438,9 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
     const PerfSampleWindow<120>::Summary workOffsetsCpuSummary = WorkOffsetsCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary sortCpuSummary = SortCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary rasterCpuSummary = RasterCpuWindow.SummarizeAndReset();
+    const PerfSampleWindow<120>::Summary graphicsSceneBuildCpuSummary = GraphicsSceneBuildCpuWindow.SummarizeAndReset();
+    const PerfSampleWindow<120>::Summary graphicsMainCpuSummary = GraphicsMainCpuWindow.SummarizeAndReset();
+    const PerfSampleWindow<120>::Summary graphicsAlphaCpuSummary = GraphicsAlphaCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary depthBlendCpuSummary = DepthBlendCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary finalCpuSummary = FinalCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary captureLineExportCpuSummary = CaptureLineExportCpuWindow.SummarizeAndReset();
@@ -1543,109 +2458,215 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
     const PerfSampleWindow<120>::Summary captureLineExportGpuSummary = CaptureLineExportGpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary earlySubmitCpuSummary = EarlySubmitCpuWindow.SummarizeAndReset();
     const PerfSampleWindow<120>::Summary earlySubmitWaitSummary = EarlySubmitContextWaitCpuWindow.SummarizeAndReset();
-    const u64 otherWaitMeanNs = waitSummary.MeanNs > renderAcquireWaitSummary.MeanNs
-        ? waitSummary.MeanNs - renderAcquireWaitSummary.MeanNs
-        : 0;
     const double cpuTileCoveragePercent = cpuTileCountSummary.MeanNs > 0
         ? (static_cast<double>(cpuActiveTileSummary.MeanNs) * 100.0 / static_cast<double>(cpuTileCountSummary.MeanNs))
         : 0.0;
-
-    Log(
-        LogLevel::Warn,
-        "VulkanPerf[GPU3D]: path=%s scale=%d render cpu avg=%.3fms p95=%.3fms max=%.3fms wait avg=%.3fms p95=%.3fms max=%.3fms gpu avg=%.3fms p95=%.3fms max=%.3fms triangles avg=%llu passes avg=%llu p95=%llu cpuTiles avg=%llu/%llu (%.1f%%) cpuGroups avg=%llu activeDispatch=%llu%% contextMisses=%llu late=%llu dropped=%llu readbackColor=%llu readbackResult=%llu capturePrepare=%llu captureEnabled=%llu captureSrc3d=%llu capMode=%llu/%llu/%llu/%llu capSize=%llu/%llu/%llu/%llu capExport=%llu capExportCpu avg=%.3fms p95=%.3fms capExportGpu avg=%.3fms p95=%.3fms rasterSpec tex=%llu alpha=%llu shade=%llu all=%llu earlySubmit hit=%llu/%llu miss=%llu skip215=%llu cpu avg=%.3fms p95=%.3fms wait avg=%.3fms p95=%.3fms",
-        CpuDirectTilesPathCount > 0 && DirectTilesPathCount == 0 && LegacyWorklistPathCount == 0
+    const auto pickDominantEnumIndex = [](const auto& counts, size_t fallbackIndex) -> size_t {
+        size_t dominantIndex = fallbackIndex;
+        u64 dominantCount = 0;
+        for (size_t i = 0; i < counts.size(); i++)
+        {
+            if (counts[i] >= dominantCount)
+            {
+                dominantCount = counts[i];
+                dominantIndex = i;
+            }
+        }
+        return dominantIndex;
+    };
+    const RasterExecutionProfile dominantRasterProfile = static_cast<RasterExecutionProfile>(pickDominantEnumIndex(
+        RasterExecutionProfileCounts,
+        static_cast<size_t>(ActiveRasterExecutionProfile)
+    ));
+    const RasterTileLoopMode dominantTileLoopMode = static_cast<RasterTileLoopMode>(pickDominantEnumIndex(
+        RasterTileLoopModeCounts,
+        static_cast<size_t>(ActiveRasterTileLoopMode)
+    ));
+    const CapturePathMode dominantCapturePathMode = static_cast<CapturePathMode>(pickDominantEnumIndex(
+        CapturePathModeCounts,
+        static_cast<size_t>(ActiveCapturePathMode)
+    ));
+    const char* activePathName = ActiveBackendMode == BackendMode::GraphicsHardware
+        ? "simple_graphics"
+        : (CpuDirectTilesPathCount > 0 && DirectTilesPathCount == 0 && LegacyWorklistPathCount == 0
             ? "cpu_direct_tiles"
-            : (LegacyWorklistPathCount > 0 && DirectTilesPathCount == 0 ? "legacy" : "direct_tiles"),
-        std::max(1, ScaleFactor),
-        PerfNsToMs(renderSummary.MeanNs),
-        PerfNsToMs(renderSummary.P95Ns),
-        PerfNsToMs(renderSummary.MaxNs),
-        PerfNsToMs(waitSummary.MeanNs),
-        PerfNsToMs(waitSummary.P95Ns),
-        PerfNsToMs(waitSummary.MaxNs),
-        PerfNsToMs(gpuSummary.MeanNs),
-        PerfNsToMs(gpuSummary.P95Ns),
-        PerfNsToMs(gpuSummary.MaxNs),
-        static_cast<unsigned long long>(triangleSummary.MeanNs),
-        static_cast<unsigned long long>(passSummary.MeanNs),
-        static_cast<unsigned long long>(passSummary.P95Ns),
-        static_cast<unsigned long long>(cpuActiveTileSummary.MeanNs),
-        static_cast<unsigned long long>(cpuTileCountSummary.MeanNs),
-        cpuTileCoveragePercent,
-        static_cast<unsigned long long>(cpuActiveGroupSummary.MeanNs),
-        static_cast<unsigned long long>(cpuActiveDispatchSummary.MeanNs),
-        static_cast<unsigned long long>(ContextMissCount),
-        static_cast<unsigned long long>(LateFrameCount),
-        static_cast<unsigned long long>(DroppedFrameCount),
-        static_cast<unsigned long long>(ReadbackColorRequestCount),
-        static_cast<unsigned long long>(ReadbackResultRequestCount),
-        static_cast<unsigned long long>(CapturePrepareRequestCount),
-        static_cast<unsigned long long>(CaptureEnabledCount),
-        static_cast<unsigned long long>(CaptureSource3dCount),
-        static_cast<unsigned long long>(CaptureModeCounts[0]),
-        static_cast<unsigned long long>(CaptureModeCounts[1]),
-        static_cast<unsigned long long>(CaptureModeCounts[2]),
-        static_cast<unsigned long long>(CaptureModeCounts[3]),
-        static_cast<unsigned long long>(CaptureSizeModeCounts[0]),
-        static_cast<unsigned long long>(CaptureSizeModeCounts[1]),
-        static_cast<unsigned long long>(CaptureSizeModeCounts[2]),
-        static_cast<unsigned long long>(CaptureSizeModeCounts[3]),
-        static_cast<unsigned long long>(CaptureLineExportCount),
-        PerfNsToMs(captureLineExportCpuSummary.MeanNs),
-        PerfNsToMs(captureLineExportCpuSummary.P95Ns),
-        PerfNsToMs(captureLineExportGpuSummary.MeanNs),
-        PerfNsToMs(captureLineExportGpuSummary.P95Ns),
-        static_cast<unsigned long long>(RasterSpecializedTextureModeCount),
-        static_cast<unsigned long long>(RasterSpecializedTranslucencyModeCount),
-        static_cast<unsigned long long>(RasterSpecializedShadeModeCount),
-        static_cast<unsigned long long>(RasterSpecializedAllModesCount),
-        static_cast<unsigned long long>(EarlySubmitHitCount),
-        static_cast<unsigned long long>(EarlySubmitAttemptCount),
-        static_cast<unsigned long long>(EarlySubmitMissCount),
-        static_cast<unsigned long long>(EarlySubmitSkipVCount215Count),
-        PerfNsToMs(earlySubmitCpuSummary.MeanNs),
-        PerfNsToMs(earlySubmitCpuSummary.P95Ns),
-        PerfNsToMs(earlySubmitWaitSummary.MeanNs),
-        PerfNsToMs(earlySubmitWaitSummary.P95Ns)
-    );
-    Log(
-        LogLevel::Warn,
-        "VulkanPerf[GPU3DPasses]: interp cpu avg=%.3fms gpu avg=%.3fms bin cpu avg=%.3fms gpu avg=%.3fms work cpu avg=%.3fms gpu avg=%.3fms sort cpu avg=%.3fms gpu avg=%.3fms raster cpu avg=%.3fms gpu avg=%.3fms resolve cpu avg=%.3fms gpu avg=%.3fms final cpu avg=%.3fms gpu avg=%.3fms captureExport cpu avg=%.3fms gpu avg=%.3fms",
-        PerfNsToMs(interpCpuSummary.MeanNs),
-        PerfNsToMs(interpGpuSummary.MeanNs),
-        PerfNsToMs(binCpuSummary.MeanNs),
-        PerfNsToMs(binGpuSummary.MeanNs),
-        PerfNsToMs(workOffsetsCpuSummary.MeanNs),
-        PerfNsToMs(workOffsetsGpuSummary.MeanNs),
-        PerfNsToMs(sortCpuSummary.MeanNs),
-        PerfNsToMs(sortGpuSummary.MeanNs),
-        PerfNsToMs(rasterCpuSummary.MeanNs),
-        PerfNsToMs(rasterGpuSummary.MeanNs),
-        PerfNsToMs(depthBlendCpuSummary.MeanNs),
-        PerfNsToMs(depthBlendGpuSummary.MeanNs),
-        PerfNsToMs(finalCpuSummary.MeanNs),
-        PerfNsToMs(finalGpuSummary.MeanNs),
-        PerfNsToMs(captureLineExportCpuSummary.MeanNs),
-        PerfNsToMs(captureLineExportGpuSummary.MeanNs)
-    );
-    Log(
-        LogLevel::Warn,
-        "VulkanPerf[GPU3DWaits]: renderAcquire avg=%.3fms p95=%.3fms max=%.3fms captureLine avg=%.3fms p95=%.3fms max=%.3fms captureReadback avg=%.3fms p95=%.3fms max=%.3fms fenceTotal avg=%.3fms p95=%.3fms max=%.3fms otherMean=%.3fms",
-        PerfNsToMs(renderAcquireWaitSummary.MeanNs),
-        PerfNsToMs(renderAcquireWaitSummary.P95Ns),
-        PerfNsToMs(renderAcquireWaitSummary.MaxNs),
-        PerfNsToMs(captureLineWaitSummary.MeanNs),
-        PerfNsToMs(captureLineWaitSummary.P95Ns),
-        PerfNsToMs(captureLineWaitSummary.MaxNs),
-        PerfNsToMs(captureReadbackWaitSummary.MeanNs),
-        PerfNsToMs(captureReadbackWaitSummary.P95Ns),
-        PerfNsToMs(captureReadbackWaitSummary.MaxNs),
-        PerfNsToMs(waitSummary.MeanNs),
-        PerfNsToMs(waitSummary.P95Ns),
-        PerfNsToMs(waitSummary.MaxNs),
-        PerfNsToMs(otherWaitMeanNs)
-    );
+            : (LegacyWorklistPathCount > 0 && DirectTilesPathCount == 0 ? "legacy" : "direct_tiles"));
 
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        Log(
+            LogLevel::Warn,
+            "VulkanPerf[GPU3D]: backendConfigured=%s backendActive=%s path=%s descriptorPath=%s captureSource=%s scale=%d render cpu avg=%.3fms p95=%.3fms max=%.3fms wait avg=%.3fms p95=%.3fms max=%.3fms gpu avg=%.3fms p95=%.3fms max=%.3fms triangles avg=%llu passes avg=%llu p95=%llu opaqueDraws=%u needOpaqueDraws=%u alphaShadowDraws=%u contextMisses=%llu late=%llu dropped=%llu readbackColor=%llu readbackResult=%llu capturePrepare=%llu captureEnabled=%llu captureSrc3d=%llu capMode=%llu/%llu/%llu/%llu capSize=%llu/%llu/%llu/%llu capExport=%llu capExportCpu avg=%.3fms p95=%.3fms capExportGpu avg=%.3fms p95=%.3fms earlySubmit hit=%llu/%llu miss=%llu skip215=%llu cpu avg=%.3fms p95=%.3fms wait avg=%.3fms p95=%.3fms",
+            backendModeName(RequestedBackendMode),
+            backendModeName(ActiveBackendMode),
+            activePathName,
+            textureSamplingPathName(ActiveTextureSamplingPath),
+            capturePathModeName(dominantCapturePathMode),
+            std::max(1, ScaleFactor),
+            PerfNsToMs(renderSummary.MeanNs),
+            PerfNsToMs(renderSummary.P95Ns),
+            PerfNsToMs(renderSummary.MaxNs),
+            PerfNsToMs(waitSummary.MeanNs),
+            PerfNsToMs(waitSummary.P95Ns),
+            PerfNsToMs(waitSummary.MaxNs),
+            PerfNsToMs(gpuSummary.MeanNs),
+            PerfNsToMs(gpuSummary.P95Ns),
+            PerfNsToMs(gpuSummary.MaxNs),
+            static_cast<unsigned long long>(triangleSummary.MeanNs),
+            static_cast<unsigned long long>(passSummary.MeanNs),
+            static_cast<unsigned long long>(passSummary.P95Ns),
+            LastGraphicsOpaqueDrawCount,
+            LastGraphicsNeedOpaqueDrawCount,
+            LastGraphicsAlphaDrawCount,
+            static_cast<unsigned long long>(ContextMissCount),
+            static_cast<unsigned long long>(LateFrameCount),
+            static_cast<unsigned long long>(DroppedFrameCount),
+            static_cast<unsigned long long>(ReadbackColorRequestCount),
+            static_cast<unsigned long long>(ReadbackResultRequestCount),
+            static_cast<unsigned long long>(CapturePrepareRequestCount),
+            static_cast<unsigned long long>(CaptureEnabledCount),
+            static_cast<unsigned long long>(CaptureSource3dCount),
+            static_cast<unsigned long long>(CaptureModeCounts[0]),
+            static_cast<unsigned long long>(CaptureModeCounts[1]),
+            static_cast<unsigned long long>(CaptureModeCounts[2]),
+            static_cast<unsigned long long>(CaptureModeCounts[3]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[0]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[1]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[2]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[3]),
+            static_cast<unsigned long long>(CaptureLineExportCount),
+            PerfNsToMs(captureLineExportCpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportCpuSummary.P95Ns),
+            PerfNsToMs(captureLineExportGpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportGpuSummary.P95Ns),
+            static_cast<unsigned long long>(EarlySubmitHitCount),
+            static_cast<unsigned long long>(EarlySubmitAttemptCount),
+            static_cast<unsigned long long>(EarlySubmitMissCount),
+            static_cast<unsigned long long>(EarlySubmitSkipVCount215Count),
+            PerfNsToMs(earlySubmitCpuSummary.MeanNs),
+            PerfNsToMs(earlySubmitCpuSummary.P95Ns),
+            PerfNsToMs(earlySubmitWaitSummary.MeanNs),
+            PerfNsToMs(earlySubmitWaitSummary.P95Ns)
+        );
+        Log(
+            LogLevel::Warn,
+            "VulkanPerf[GPU3DPasses]: sceneBuild cpu avg=%.3fms p95=%.3fms opaque cpu avg=%.3fms p95=%.3fms alphaShadow cpu avg=%.3fms p95=%.3fms raster gpu avg=%.3fms p95=%.3fms final cpu avg=%.3fms p95=%.3fms final gpu avg=%.3fms p95=%.3fms captureExport cpu avg=%.3fms p95=%.3fms captureExport gpu avg=%.3fms p95=%.3fms opaqueDraws=%u needOpaqueDraws=%u alphaShadowDraws=%u triangles=%zu pipelines=%u",
+            PerfNsToMs(graphicsSceneBuildCpuSummary.MeanNs),
+            PerfNsToMs(graphicsSceneBuildCpuSummary.P95Ns),
+            PerfNsToMs(graphicsMainCpuSummary.MeanNs),
+            PerfNsToMs(graphicsMainCpuSummary.P95Ns),
+            PerfNsToMs(graphicsAlphaCpuSummary.MeanNs),
+            PerfNsToMs(graphicsAlphaCpuSummary.P95Ns),
+            PerfNsToMs(rasterGpuSummary.MeanNs),
+            PerfNsToMs(rasterGpuSummary.P95Ns),
+            PerfNsToMs(finalCpuSummary.MeanNs),
+            PerfNsToMs(finalCpuSummary.P95Ns),
+            PerfNsToMs(finalGpuSummary.MeanNs),
+            PerfNsToMs(finalGpuSummary.P95Ns),
+            PerfNsToMs(captureLineExportCpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportCpuSummary.P95Ns),
+            PerfNsToMs(captureLineExportGpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportGpuSummary.P95Ns),
+            LastGraphicsOpaqueDrawCount,
+            LastGraphicsNeedOpaqueDrawCount,
+            LastGraphicsAlphaDrawCount,
+            Triangles.size(),
+            static_cast<u32>(
+                GraphicsOpaquePipelineCount
+                + GraphicsTranslucentPipelineCount
+                + GraphicsBgZeroTranslucentPipelineCount
+                + GraphicsShadowMaskPipelineCount
+                + GraphicsShadowMaskBgZeroPipelineCount
+                + GraphicsShadowClearPipelineCount
+                + GraphicsShadowBlendBgZeroPipelineCount
+                + GraphicsShadowBlendPipelineCount)
+        );
+    }
+    else
+    {
+        Log(
+            LogLevel::Warn,
+            "VulkanPerf[GPU3D]: backendConfigured=%s backendActive=%s path=%s rasterProfile=%s descriptorPath=%s tileLoopMode=%s captureSource=%s scale=%d render cpu avg=%.3fms p95=%.3fms max=%.3fms wait avg=%.3fms p95=%.3fms max=%.3fms gpu avg=%.3fms p95=%.3fms max=%.3fms triangles avg=%llu passes avg=%llu p95=%llu cpuTiles avg=%llu/%llu (%.1f%%) cpuGroups avg=%llu activeDispatch=%llu%% contextMisses=%llu late=%llu dropped=%llu readbackColor=%llu readbackResult=%llu capturePrepare=%llu captureEnabled=%llu captureSrc3d=%llu capMode=%llu/%llu/%llu/%llu capSize=%llu/%llu/%llu/%llu capExport=%llu capExportCpu avg=%.3fms p95=%.3fms capExportGpu avg=%.3fms p95=%.3fms rasterSpec tex=%llu alpha=%llu shade=%llu all=%llu earlySubmit hit=%llu/%llu miss=%llu skip215=%llu cpu avg=%.3fms p95=%.3fms wait avg=%.3fms p95=%.3fms",
+            backendModeName(RequestedBackendMode),
+            backendModeName(ActiveBackendMode),
+            activePathName,
+            rasterExecutionProfileName(dominantRasterProfile),
+            textureSamplingPathName(ActiveTextureSamplingPath),
+            rasterTileLoopModeName(dominantTileLoopMode),
+            capturePathModeName(dominantCapturePathMode),
+            std::max(1, ScaleFactor),
+            PerfNsToMs(renderSummary.MeanNs),
+            PerfNsToMs(renderSummary.P95Ns),
+            PerfNsToMs(renderSummary.MaxNs),
+            PerfNsToMs(waitSummary.MeanNs),
+            PerfNsToMs(waitSummary.P95Ns),
+            PerfNsToMs(waitSummary.MaxNs),
+            PerfNsToMs(gpuSummary.MeanNs),
+            PerfNsToMs(gpuSummary.P95Ns),
+            PerfNsToMs(gpuSummary.MaxNs),
+            static_cast<unsigned long long>(triangleSummary.MeanNs),
+            static_cast<unsigned long long>(passSummary.MeanNs),
+            static_cast<unsigned long long>(passSummary.P95Ns),
+            static_cast<unsigned long long>(cpuActiveTileSummary.MeanNs),
+            static_cast<unsigned long long>(cpuTileCountSummary.MeanNs),
+            cpuTileCoveragePercent,
+            static_cast<unsigned long long>(cpuActiveGroupSummary.MeanNs),
+            static_cast<unsigned long long>(cpuActiveDispatchSummary.MeanNs),
+            static_cast<unsigned long long>(ContextMissCount),
+            static_cast<unsigned long long>(LateFrameCount),
+            static_cast<unsigned long long>(DroppedFrameCount),
+            static_cast<unsigned long long>(ReadbackColorRequestCount),
+            static_cast<unsigned long long>(ReadbackResultRequestCount),
+            static_cast<unsigned long long>(CapturePrepareRequestCount),
+            static_cast<unsigned long long>(CaptureEnabledCount),
+            static_cast<unsigned long long>(CaptureSource3dCount),
+            static_cast<unsigned long long>(CaptureModeCounts[0]),
+            static_cast<unsigned long long>(CaptureModeCounts[1]),
+            static_cast<unsigned long long>(CaptureModeCounts[2]),
+            static_cast<unsigned long long>(CaptureModeCounts[3]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[0]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[1]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[2]),
+            static_cast<unsigned long long>(CaptureSizeModeCounts[3]),
+            static_cast<unsigned long long>(CaptureLineExportCount),
+            PerfNsToMs(captureLineExportCpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportCpuSummary.P95Ns),
+            PerfNsToMs(captureLineExportGpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportGpuSummary.P95Ns),
+            static_cast<unsigned long long>(RasterSpecializedTextureModeCount),
+            static_cast<unsigned long long>(RasterSpecializedTranslucencyModeCount),
+            static_cast<unsigned long long>(RasterSpecializedShadeModeCount),
+            static_cast<unsigned long long>(RasterSpecializedAllModesCount),
+            static_cast<unsigned long long>(EarlySubmitHitCount),
+            static_cast<unsigned long long>(EarlySubmitAttemptCount),
+            static_cast<unsigned long long>(EarlySubmitMissCount),
+            static_cast<unsigned long long>(EarlySubmitSkipVCount215Count),
+            PerfNsToMs(earlySubmitCpuSummary.MeanNs),
+            PerfNsToMs(earlySubmitCpuSummary.P95Ns),
+            PerfNsToMs(earlySubmitWaitSummary.MeanNs),
+            PerfNsToMs(earlySubmitWaitSummary.P95Ns)
+        );
+        Log(
+            LogLevel::Warn,
+            "VulkanPerf[GPU3DPasses]: interp cpu avg=%.3fms gpu avg=%.3fms bin cpu avg=%.3fms gpu avg=%.3fms work cpu avg=%.3fms gpu avg=%.3fms sort cpu avg=%.3fms gpu avg=%.3fms raster cpu avg=%.3fms gpu avg=%.3fms resolve cpu avg=%.3fms gpu avg=%.3fms final cpu avg=%.3fms gpu avg=%.3fms captureExport cpu avg=%.3fms gpu avg=%.3fms",
+            PerfNsToMs(interpCpuSummary.MeanNs),
+            PerfNsToMs(interpGpuSummary.MeanNs),
+            PerfNsToMs(binCpuSummary.MeanNs),
+            PerfNsToMs(binGpuSummary.MeanNs),
+            PerfNsToMs(workOffsetsCpuSummary.MeanNs),
+            PerfNsToMs(workOffsetsGpuSummary.MeanNs),
+            PerfNsToMs(sortCpuSummary.MeanNs),
+            PerfNsToMs(sortGpuSummary.MeanNs),
+            PerfNsToMs(rasterCpuSummary.MeanNs),
+            PerfNsToMs(rasterGpuSummary.MeanNs),
+            PerfNsToMs(depthBlendCpuSummary.MeanNs),
+            PerfNsToMs(depthBlendGpuSummary.MeanNs),
+            PerfNsToMs(finalCpuSummary.MeanNs),
+            PerfNsToMs(finalGpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportCpuSummary.MeanNs),
+            PerfNsToMs(captureLineExportGpuSummary.MeanNs)
+        );
+    }
     ContextMissCount = 0;
     LateFrameCount = 0;
     DroppedFrameCount = 0;
@@ -1659,6 +2680,9 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
     CaptureSource3dCount = 0;
     CaptureModeCounts.fill(0);
     CaptureSizeModeCounts.fill(0);
+    RasterExecutionProfileCounts.fill(0);
+    RasterTileLoopModeCounts.fill(0);
+    CapturePathModeCounts.fill(0);
     CaptureLineExportCount = 0;
     RasterSpecializedShadeModeCount = 0;
     RasterSpecializedTextureModeCount = 0;
@@ -1717,6 +2741,7 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
     auto* workOffsetValues = reinterpret_cast<u32*>(context.WorkOffsetMapped);
     std::memset(binMaskValues, 0, requiredBinMaskWords * sizeof(u32));
     std::memset(groupListValues, 0, static_cast<size_t>(tileCount) * sizeof(u32));
+    std::memset(workOffsetValues, 0, static_cast<size_t>(requiredWorkOffsetWords) * sizeof(u32));
 
     const auto variantMatchesPass = [](u32 triangleVariantKey, u32 passVariantKey) noexcept -> bool {
         constexpr u32 kVariantWildcard = 0xFFFFFFFFu;
@@ -1845,7 +2870,20 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
 
                 const size_t linearTile = rowTileBase + static_cast<size_t>(tileX);
                 const size_t maskIndex = linearTile * static_cast<size_t>(groupCount) + static_cast<size_t>(groupIdx);
-                binMaskValues[maskIndex] |= groupBit;
+                const u32 previousMask = binMaskValues[maskIndex];
+                binMaskValues[maskIndex] = previousMask | groupBit;
+                if (previousMask == 0u)
+                {
+                    const u32 slot = groupListValues[linearTile]++;
+                    if (slot < groupCount)
+                    {
+                        const size_t listIndex =
+                            static_cast<size_t>(tileCount)
+                            + linearTile * static_cast<size_t>(groupCount)
+                            + static_cast<size_t>(slot);
+                        groupListValues[listIndex] = groupIdx;
+                    }
+                }
 
                 tileMinX += kTileSizeF;
                 edge0MinMin += edge0StepX;
@@ -1859,21 +2897,6 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
     }
 
     const size_t tileGroupListBase = static_cast<size_t>(tileCount);
-    for (u32 linearTile = 0; linearTile < tileCount; linearTile++)
-    {
-        const size_t maskBase = static_cast<size_t>(linearTile) * static_cast<size_t>(groupCount);
-        const size_t listBase = tileGroupListBase + static_cast<size_t>(linearTile) * static_cast<size_t>(groupCount);
-        u32 tileGroupCount = 0u;
-        for (u32 groupIdx = 0; groupIdx < groupCount; groupIdx++)
-        {
-            if (binMaskValues[maskBase + static_cast<size_t>(groupIdx)] == 0u)
-                continue;
-            groupListValues[listBase + static_cast<size_t>(tileGroupCount)] = groupIdx;
-            tileGroupCount++;
-        }
-        groupListValues[linearTile] = tileGroupCount;
-    }
-
     const size_t compactGroupListBase = static_cast<size_t>(kWorkTileOffsetsBase)
         + static_cast<size_t>(tileCount + 1u)
         + static_cast<size_t>(tileCount);
@@ -1881,6 +2904,8 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
     u32 activeTileCount = 0u;
     for (u32 linearTile = 0; linearTile < tileCount; linearTile++)
     {
+        workOffsetValues[kWorkTileOffsetsBase + linearTile] = runningGroupOffset;
+
         const u32 tileGroupCount = std::min(groupListValues[linearTile], groupCount);
         if (tileGroupCount == 0u)
             continue;
@@ -1888,18 +2913,13 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
         runningGroupOffset += tileGroupCount;
         activeTileCount++;
     }
+    workOffsetValues[kWorkTileOffsetsBase + tileCount] = runningGroupOffset;
 
-    const bool hasSparseCoverage = activeTileCount == 0u
-        || static_cast<u64>(activeTileCount) * 100ull
-            < static_cast<u64>(tileCount) * static_cast<u64>(kCpuActiveTileDispatchMaxCoveragePercent);
-    if (hasSparseCoverage)
     {
         u32 compactGroupOffset = 0u;
         u32 compactActiveTileIndex = 0u;
         for (u32 linearTile = 0; linearTile < tileCount; linearTile++)
         {
-            workOffsetValues[kWorkTileOffsetsBase + linearTile] = compactGroupOffset;
-
             const u32 tileGroupCount = std::min(groupListValues[linearTile], groupCount);
             if (tileGroupCount == 0u)
                 continue;
@@ -1914,7 +2934,6 @@ bool VulkanRenderer3D::prepareCpuTileBins(RenderContext& context, const RasterPu
             compactGroupOffset += tileGroupCount;
             compactActiveTileIndex++;
         }
-        workOffsetValues[kWorkTileOffsetsBase + tileCount] = compactGroupOffset;
     }
 
     workOffsetValues[kWorkSortDispatchX] = std::max<u32>(1u, (activeTileCount + 63u) / 64u);
@@ -2113,6 +3132,132 @@ bool VulkanRenderer3D::createDescriptorObjects()
     }
 
     return true;
+}
+
+bool VulkanRenderer3D::createGraphicsDescriptorObjects()
+{
+    const u32 textureDescriptorBindingCount = getTextureBindingDescriptorCount();
+
+    VkDescriptorSetLayoutBinding triangleBinding{};
+    triangleBinding.binding = 0;
+    triangleBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    triangleBinding.descriptorCount = 1;
+    triangleBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    VkDescriptorSetLayoutBinding textureBinding{};
+    textureBinding.binding = 1;
+    textureBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    textureBinding.descriptorCount = textureDescriptorBindingCount;
+    textureBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutBinding toonBinding{};
+    toonBinding.binding = 2;
+    toonBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    toonBinding.descriptorCount = 1;
+    toonBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutBinding attrBinding{};
+    attrBinding.binding = 3;
+    attrBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    attrBinding.descriptorCount = 1;
+    attrBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutBinding depthBinding{};
+    depthBinding.binding = 4;
+    depthBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    depthBinding.descriptorCount = 1;
+    depthBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutBinding clearBinding{};
+    clearBinding.binding = 5;
+    clearBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    clearBinding.descriptorCount = 1;
+    clearBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    std::array<VkDescriptorSetLayoutBinding, 6> bindings = {
+        triangleBinding,
+        textureBinding,
+        toonBinding,
+        attrBinding,
+        depthBinding,
+        clearBinding,
+    };
+
+    VkDescriptorSetLayoutCreateInfo layoutCreateInfo{};
+    layoutCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutCreateInfo.bindingCount = static_cast<u32>(bindings.size());
+    layoutCreateInfo.pBindings = bindings.data();
+
+    if (vkCreateDescriptorSetLayout(Device, &layoutCreateInfo, nullptr, &GraphicsDescriptorSetLayout) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics descriptor set layout");
+        return false;
+    }
+
+    const u32 descriptorSetCount = static_cast<u32>(AsyncRenderContextCount + 1u);
+    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizes[0].descriptorCount = 3u * descriptorSetCount;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = (textureDescriptorBindingCount + 2u) * descriptorSetCount;
+
+    VkDescriptorPoolCreateInfo poolCreateInfo{};
+    poolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolCreateInfo.maxSets = descriptorSetCount;
+    poolCreateInfo.poolSizeCount = static_cast<u32>(poolSizes.size());
+    poolCreateInfo.pPoolSizes = poolSizes.data();
+
+    if (vkCreateDescriptorPool(Device, &poolCreateInfo, nullptr, &GraphicsDescriptorPool) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics descriptor pool");
+        return false;
+    }
+
+    std::vector<VkDescriptorSetLayout> setLayouts(descriptorSetCount, GraphicsDescriptorSetLayout);
+    std::vector<VkDescriptorSet> descriptorSets(descriptorSetCount, VK_NULL_HANDLE);
+
+    VkDescriptorSetAllocateInfo descriptorAllocInfo{};
+    descriptorAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    descriptorAllocInfo.descriptorPool = GraphicsDescriptorPool;
+    descriptorAllocInfo.descriptorSetCount = descriptorSetCount;
+    descriptorAllocInfo.pSetLayouts = setLayouts.data();
+
+    if (vkAllocateDescriptorSets(Device, &descriptorAllocInfo, descriptorSets.data()) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to allocate graphics descriptor sets");
+        return false;
+    }
+
+    size_t cursor = 0;
+    GraphicsDescriptorSet = descriptorSets[cursor++];
+    for (RenderContext& renderContext : RenderContexts)
+        renderContext.GraphicsDescriptorSet = descriptorSets[cursor++];
+
+    invalidateAllGraphicsDescriptorSetCaches();
+    return true;
+}
+
+bool VulkanRenderer3D::selectGraphicsDepthStencilFormat()
+{
+    const std::array<VkFormat, 3> candidates = {
+        VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D16_UNORM_S8_UINT,
+    };
+
+    for (const VkFormat candidate : candidates)
+    {
+        VkFormatProperties formatProperties{};
+        vkGetPhysicalDeviceFormatProperties(PhysicalDevice, candidate, &formatProperties);
+        if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0)
+        {
+            GraphicsDepthStencilFormat = candidate;
+            return true;
+        }
+    }
+
+    GraphicsDepthStencilFormat = VK_FORMAT_UNDEFINED;
+    return false;
 }
 
 std::string VulkanRenderer3D::buildPipelineCacheFileName(TextureSamplingPath samplingPath) const
@@ -2390,30 +3535,38 @@ bool VulkanRenderer3D::createComputePipeline()
 
     struct RasterSpecializationData
     {
+        u32 sceneMode;
         u32 expectWBufferMode;
         u32 expectShadeMode;
         u32 expectTextureMode;
         u32 expectTranslucencyMode;
     };
 
-    std::array<VkSpecializationMapEntry, 4> rasterSpecializationEntries{};
+    std::array<VkSpecializationMapEntry, 5> rasterSpecializationEntries{};
     rasterSpecializationEntries[0].constantID = 0;
-    rasterSpecializationEntries[0].offset = offsetof(RasterSpecializationData, expectWBufferMode);
+    rasterSpecializationEntries[0].offset = offsetof(RasterSpecializationData, sceneMode);
     rasterSpecializationEntries[0].size = sizeof(u32);
     rasterSpecializationEntries[1].constantID = 1;
-    rasterSpecializationEntries[1].offset = offsetof(RasterSpecializationData, expectShadeMode);
+    rasterSpecializationEntries[1].offset = offsetof(RasterSpecializationData, expectWBufferMode);
     rasterSpecializationEntries[1].size = sizeof(u32);
     rasterSpecializationEntries[2].constantID = 2;
-    rasterSpecializationEntries[2].offset = offsetof(RasterSpecializationData, expectTextureMode);
+    rasterSpecializationEntries[2].offset = offsetof(RasterSpecializationData, expectShadeMode);
     rasterSpecializationEntries[2].size = sizeof(u32);
     rasterSpecializationEntries[3].constantID = 3;
-    rasterSpecializationEntries[3].offset = offsetof(RasterSpecializationData, expectTranslucencyMode);
+    rasterSpecializationEntries[3].offset = offsetof(RasterSpecializationData, expectTextureMode);
     rasterSpecializationEntries[3].size = sizeof(u32);
+    rasterSpecializationEntries[4].constantID = 4;
+    rasterSpecializationEntries[4].offset = offsetof(RasterSpecializationData, expectTranslucencyMode);
+    rasterSpecializationEntries[4].size = sizeof(u32);
 
+    const char* rasterSceneModeNames[] = {"dense_no_boundary", "dense_boundary", "sparse_active"};
     const char* rasterWModeNames[] = {"z", "w", "any"};
     const char* rasterShadeModeNames[] = {"modulate", "decal", "toon", "highlight", "shadow", "any"};
     const char* rasterTextureModeNames[] = {"notexture", "texture", "anytex"};
     const char* rasterTranslucencyModeNames[] = {"opaque", "translucent", "anyalpha"};
+    constexpr u32 kCreateRasterShadeModeAny = 5u;
+    constexpr u32 kCreateRasterTextureModeAny = 2u;
+    constexpr u32 kCreateRasterTranslucencyModeAny = 2u;
     const unsigned char* triRasterSpirv = melonDS_gpu3d_vulkan_tri_raster_comp_spv;
     size_t triRasterSpirvLen = melonDS_gpu3d_vulkan_tri_raster_comp_spv_len;
     if (samplingPath == TextureSamplingPath::BaseSingleDescriptor)
@@ -2447,59 +3600,63 @@ bool VulkanRenderer3D::createComputePipeline()
                 ? "compatibility (dynamic-uniform descriptor indexing)"
                 : "base switch-descriptor compatibility")
     );
-    auto makeRasterPipelineIndex = [&](u32 rasterWMode, u32 rasterShadeMode, u32 rasterTextureMode, u32 rasterTranslucencyMode) -> u32
+    auto makeRasterPipelineIndex = [&](u32 sceneMode,
+                                       u32 rasterWMode,
+                                       u32 rasterShadeMode,
+                                       u32 rasterTextureMode,
+                                       u32 rasterTranslucencyMode) -> u32
     {
-        return (((rasterWMode * RasterShadeModeCount) + rasterShadeMode) * RasterTextureModeCount + rasterTextureMode)
+        return ((((sceneMode * RasterWModeCount) + rasterWMode) * RasterShadeModeCount + rasterShadeMode) * RasterTextureModeCount + rasterTextureMode)
             * RasterTranslucencyModeCount
             + rasterTranslucencyMode;
     };
-    for (u32 rasterWMode = 0; rasterWMode < RasterWModeCount; rasterWMode++)
+    for (u32 rasterSceneMode = 0; rasterSceneMode < RasterSceneModeCount; rasterSceneMode++)
     {
-        for (u32 rasterShadeMode = 0; rasterShadeMode < RasterShadeModeCount; rasterShadeMode++)
+        for (u32 rasterWMode = 0; rasterWMode < RasterWModeCount; rasterWMode++)
         {
-            for (u32 rasterTextureMode = 0; rasterTextureMode < RasterTextureModeCount; rasterTextureMode++)
+            const u32 rasterShadeMode = kCreateRasterShadeModeAny;
+            const u32 rasterTextureMode = kCreateRasterTextureModeAny;
+            const u32 rasterTranslucencyMode = kCreateRasterTranslucencyModeAny;
+            RasterSpecializationData rasterSpecializationData{};
+            rasterSpecializationData.sceneMode = rasterSceneMode;
+            rasterSpecializationData.expectWBufferMode = rasterWMode;
+            rasterSpecializationData.expectShadeMode = rasterShadeMode;
+            rasterSpecializationData.expectTextureMode = rasterTextureMode;
+            rasterSpecializationData.expectTranslucencyMode = rasterTranslucencyMode;
+
+            VkSpecializationInfo rasterSpecializationInfo{};
+            rasterSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
+            rasterSpecializationInfo.pMapEntries = rasterSpecializationEntries.data();
+            rasterSpecializationInfo.dataSize = sizeof(rasterSpecializationData);
+            rasterSpecializationInfo.pData = &rasterSpecializationData;
+
+            const u32 rasterPipelineIndex = makeRasterPipelineIndex(
+                rasterSceneMode,
+                rasterWMode,
+                rasterShadeMode,
+                rasterTextureMode,
+                rasterTranslucencyMode
+            );
+            char rasterPipelineName[128]{};
+            std::snprintf(
+                rasterPipelineName,
+                sizeof(rasterPipelineName),
+                "raster_%s_%s_%s_%s_%s",
+                rasterSceneModeNames[rasterSceneMode],
+                rasterWModeNames[rasterWMode],
+                rasterShadeModeNames[rasterShadeMode],
+                rasterTextureModeNames[rasterTextureMode],
+                rasterTranslucencyModeNames[rasterTranslucencyMode]
+            );
+
+            if (!createPipelineFromSpirv(
+                    triRasterSpirv,
+                    triRasterSpirvLen,
+                    rasterPipelineName,
+                    &rasterSpecializationInfo,
+                    &RasterPipelines[rasterPipelineIndex]))
             {
-                for (u32 rasterTranslucencyMode = 0; rasterTranslucencyMode < RasterTranslucencyModeCount; rasterTranslucencyMode++)
-                {
-                    RasterSpecializationData rasterSpecializationData{};
-                    rasterSpecializationData.expectWBufferMode = rasterWMode;
-                    rasterSpecializationData.expectShadeMode = rasterShadeMode;
-                    rasterSpecializationData.expectTextureMode = rasterTextureMode;
-                    rasterSpecializationData.expectTranslucencyMode = rasterTranslucencyMode;
-
-                    VkSpecializationInfo rasterSpecializationInfo{};
-                    rasterSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
-                    rasterSpecializationInfo.pMapEntries = rasterSpecializationEntries.data();
-                    rasterSpecializationInfo.dataSize = sizeof(rasterSpecializationData);
-                    rasterSpecializationInfo.pData = &rasterSpecializationData;
-
-                    const u32 rasterPipelineIndex = makeRasterPipelineIndex(
-                        rasterWMode,
-                        rasterShadeMode,
-                        rasterTextureMode,
-                        rasterTranslucencyMode
-                    );
-                    char rasterPipelineName[96]{};
-                    std::snprintf(
-                        rasterPipelineName,
-                        sizeof(rasterPipelineName),
-                        "raster_%s_%s_%s_%s",
-                        rasterWModeNames[rasterWMode],
-                        rasterShadeModeNames[rasterShadeMode],
-                        rasterTextureModeNames[rasterTextureMode],
-                        rasterTranslucencyModeNames[rasterTranslucencyMode]
-                    );
-
-                    if (!createPipelineFromSpirv(
-                            triRasterSpirv,
-                            triRasterSpirvLen,
-                            rasterPipelineName,
-                            &rasterSpecializationInfo,
-                            &RasterPipelines[rasterPipelineIndex]))
-                    {
-                        return false;
-                    }
-                }
+                return false;
             }
         }
     }
@@ -2561,12 +3718,974 @@ bool VulkanRenderer3D::createComputePipeline()
     return true;
 }
 
+bool VulkanRenderer3D::createGraphicsPipelines()
+{
+    GraphicsReady = false;
+
+    if (GraphicsDescriptorSetLayout == VK_NULL_HANDLE)
+        return false;
+
+    if (melonDS_gpu3d_vulkan_graphics_raster_vert_spv_len == 0
+        || melonDS_gpu3d_vulkan_graphics_raster_frag_spv_len == 0
+        || melonDS_gpu3d_vulkan_graphics_no_color_frag_spv_len == 0
+        || melonDS_gpu3d_vulkan_graphics_clear_frag_spv_len == 0
+        || melonDS_gpu3d_vulkan_graphics_final_vert_spv_len == 0
+        || melonDS_gpu3d_vulkan_graphics_edge_frag_spv_len == 0
+        || melonDS_gpu3d_vulkan_graphics_fog_frag_spv_len == 0)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: empty graphics SPIR-V blob(s)");
+        return false;
+    }
+
+    if (!selectGraphicsDepthStencilFormat())
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: no supported graphics depth/stencil format");
+        return false;
+    }
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(RasterPushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{};
+    pipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutCreateInfo.setLayoutCount = 1;
+    pipelineLayoutCreateInfo.pSetLayouts = &GraphicsDescriptorSetLayout;
+    pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
+    pipelineLayoutCreateInfo.pPushConstantRanges = &pushConstantRange;
+
+    if (vkCreatePipelineLayout(Device, &pipelineLayoutCreateInfo, nullptr, &GraphicsPipelineLayout) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics pipeline layout");
+        return false;
+    }
+
+    VkSamplerCreateInfo samplerCreateInfo{};
+    samplerCreateInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerCreateInfo.magFilter = VK_FILTER_NEAREST;
+    samplerCreateInfo.minFilter = VK_FILTER_NEAREST;
+    samplerCreateInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerCreateInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCreateInfo.maxLod = 0.0f;
+    if (vkCreateSampler(Device, &samplerCreateInfo, nullptr, &GraphicsAttachmentSampler) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics attachment sampler");
+        return false;
+    }
+
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentDescription attrAttachment = colorAttachment;
+    attrAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkAttachmentDescription depthColorAttachment{};
+    depthColorAttachment.format = VK_FORMAT_R32_SFLOAT;
+    depthColorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthColorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthColorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthColorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthColorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthColorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    depthColorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkAttachmentDescription depthStencilAttachment{};
+    depthStencilAttachment.format = GraphicsDepthStencilFormat;
+    depthStencilAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthStencilAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthStencilAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthStencilAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthStencilAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthStencilAttachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthStencilAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    std::array<VkAttachmentReference, 3> colorRefs{};
+    colorRefs[0] = {0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    colorRefs[1] = {1u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    colorRefs[2] = {2u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthStencilRef{3u, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+    VkSubpassDescription rasterSubpass{};
+    rasterSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    rasterSubpass.colorAttachmentCount = static_cast<u32>(colorRefs.size());
+    rasterSubpass.pColorAttachments = colorRefs.data();
+    rasterSubpass.pDepthStencilAttachment = &depthStencilRef;
+
+    std::array<VkAttachmentDescription, 4> rasterAttachments = {
+        colorAttachment,
+        attrAttachment,
+        depthColorAttachment,
+        depthStencilAttachment,
+    };
+
+    std::array<VkSubpassDependency, 2> rasterDependencies{};
+    rasterDependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    rasterDependencies[0].dstSubpass = 0;
+    rasterDependencies[0].srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    rasterDependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    rasterDependencies[0].dstAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    rasterDependencies[1].srcSubpass = 0;
+    rasterDependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    rasterDependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    rasterDependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    rasterDependencies[1].srcAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    rasterDependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    VkRenderPassCreateInfo rasterRenderPassCreateInfo{};
+    rasterRenderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rasterRenderPassCreateInfo.attachmentCount = static_cast<u32>(rasterAttachments.size());
+    rasterRenderPassCreateInfo.pAttachments = rasterAttachments.data();
+    rasterRenderPassCreateInfo.subpassCount = 1;
+    rasterRenderPassCreateInfo.pSubpasses = &rasterSubpass;
+    rasterRenderPassCreateInfo.dependencyCount = static_cast<u32>(rasterDependencies.size());
+    rasterRenderPassCreateInfo.pDependencies = rasterDependencies.data();
+
+    if (vkCreateRenderPass(Device, &rasterRenderPassCreateInfo, nullptr, &GraphicsRasterRenderPass) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics raster render pass");
+        return false;
+    }
+
+    VkAttachmentDescription finalColorAttachment{};
+    finalColorAttachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+    finalColorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    finalColorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    finalColorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    finalColorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    finalColorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    finalColorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    finalColorAttachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkAttachmentReference finalColorRef{0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription finalSubpass{};
+    finalSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    finalSubpass.colorAttachmentCount = 1;
+    finalSubpass.pColorAttachments = &finalColorRef;
+
+    std::array<VkSubpassDependency, 2> finalDependencies{};
+    finalDependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    finalDependencies[0].dstSubpass = 0;
+    finalDependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    finalDependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    finalDependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    finalDependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    finalDependencies[1].srcSubpass = 0;
+    finalDependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    finalDependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    finalDependencies[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    finalDependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    finalDependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkRenderPassCreateInfo finalRenderPassCreateInfo{};
+    finalRenderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    finalRenderPassCreateInfo.attachmentCount = 1;
+    finalRenderPassCreateInfo.pAttachments = &finalColorAttachment;
+    finalRenderPassCreateInfo.subpassCount = 1;
+    finalRenderPassCreateInfo.pSubpasses = &finalSubpass;
+    finalRenderPassCreateInfo.dependencyCount = static_cast<u32>(finalDependencies.size());
+    finalRenderPassCreateInfo.pDependencies = finalDependencies.data();
+
+    if (vkCreateRenderPass(Device, &finalRenderPassCreateInfo, nullptr, &GraphicsFinalRenderPass) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics final render pass");
+        return false;
+    }
+
+    VkShaderModule rasterVertModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_vert_spv, melonDS_gpu3d_vulkan_graphics_raster_vert_spv_len);
+    VkShaderModule rasterFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_frag_spv_len);
+    VkShaderModule noColorFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_no_color_frag_spv, melonDS_gpu3d_vulkan_graphics_no_color_frag_spv_len);
+    VkShaderModule clearFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_clear_frag_spv, melonDS_gpu3d_vulkan_graphics_clear_frag_spv_len);
+    VkShaderModule finalVertModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_final_vert_spv, melonDS_gpu3d_vulkan_graphics_final_vert_spv_len);
+    VkShaderModule edgeFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_edge_frag_spv, melonDS_gpu3d_vulkan_graphics_edge_frag_spv_len);
+    VkShaderModule fogFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_fog_frag_spv, melonDS_gpu3d_vulkan_graphics_fog_frag_spv_len);
+
+    if (rasterVertModule == VK_NULL_HANDLE
+        || rasterFragModule == VK_NULL_HANDLE
+        || noColorFragModule == VK_NULL_HANDLE
+        || clearFragModule == VK_NULL_HANDLE
+        || finalVertModule == VK_NULL_HANDLE
+        || edgeFragModule == VK_NULL_HANDLE
+        || fogFragModule == VK_NULL_HANDLE)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics shader modules");
+        if (rasterVertModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterVertModule, nullptr);
+        if (rasterFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterFragModule, nullptr);
+        if (noColorFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, noColorFragModule, nullptr);
+        if (clearFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, clearFragModule, nullptr);
+        if (finalVertModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, finalVertModule, nullptr);
+        if (edgeFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, edgeFragModule, nullptr);
+        if (fogFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, fogFragModule, nullptr);
+        return false;
+    }
+
+    auto makeBlendAttachment = [](
+                                   VkColorComponentFlags writeMask,
+                                   bool blendEnable,
+                                   VkBlendFactor srcColor,
+                                   VkBlendFactor dstColor,
+                                   VkBlendOp colorOp,
+                                   VkBlendFactor srcAlpha,
+                                   VkBlendFactor dstAlpha,
+                                   VkBlendOp alphaOp) {
+        VkPipelineColorBlendAttachmentState state{};
+        state.colorWriteMask = writeMask;
+        state.blendEnable = blendEnable ? VK_TRUE : VK_FALSE;
+        state.srcColorBlendFactor = srcColor;
+        state.dstColorBlendFactor = dstColor;
+        state.colorBlendOp = colorOp;
+        state.srcAlphaBlendFactor = srcAlpha;
+        state.dstAlphaBlendFactor = dstAlpha;
+        state.alphaBlendOp = alphaOp;
+        return state;
+    };
+
+    auto createRasterPipeline = [&](VkShaderModule fragmentModule,
+                                    const VkSpecializationInfo* fragmentSpecializationInfo,
+                                    const std::array<VkPipelineColorBlendAttachmentState, 3>& blendAttachments,
+                                    bool depthWriteEnable,
+                                    VkCompareOp depthCompareOp,
+                                    bool stencilTestEnable,
+                                    VkStencilOp stencilFailOp,
+                                    VkStencilOp stencilDepthFailOp,
+                                    VkStencilOp stencilPassOp,
+                                    VkCompareOp stencilCompareOp,
+                                    VkPipeline* outPipeline,
+                                    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) -> bool {
+        VkPipelineShaderStageCreateInfo shaderStages[2]{};
+        shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        shaderStages[0].module = rasterVertModule;
+        shaderStages[0].pName = "main";
+        shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shaderStages[1].module = fragmentModule;
+        shaderStages[1].pName = "main";
+        shaderStages[1].pSpecializationInfo = fragmentSpecializationInfo;
+
+        const VkVertexInputBindingDescription vertexBindingDescription = {
+            0u,
+            static_cast<u32>(sizeof(GraphicsVertexGpu)),
+            VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+        const std::array<VkVertexInputAttributeDescription, 5> vertexAttributeDescriptions = {{
+            {0u, 0u, VK_FORMAT_R32G32B32A32_SFLOAT, 0u},
+            {1u, 0u, VK_FORMAT_R32G32_SFLOAT, 16u},
+            {2u, 0u, VK_FORMAT_R8G8B8A8_UINT, 24u},
+            {3u, 0u, VK_FORMAT_R32G32B32A32_UINT, 28u},
+            {4u, 0u, VK_FORMAT_R32G32B32_UINT, 44u},
+        }};
+        VkPipelineVertexInputStateCreateInfo vertexInputState{};
+        vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInputState.vertexBindingDescriptionCount = 1;
+        vertexInputState.pVertexBindingDescriptions = &vertexBindingDescription;
+        vertexInputState.vertexAttributeDescriptionCount = static_cast<u32>(vertexAttributeDescriptions.size());
+        vertexInputState.pVertexAttributeDescriptions = vertexAttributeDescriptions.data();
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
+        inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssemblyState.topology = topology;
+
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizationState{};
+        rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizationState.cullMode = VK_CULL_MODE_NONE;
+        rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizationState.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisampleState{};
+        multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkStencilOpState stencilState{};
+        stencilState.failOp = stencilFailOp;
+        stencilState.passOp = stencilPassOp;
+        stencilState.depthFailOp = stencilDepthFailOp;
+        stencilState.compareOp = stencilCompareOp;
+        stencilState.compareMask = 0xFFu;
+        stencilState.writeMask = 0xFFu;
+        stencilState.reference = 0u;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencilState{};
+        depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencilState.depthTestEnable = VK_TRUE;
+        depthStencilState.depthWriteEnable = depthWriteEnable ? VK_TRUE : VK_FALSE;
+        depthStencilState.depthCompareOp = depthCompareOp;
+        depthStencilState.stencilTestEnable = stencilTestEnable ? VK_TRUE : VK_FALSE;
+        depthStencilState.front = stencilState;
+        depthStencilState.back = stencilState;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendState{};
+        colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlendState.attachmentCount = static_cast<u32>(blendAttachments.size());
+        colorBlendState.pAttachments = blendAttachments.data();
+
+        const std::array<VkDynamicState, 5> dynamicStates = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        };
+
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = static_cast<u32>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        VkGraphicsPipelineCreateInfo pipelineCreateInfo{};
+        pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineCreateInfo.stageCount = 2;
+        pipelineCreateInfo.pStages = shaderStages;
+        pipelineCreateInfo.pVertexInputState = &vertexInputState;
+        pipelineCreateInfo.pInputAssemblyState = &inputAssemblyState;
+        pipelineCreateInfo.pViewportState = &viewportState;
+        pipelineCreateInfo.pRasterizationState = &rasterizationState;
+        pipelineCreateInfo.pMultisampleState = &multisampleState;
+        pipelineCreateInfo.pDepthStencilState = &depthStencilState;
+        pipelineCreateInfo.pColorBlendState = &colorBlendState;
+        pipelineCreateInfo.pDynamicState = &dynamicState;
+        pipelineCreateInfo.layout = GraphicsPipelineLayout;
+        pipelineCreateInfo.renderPass = GraphicsRasterRenderPass;
+        pipelineCreateInfo.subpass = 0;
+
+        return vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
+    };
+
+    auto createFullscreenRasterPipeline = [&](VkShaderModule fragmentModule,
+                                              const std::array<VkPipelineColorBlendAttachmentState, 3>& blendAttachments,
+                                              bool depthWriteEnable,
+                                              VkCompareOp depthCompareOp,
+                                              bool stencilTestEnable,
+                                              VkStencilOp stencilFailOp,
+                                              VkStencilOp stencilDepthFailOp,
+                                              VkStencilOp stencilPassOp,
+                                              VkCompareOp stencilCompareOp,
+                                              VkPipeline* outPipeline) -> bool {
+        VkPipelineShaderStageCreateInfo shaderStages[2]{};
+        shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        shaderStages[0].module = finalVertModule;
+        shaderStages[0].pName = "main";
+        shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shaderStages[1].module = fragmentModule;
+        shaderStages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vertexInputState{};
+        vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
+        inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizationState{};
+        rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizationState.cullMode = VK_CULL_MODE_NONE;
+        rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizationState.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisampleState{};
+        multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkStencilOpState stencilState{};
+        stencilState.failOp = stencilFailOp;
+        stencilState.passOp = stencilPassOp;
+        stencilState.depthFailOp = stencilDepthFailOp;
+        stencilState.compareOp = stencilCompareOp;
+        stencilState.compareMask = 0xFFu;
+        stencilState.writeMask = 0xFFu;
+        stencilState.reference = 0u;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencilState{};
+        depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencilState.depthTestEnable = VK_TRUE;
+        depthStencilState.depthWriteEnable = depthWriteEnable ? VK_TRUE : VK_FALSE;
+        depthStencilState.depthCompareOp = depthCompareOp;
+        depthStencilState.stencilTestEnable = stencilTestEnable ? VK_TRUE : VK_FALSE;
+        depthStencilState.front = stencilState;
+        depthStencilState.back = stencilState;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendState{};
+        colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlendState.attachmentCount = static_cast<u32>(blendAttachments.size());
+        colorBlendState.pAttachments = blendAttachments.data();
+
+        const std::array<VkDynamicState, 5> dynamicStates = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        };
+
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = static_cast<u32>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        VkGraphicsPipelineCreateInfo pipelineCreateInfo{};
+        pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineCreateInfo.stageCount = 2;
+        pipelineCreateInfo.pStages = shaderStages;
+        pipelineCreateInfo.pVertexInputState = &vertexInputState;
+        pipelineCreateInfo.pInputAssemblyState = &inputAssemblyState;
+        pipelineCreateInfo.pViewportState = &viewportState;
+        pipelineCreateInfo.pRasterizationState = &rasterizationState;
+        pipelineCreateInfo.pMultisampleState = &multisampleState;
+        pipelineCreateInfo.pDepthStencilState = &depthStencilState;
+        pipelineCreateInfo.pColorBlendState = &colorBlendState;
+        pipelineCreateInfo.pDynamicState = &dynamicState;
+        pipelineCreateInfo.layout = GraphicsPipelineLayout;
+        pipelineCreateInfo.renderPass = GraphicsRasterRenderPass;
+        pipelineCreateInfo.subpass = 0;
+
+        return vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
+    };
+
+    auto createFinalPipeline = [&](VkShaderModule fragmentModule,
+                                   VkPipelineColorBlendAttachmentState blendAttachment,
+                                   VkPipeline* outPipeline) -> bool {
+        VkPipelineShaderStageCreateInfo shaderStages[2]{};
+        shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        shaderStages[0].module = finalVertModule;
+        shaderStages[0].pName = "main";
+        shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        shaderStages[1].module = fragmentModule;
+        shaderStages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vertexInputState{};
+        vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
+        inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rasterizationState{};
+        rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizationState.cullMode = VK_CULL_MODE_NONE;
+        rasterizationState.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizationState.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisampleState{};
+        multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineColorBlendStateCreateInfo colorBlendState{};
+        colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlendState.attachmentCount = 1;
+        colorBlendState.pAttachments = &blendAttachment;
+
+        const std::array<VkDynamicState, 3> dynamicStates = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        };
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = static_cast<u32>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        VkGraphicsPipelineCreateInfo pipelineCreateInfo{};
+        pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineCreateInfo.stageCount = 2;
+        pipelineCreateInfo.pStages = shaderStages;
+        pipelineCreateInfo.pVertexInputState = &vertexInputState;
+        pipelineCreateInfo.pInputAssemblyState = &inputAssemblyState;
+        pipelineCreateInfo.pViewportState = &viewportState;
+        pipelineCreateInfo.pRasterizationState = &rasterizationState;
+        pipelineCreateInfo.pMultisampleState = &multisampleState;
+        pipelineCreateInfo.pColorBlendState = &colorBlendState;
+        pipelineCreateInfo.pDynamicState = &dynamicState;
+        pipelineCreateInfo.layout = GraphicsPipelineLayout;
+        pipelineCreateInfo.renderPass = GraphicsFinalRenderPass;
+        pipelineCreateInfo.subpass = 0;
+
+        return vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
+    };
+
+    struct RasterFragmentSpecialization
+    {
+        u32 depthInterpolationMode;
+        u32 translucentPass;
+        u32 edgeMarkPass;
+    };
+
+    std::array<VkSpecializationMapEntry, 3> rasterSpecializationEntries{};
+    rasterSpecializationEntries[0] = {0u, offsetof(RasterFragmentSpecialization, depthInterpolationMode), sizeof(u32)};
+    rasterSpecializationEntries[1] = {1u, offsetof(RasterFragmentSpecialization, translucentPass), sizeof(u32)};
+    rasterSpecializationEntries[2] = {2u, offsetof(RasterFragmentSpecialization, edgeMarkPass), sizeof(u32)};
+
+    struct NoColorFragmentSpecialization
+    {
+        u32 writeFragDepth;
+        u32 edgeMarkPass;
+    };
+
+    std::array<VkSpecializationMapEntry, 2> noColorSpecializationEntries{};
+    noColorSpecializationEntries[0] = {0u, offsetof(NoColorFragmentSpecialization, writeFragDepth), sizeof(u32)};
+    noColorSpecializationEntries[1] = {1u, offsetof(NoColorFragmentSpecialization, edgeMarkPass), sizeof(u32)};
+
+    const auto makeOpaqueIndex = [](u32 wMode, u32 depthCompareMode) {
+        return (wMode * GraphicsDepthCompareModeCount) + depthCompareMode;
+    };
+    const auto makeBgZeroTranslucentIndex = [](u32 wMode, u32 depthCompareMode, u32 depthWriteMode, u32 fogWriteMode) {
+        return (((wMode * GraphicsDepthCompareModeCount) + depthCompareMode) * GraphicsDepthWriteModeCount + depthWriteMode)
+            * GraphicsFogWriteModeCount
+            + fogWriteMode;
+    };
+    const auto makeTranslucentIndex = [](u32 wMode, u32 depthCompareMode, u32 depthWriteMode, u32 fogWriteMode, u32 alphaBlendMode) {
+        return ((((wMode * GraphicsDepthCompareModeCount) + depthCompareMode) * GraphicsDepthWriteModeCount + depthWriteMode)
+            * GraphicsFogWriteModeCount
+            + fogWriteMode)
+            * GraphicsAlphaBlendModeCount
+            + alphaBlendMode;
+    };
+
+    const auto colorWriteAll = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    const auto colorWriteB = VK_COLOR_COMPONENT_B_BIT;
+    const auto colorWriteR = VK_COLOR_COMPONENT_R_BIT;
+    const auto colorWriteNone = 0u;
+
+    const std::array<VkPipelineColorBlendAttachmentState, 3> clearBlendAttachments = {
+        makeBlendAttachment(colorWriteAll, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+        makeBlendAttachment(colorWriteAll, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+        makeBlendAttachment(colorWriteR, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+    };
+    if (!createFullscreenRasterPipeline(
+            clearFragModule,
+            clearBlendAttachments,
+            true,
+            VK_COMPARE_OP_ALWAYS,
+            true,
+            VK_STENCIL_OP_REPLACE,
+            VK_STENCIL_OP_REPLACE,
+            VK_STENCIL_OP_REPLACE,
+            VK_COMPARE_OP_ALWAYS,
+            &GraphicsClearPipeline))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics clear pipeline");
+        return false;
+    }
+
+    for (u32 wMode = 0; wMode < GraphicsWModeCount; wMode++)
+    {
+        for (u32 depthCompareMode = 0; depthCompareMode < GraphicsDepthCompareModeCount; depthCompareMode++)
+        {
+            RasterFragmentSpecialization opaqueSpecializationData{};
+            opaqueSpecializationData.depthInterpolationMode = wMode;
+            opaqueSpecializationData.translucentPass = 0u;
+            opaqueSpecializationData.edgeMarkPass = 0u;
+
+            VkSpecializationInfo opaqueSpecializationInfo{};
+            opaqueSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
+            opaqueSpecializationInfo.pMapEntries = rasterSpecializationEntries.data();
+            opaqueSpecializationInfo.dataSize = sizeof(opaqueSpecializationData);
+            opaqueSpecializationInfo.pData = &opaqueSpecializationData;
+
+            const std::array<VkPipelineColorBlendAttachmentState, 3> opaqueBlendAttachments = {
+                makeBlendAttachment(colorWriteAll, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                makeBlendAttachment(colorWriteAll, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                makeBlendAttachment(colorWriteR, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+            };
+
+            if (!createRasterPipeline(
+                    rasterFragModule,
+                    &opaqueSpecializationInfo,
+                    opaqueBlendAttachments,
+                    true,
+                    depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                    true,
+                    VK_STENCIL_OP_KEEP,
+                    VK_STENCIL_OP_KEEP,
+                    VK_STENCIL_OP_REPLACE,
+                    VK_COMPARE_OP_ALWAYS,
+                    &GraphicsOpaquePipelines[makeOpaqueIndex(wMode, depthCompareMode)]))
+            {
+                Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics opaque pipeline");
+                return false;
+            }
+
+            for (u32 depthWriteMode = 0; depthWriteMode < GraphicsDepthWriteModeCount; depthWriteMode++)
+            {
+                for (u32 fogWriteMode = 0; fogWriteMode < GraphicsFogWriteModeCount; fogWriteMode++)
+                {
+                    RasterFragmentSpecialization translucentSpecializationData{};
+                    translucentSpecializationData.depthInterpolationMode = wMode;
+                    translucentSpecializationData.translucentPass = 1u;
+                    translucentSpecializationData.edgeMarkPass = 0u;
+
+                    VkSpecializationInfo translucentSpecializationInfo{};
+                    translucentSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
+                    translucentSpecializationInfo.pMapEntries = rasterSpecializationEntries.data();
+                    translucentSpecializationInfo.dataSize = sizeof(translucentSpecializationData);
+                    translucentSpecializationInfo.pData = &translucentSpecializationData;
+
+                    const std::array<VkPipelineColorBlendAttachmentState, 3> translucentBlendAttachments = {
+                        makeBlendAttachment(colorWriteAll, true, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_MAX),
+                        makeBlendAttachment(fogWriteMode != 0u ? colorWriteB : colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                        makeBlendAttachment(depthWriteMode != 0u ? colorWriteR : colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                    };
+                    const std::array<VkPipelineColorBlendAttachmentState, 3> translucentReplaceBlendAttachments = {
+                        makeBlendAttachment(colorWriteAll, true, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_MAX),
+                        makeBlendAttachment(fogWriteMode != 0u ? colorWriteB : colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                        makeBlendAttachment(depthWriteMode != 0u ? colorWriteR : colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                    };
+                    const std::array<VkPipelineColorBlendAttachmentState, 3> bgZeroTranslucentBlendAttachments = {
+                        makeBlendAttachment(colorWriteAll, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                        makeBlendAttachment(fogWriteMode != 0u ? colorWriteB : colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                        makeBlendAttachment(depthWriteMode != 0u ? colorWriteR : colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+                    };
+
+                    if (!createRasterPipeline(
+                            rasterFragModule,
+                            &translucentSpecializationInfo,
+                            translucentBlendAttachments,
+                            depthWriteMode != 0u,
+                            depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                            true,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_REPLACE,
+                            VK_COMPARE_OP_NOT_EQUAL,
+                            &GraphicsTranslucentPipelines[makeTranslucentIndex(wMode, depthCompareMode, depthWriteMode, fogWriteMode, 1u)]))
+                    {
+                        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics translucent pipeline");
+                        return false;
+                    }
+
+                    if (!createRasterPipeline(
+                            rasterFragModule,
+                            &translucentSpecializationInfo,
+                            translucentReplaceBlendAttachments,
+                            depthWriteMode != 0u,
+                            depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                            true,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_REPLACE,
+                            VK_COMPARE_OP_NOT_EQUAL,
+                            &GraphicsTranslucentPipelines[makeTranslucentIndex(wMode, depthCompareMode, depthWriteMode, fogWriteMode, 0u)]))
+                    {
+                        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics translucent-replace pipeline");
+                        return false;
+                    }
+
+                    if (!createRasterPipeline(
+                            rasterFragModule,
+                            &translucentSpecializationInfo,
+                            bgZeroTranslucentBlendAttachments,
+                            depthWriteMode != 0u,
+                            depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                            true,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_INVERT,
+                            VK_COMPARE_OP_EQUAL,
+                            &GraphicsBgZeroTranslucentPipelines[makeBgZeroTranslucentIndex(wMode, depthCompareMode, depthWriteMode, fogWriteMode)]))
+                    {
+                        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics bg-zero translucent pipeline");
+                        return false;
+                    }
+
+                    if (!createRasterPipeline(
+                            rasterFragModule,
+                            &translucentSpecializationInfo,
+                            translucentBlendAttachments,
+                            depthWriteMode != 0u,
+                            depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                            true,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_INVERT,
+                            VK_COMPARE_OP_EQUAL,
+                            &GraphicsShadowBlendBgZeroPipelines[makeTranslucentIndex(wMode, depthCompareMode, depthWriteMode, fogWriteMode, 1u)]))
+                    {
+                        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics bg-zero shadow-blend pipeline");
+                        return false;
+                    }
+
+                    if (!createRasterPipeline(
+                            rasterFragModule,
+                            &translucentSpecializationInfo,
+                            translucentReplaceBlendAttachments,
+                            depthWriteMode != 0u,
+                            depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                            true,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_INVERT,
+                            VK_COMPARE_OP_EQUAL,
+                            &GraphicsShadowBlendBgZeroPipelines[makeTranslucentIndex(wMode, depthCompareMode, depthWriteMode, fogWriteMode, 0u)]))
+                    {
+                        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics bg-zero shadow-blend-replace pipeline");
+                        return false;
+                    }
+
+                    if (!createRasterPipeline(
+                            rasterFragModule,
+                            &translucentSpecializationInfo,
+                            translucentBlendAttachments,
+                            depthWriteMode != 0u,
+                            depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                            true,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_REPLACE,
+                            VK_COMPARE_OP_EQUAL,
+                            &GraphicsShadowBlendPipelines[makeTranslucentIndex(wMode, depthCompareMode, depthWriteMode, fogWriteMode, 1u)]))
+                    {
+                        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics shadow-blend pipeline");
+                        return false;
+                    }
+
+                    if (!createRasterPipeline(
+                            rasterFragModule,
+                            &translucentSpecializationInfo,
+                            translucentReplaceBlendAttachments,
+                            depthWriteMode != 0u,
+                            depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                            true,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_KEEP,
+                            VK_STENCIL_OP_REPLACE,
+                            VK_COMPARE_OP_EQUAL,
+                            &GraphicsShadowBlendPipelines[makeTranslucentIndex(wMode, depthCompareMode, depthWriteMode, fogWriteMode, 0u)]))
+                    {
+                        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics shadow-blend-replace pipeline");
+                        return false;
+                    }
+                }
+            }
+        }
+
+        RasterFragmentSpecialization edgeMarkSpecializationData{};
+        edgeMarkSpecializationData.depthInterpolationMode = wMode;
+        edgeMarkSpecializationData.translucentPass = 0u;
+        edgeMarkSpecializationData.edgeMarkPass = 1u;
+
+        VkSpecializationInfo edgeMarkSpecializationInfo{};
+        edgeMarkSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
+        edgeMarkSpecializationInfo.pMapEntries = rasterSpecializationEntries.data();
+        edgeMarkSpecializationInfo.dataSize = sizeof(edgeMarkSpecializationData);
+        edgeMarkSpecializationInfo.pData = &edgeMarkSpecializationData;
+
+        const std::array<VkPipelineColorBlendAttachmentState, 3> edgeMarkBlendAttachments = {
+            makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+            makeBlendAttachment(VK_COLOR_COMPONENT_G_BIT, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+            makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+        };
+        if (!createRasterPipeline(
+                rasterFragModule,
+                &edgeMarkSpecializationInfo,
+                edgeMarkBlendAttachments,
+                false,
+                VK_COMPARE_OP_ALWAYS,
+                false,
+                VK_STENCIL_OP_KEEP,
+                VK_STENCIL_OP_KEEP,
+                VK_STENCIL_OP_KEEP,
+                VK_COMPARE_OP_ALWAYS,
+                &GraphicsEdgeMarkPipelines[wMode],
+                VK_PRIMITIVE_TOPOLOGY_LINE_LIST))
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics edge-mark pipeline");
+            return false;
+        }
+
+        NoColorFragmentSpecialization noColorSpecializationData{};
+        noColorSpecializationData.writeFragDepth = wMode;
+        noColorSpecializationData.edgeMarkPass = 0u;
+
+        VkSpecializationInfo noColorSpecializationInfo{};
+        noColorSpecializationInfo.mapEntryCount = static_cast<u32>(noColorSpecializationEntries.size());
+        noColorSpecializationInfo.pMapEntries = noColorSpecializationEntries.data();
+        noColorSpecializationInfo.dataSize = sizeof(noColorSpecializationData);
+        noColorSpecializationInfo.pData = &noColorSpecializationData;
+
+        const std::array<VkPipelineColorBlendAttachmentState, 3> noColorBlendAttachments = {
+            makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+            makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+            makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+        };
+
+        if (!createRasterPipeline(
+                noColorFragModule,
+                &noColorSpecializationInfo,
+                noColorBlendAttachments,
+                false,
+                VK_COMPARE_OP_LESS,
+                true,
+                VK_STENCIL_OP_KEEP,
+                VK_STENCIL_OP_INVERT,
+                VK_STENCIL_OP_KEEP,
+                VK_COMPARE_OP_EQUAL,
+                &GraphicsShadowMaskBgZeroPipelines[wMode]))
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics shadow-mask-bgzero pipeline");
+            return false;
+        }
+
+        if (!createRasterPipeline(
+                noColorFragModule,
+                &noColorSpecializationInfo,
+                noColorBlendAttachments,
+                false,
+                VK_COMPARE_OP_LESS,
+                true,
+                VK_STENCIL_OP_KEEP,
+                VK_STENCIL_OP_REPLACE,
+                VK_STENCIL_OP_KEEP,
+                VK_COMPARE_OP_ALWAYS,
+                &GraphicsShadowMaskPipelines[wMode]))
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics shadow-mask pipeline");
+            return false;
+        }
+
+        for (u32 depthCompareMode = 0; depthCompareMode < GraphicsDepthCompareModeCount; depthCompareMode++)
+        {
+            if (!createRasterPipeline(
+                    noColorFragModule,
+                    &noColorSpecializationInfo,
+                    noColorBlendAttachments,
+                    false,
+                    depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                    true,
+                    VK_STENCIL_OP_KEEP,
+                    VK_STENCIL_OP_KEEP,
+                    VK_STENCIL_OP_ZERO,
+                    VK_COMPARE_OP_EQUAL,
+                    &GraphicsShadowClearPipelines[makeOpaqueIndex(wMode, depthCompareMode)]))
+            {
+                Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics shadow-clear pipeline");
+                return false;
+            }
+        }
+    }
+
+    NoColorFragmentSpecialization stencilClearSpecializationData{};
+    stencilClearSpecializationData.writeFragDepth = 0u;
+    stencilClearSpecializationData.edgeMarkPass = 0u;
+    VkSpecializationInfo stencilClearSpecializationInfo{};
+    stencilClearSpecializationInfo.mapEntryCount = static_cast<u32>(noColorSpecializationEntries.size());
+    stencilClearSpecializationInfo.pMapEntries = noColorSpecializationEntries.data();
+    stencilClearSpecializationInfo.dataSize = sizeof(stencilClearSpecializationData);
+    stencilClearSpecializationInfo.pData = &stencilClearSpecializationData;
+    const std::array<VkPipelineColorBlendAttachmentState, 3> stencilClearBlendAttachments = {
+        makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+        makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+        makeBlendAttachment(colorWriteNone, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
+    };
+    if (!createRasterPipeline(
+            noColorFragModule,
+            &stencilClearSpecializationInfo,
+            stencilClearBlendAttachments,
+            false,
+            VK_COMPARE_OP_ALWAYS,
+            true,
+            VK_STENCIL_OP_KEEP,
+            VK_STENCIL_OP_KEEP,
+            VK_STENCIL_OP_REPLACE,
+            VK_COMPARE_OP_ALWAYS,
+            &GraphicsStencilBitClearPipeline))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics stencil-clear pipeline");
+        return false;
+    }
+
+    constexpr VkColorComponentFlags colorWriteRgb =
+        VK_COLOR_COMPONENT_R_BIT |
+        VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT;
+
+    const VkPipelineColorBlendAttachmentState finalEdgeBlendAttachment = makeBlendAttachment(
+        colorWriteRgb,
+        true,
+        VK_BLEND_FACTOR_SRC_ALPHA,
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_OP_ADD,
+        VK_BLEND_FACTOR_ONE,
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_OP_ADD);
+    if (!createFinalPipeline(edgeFragModule, finalEdgeBlendAttachment, &GraphicsFinalEdgePipeline))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics final-edge pipeline");
+        return false;
+    }
+
+    const VkPipelineColorBlendAttachmentState finalFogBlendAttachment = makeBlendAttachment(
+        colorWriteRgb,
+        true,
+        VK_BLEND_FACTOR_CONSTANT_COLOR,
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_OP_ADD,
+        VK_BLEND_FACTOR_CONSTANT_COLOR,
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_OP_ADD);
+    if (!createFinalPipeline(fogFragModule, finalFogBlendAttachment, &GraphicsFinalFogPipeline))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics final-fog pipeline");
+        return false;
+    }
+
+    vkDestroyShaderModule(Device, rasterVertModule, nullptr);
+    vkDestroyShaderModule(Device, rasterFragModule, nullptr);
+    vkDestroyShaderModule(Device, noColorFragModule, nullptr);
+    vkDestroyShaderModule(Device, clearFragModule, nullptr);
+    vkDestroyShaderModule(Device, finalVertModule, nullptr);
+    vkDestroyShaderModule(Device, edgeFragModule, nullptr);
+    vkDestroyShaderModule(Device, fogFragModule, nullptr);
+
+    GraphicsReady = true;
+    return true;
+}
+
 bool VulkanRenderer3D::ensureRenderTarget(u32 width, u32 height)
 {
     if (width == 0 || height == 0)
         return false;
 
-    if (ColorImage != VK_NULL_HANDLE && ColorImageWidth == width && ColorImageHeight == height)
+    const bool graphicsAttachmentsReady = !GraphicsReady
+        || (AttrImage != VK_NULL_HANDLE
+            && DepthImage != VK_NULL_HANDLE
+            && DepthStencilImage != VK_NULL_HANDLE
+            && GraphicsRasterFramebuffer != VK_NULL_HANDLE
+            && GraphicsFinalFramebuffer != VK_NULL_HANDLE);
+    if (ColorImage != VK_NULL_HANDLE && ColorImageWidth == width && ColorImageHeight == height && graphicsAttachmentsReady)
         return true;
 
     if ((ColorImage != VK_NULL_HANDLE
@@ -2593,80 +4712,161 @@ bool VulkanRenderer3D::ensureRenderTarget(u32 width, u32 height)
     destroyResultBuffer();
     destroyRenderTarget();
 
-    VkImageCreateInfo imageCreateInfo{};
-    imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    imageCreateInfo.extent.width = width;
-    imageCreateInfo.extent.height = height;
-    imageCreateInfo.extent.depth = 1;
-    imageCreateInfo.mipLevels = 1;
-    imageCreateInfo.arrayLayers = 1;
-    imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageCreateInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    const auto createImage = [&](VkFormat format,
+                                 VkImageUsageFlags usage,
+                                 VkImageAspectFlags aspectMask,
+                                 VkImage& image,
+                                 VkDeviceMemory& memory,
+                                 VkImageView& view) -> bool {
+        VkImageCreateInfo imageCreateInfo{};
+        imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageCreateInfo.format = format;
+        imageCreateInfo.extent.width = width;
+        imageCreateInfo.extent.height = height;
+        imageCreateInfo.extent.depth = 1;
+        imageCreateInfo.mipLevels = 1;
+        imageCreateInfo.arrayLayers = 1;
+        imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageCreateInfo.usage = usage;
+        imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    if (vkCreateImage(Device, &imageCreateInfo, nullptr, &ColorImage) != VK_SUCCESS)
+        if (vkCreateImage(Device, &imageCreateInfo, nullptr, &image) != VK_SUCCESS)
+            return false;
+
+        VkMemoryRequirements memoryRequirements{};
+        vkGetImageMemoryRequirements(Device, image, &memoryRequirements);
+
+        VkMemoryAllocateInfo memoryAllocateInfo{};
+        memoryAllocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memoryAllocateInfo.allocationSize = memoryRequirements.size;
+        memoryAllocateInfo.memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryAllocateInfo.memoryTypeIndex == UINT32_MAX)
+            memoryAllocateInfo.memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, 0);
+        if (memoryAllocateInfo.memoryTypeIndex == UINT32_MAX)
+            return false;
+
+        if (vkAllocateMemory(Device, &memoryAllocateInfo, nullptr, &memory) != VK_SUCCESS)
+            return false;
+
+        if (vkBindImageMemory(Device, image, memory, 0) != VK_SUCCESS)
+            return false;
+
+        VkImageViewCreateInfo imageViewCreateInfo{};
+        imageViewCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        imageViewCreateInfo.image = image;
+        imageViewCreateInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        imageViewCreateInfo.format = format;
+        imageViewCreateInfo.subresourceRange.aspectMask = aspectMask;
+        imageViewCreateInfo.subresourceRange.baseMipLevel = 0;
+        imageViewCreateInfo.subresourceRange.levelCount = 1;
+        imageViewCreateInfo.subresourceRange.baseArrayLayer = 0;
+        imageViewCreateInfo.subresourceRange.layerCount = 1;
+
+        return vkCreateImageView(Device, &imageViewCreateInfo, nullptr, &view) == VK_SUCCESS;
+    };
+
+    if (!createImage(
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            ColorImage,
+            ColorImageMemory,
+            ColorImageView))
     {
-        Log(LogLevel::Error, "VulkanRenderer3D: failed to create color image");
-        return false;
-    }
-
-    VkMemoryRequirements imageMemoryRequirements{};
-    vkGetImageMemoryRequirements(Device, ColorImage, &imageMemoryRequirements);
-
-    VkMemoryAllocateInfo memoryAllocateInfo{};
-    memoryAllocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    memoryAllocateInfo.allocationSize = imageMemoryRequirements.size;
-    memoryAllocateInfo.memoryTypeIndex = findMemoryType(imageMemoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (memoryAllocateInfo.memoryTypeIndex == UINT32_MAX)
-        memoryAllocateInfo.memoryTypeIndex = findMemoryType(imageMemoryRequirements.memoryTypeBits, 0);
-    if (memoryAllocateInfo.memoryTypeIndex == UINT32_MAX)
-    {
-        Log(LogLevel::Error, "VulkanRenderer3D: unable to find memory type for color image");
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create color target");
         destroyRenderTarget();
         return false;
     }
 
-    if (vkAllocateMemory(Device, &memoryAllocateInfo, nullptr, &ColorImageMemory) != VK_SUCCESS)
+    if (GraphicsReady)
     {
-        Log(LogLevel::Error, "VulkanRenderer3D: failed to allocate image memory");
-        destroyRenderTarget();
-        return false;
-    }
+        if (!createImage(
+                VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                AttrImage,
+                AttrImageMemory,
+                AttrImageView))
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create attr target");
+            destroyRenderTarget();
+            return false;
+        }
 
-    if (vkBindImageMemory(Device, ColorImage, ColorImageMemory, 0) != VK_SUCCESS)
-    {
-        Log(LogLevel::Error, "VulkanRenderer3D: failed to bind image memory");
-        destroyRenderTarget();
-        return false;
-    }
+        if (!createImage(
+                VK_FORMAT_R32_SFLOAT,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                DepthImage,
+                DepthImageMemory,
+                DepthImageView))
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create depth-color target");
+            destroyRenderTarget();
+            return false;
+        }
 
-    VkImageViewCreateInfo imageViewCreateInfo{};
-    imageViewCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    imageViewCreateInfo.image = ColorImage;
-    imageViewCreateInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    imageViewCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    imageViewCreateInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    imageViewCreateInfo.subresourceRange.baseMipLevel = 0;
-    imageViewCreateInfo.subresourceRange.levelCount = 1;
-    imageViewCreateInfo.subresourceRange.baseArrayLayer = 0;
-    imageViewCreateInfo.subresourceRange.layerCount = 1;
+        if (!createImage(
+                GraphicsDepthStencilFormat,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                DepthStencilImage,
+                DepthStencilImageMemory,
+                DepthStencilImageView))
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create depth-stencil target");
+            destroyRenderTarget();
+            return false;
+        }
 
-    if (vkCreateImageView(Device, &imageViewCreateInfo, nullptr, &ColorImageView) != VK_SUCCESS)
-    {
-        Log(LogLevel::Error, "VulkanRenderer3D: failed to create image view");
-        destroyRenderTarget();
-        return false;
+        std::array<VkImageView, 4> rasterAttachments = {
+            ColorImageView,
+            AttrImageView,
+            DepthImageView,
+            DepthStencilImageView,
+        };
+        VkFramebufferCreateInfo rasterFramebufferCreateInfo{};
+        rasterFramebufferCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        rasterFramebufferCreateInfo.renderPass = GraphicsRasterRenderPass;
+        rasterFramebufferCreateInfo.attachmentCount = static_cast<u32>(rasterAttachments.size());
+        rasterFramebufferCreateInfo.pAttachments = rasterAttachments.data();
+        rasterFramebufferCreateInfo.width = width;
+        rasterFramebufferCreateInfo.height = height;
+        rasterFramebufferCreateInfo.layers = 1;
+        if (vkCreateFramebuffer(Device, &rasterFramebufferCreateInfo, nullptr, &GraphicsRasterFramebuffer) != VK_SUCCESS)
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics raster framebuffer");
+            destroyRenderTarget();
+            return false;
+        }
+
+        VkFramebufferCreateInfo finalFramebufferCreateInfo{};
+        finalFramebufferCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        finalFramebufferCreateInfo.renderPass = GraphicsFinalRenderPass;
+        finalFramebufferCreateInfo.attachmentCount = 1;
+        finalFramebufferCreateInfo.pAttachments = &ColorImageView;
+        finalFramebufferCreateInfo.width = width;
+        finalFramebufferCreateInfo.height = height;
+        finalFramebufferCreateInfo.layers = 1;
+        if (vkCreateFramebuffer(Device, &finalFramebufferCreateInfo, nullptr, &GraphicsFinalFramebuffer) != VK_SUCCESS)
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics final framebuffer");
+            destroyRenderTarget();
+            return false;
+        }
     }
 
     ColorImageWidth = width;
     ColorImageHeight = height;
     ColorImageInitialized = false;
 
+    invalidateAllDescriptorSetCaches();
+    invalidateAllGraphicsDescriptorSetCaches();
     updateDescriptorSet(nullptr);
+    updateGraphicsDescriptorSet(nullptr);
 
     return true;
 }
@@ -2674,6 +4874,73 @@ bool VulkanRenderer3D::ensureRenderTarget(u32 width, u32 height)
 void VulkanRenderer3D::destroyRenderTarget()
 {
     invalidateAllDescriptorSetCaches();
+    invalidateAllGraphicsDescriptorSetCaches();
+
+    if (GraphicsFinalFramebuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyFramebuffer(Device, GraphicsFinalFramebuffer, nullptr);
+        GraphicsFinalFramebuffer = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsRasterFramebuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyFramebuffer(Device, GraphicsRasterFramebuffer, nullptr);
+        GraphicsRasterFramebuffer = VK_NULL_HANDLE;
+    }
+
+    if (DepthStencilImageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(Device, DepthStencilImageView, nullptr);
+        DepthStencilImageView = VK_NULL_HANDLE;
+    }
+
+    if (DepthStencilImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(Device, DepthStencilImage, nullptr);
+        DepthStencilImage = VK_NULL_HANDLE;
+    }
+
+    if (DepthStencilImageMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(Device, DepthStencilImageMemory, nullptr);
+        DepthStencilImageMemory = VK_NULL_HANDLE;
+    }
+
+    if (DepthImageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(Device, DepthImageView, nullptr);
+        DepthImageView = VK_NULL_HANDLE;
+    }
+
+    if (DepthImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(Device, DepthImage, nullptr);
+        DepthImage = VK_NULL_HANDLE;
+    }
+
+    if (DepthImageMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(Device, DepthImageMemory, nullptr);
+        DepthImageMemory = VK_NULL_HANDLE;
+    }
+
+    if (AttrImageView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(Device, AttrImageView, nullptr);
+        AttrImageView = VK_NULL_HANDLE;
+    }
+
+    if (AttrImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(Device, AttrImage, nullptr);
+        AttrImage = VK_NULL_HANDLE;
+    }
+
+    if (AttrImageMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(Device, AttrImageMemory, nullptr);
+        AttrImageMemory = VK_NULL_HANDLE;
+    }
 
     if (ColorImageView != VK_NULL_HANDLE)
     {
@@ -2767,6 +5034,178 @@ void VulkanRenderer3D::destroyTriangleBuffer(RenderContext* context)
     }
 
     triangleBufferSize = 0;
+}
+
+bool VulkanRenderer3D::ensureGraphicsVertexBuffer(RenderContext* context, size_t vertexCount)
+{
+    static_assert(sizeof(GraphicsVertexGpu) == 56u, "GraphicsVertexGpu layout must match vertex shader inputs");
+    static_assert(offsetof(GraphicsVertexGpu, x) == 0u, "GraphicsVertexGpu.x offset mismatch");
+    static_assert(offsetof(GraphicsVertexGpu, u) == 16u, "GraphicsVertexGpu.u offset mismatch");
+    static_assert(offsetof(GraphicsVertexGpu, colorRgba8) == 24u, "GraphicsVertexGpu.colorRgba8 offset mismatch");
+    static_assert(offsetof(GraphicsVertexGpu, flags) == 28u, "GraphicsVertexGpu.flags offset mismatch");
+    static_assert(offsetof(GraphicsVertexGpu, texHeight) == 44u, "GraphicsVertexGpu.texHeight offset mismatch");
+    VkBuffer& graphicsVertexBuffer = context != nullptr ? context->GraphicsVertexBuffer : GraphicsVertexBuffer;
+    VkDeviceMemory& graphicsVertexMemory = context != nullptr ? context->GraphicsVertexMemory : GraphicsVertexMemory;
+    VkDeviceSize& graphicsVertexBufferSize = context != nullptr ? context->GraphicsVertexBufferSize : GraphicsVertexBufferSize;
+    void*& graphicsVertexMapped = context != nullptr ? context->GraphicsVertexMapped : GraphicsVertexMapped;
+    const size_t requiredVertexCount = std::max<size_t>(1, vertexCount);
+    const VkDeviceSize requiredSize = static_cast<VkDeviceSize>(requiredVertexCount * sizeof(GraphicsVertexGpu));
+    if (graphicsVertexBuffer != VK_NULL_HANDLE && graphicsVertexBufferSize >= requiredSize)
+        return true;
+
+    destroyGraphicsVertexBuffer(context);
+
+    if (!createBufferAllocation(
+            Device,
+            [&](u32 typeBits, VkMemoryPropertyFlags properties) { return findMemoryType(typeBits, properties); },
+            requiredSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            graphicsVertexBuffer,
+            graphicsVertexMemory,
+            &graphicsVertexMapped))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to allocate graphics vertex buffer");
+        destroyGraphicsVertexBuffer(context);
+        return false;
+    }
+
+    graphicsVertexBufferSize = requiredSize;
+    return true;
+}
+
+void VulkanRenderer3D::destroyGraphicsVertexBuffer(RenderContext* context)
+{
+    VkBuffer& graphicsVertexBuffer = context != nullptr ? context->GraphicsVertexBuffer : GraphicsVertexBuffer;
+    VkDeviceMemory& graphicsVertexMemory = context != nullptr ? context->GraphicsVertexMemory : GraphicsVertexMemory;
+    VkDeviceSize& graphicsVertexBufferSize = context != nullptr ? context->GraphicsVertexBufferSize : GraphicsVertexBufferSize;
+    void*& graphicsVertexMapped = context != nullptr ? context->GraphicsVertexMapped : GraphicsVertexMapped;
+
+    if (graphicsVertexMapped != nullptr)
+    {
+        vkUnmapMemory(Device, graphicsVertexMemory);
+        graphicsVertexMapped = nullptr;
+    }
+
+    if (graphicsVertexBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(Device, graphicsVertexBuffer, nullptr);
+        graphicsVertexBuffer = VK_NULL_HANDLE;
+    }
+
+    if (graphicsVertexMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(Device, graphicsVertexMemory, nullptr);
+        graphicsVertexMemory = VK_NULL_HANDLE;
+    }
+
+    graphicsVertexBufferSize = 0;
+}
+
+bool VulkanRenderer3D::ensureGraphicsSceneVertexBuffer(size_t vertexCount)
+{
+    static_assert(sizeof(GraphicsVertexGpu) == 56u, "GraphicsVertexGpu layout must match vertex shader inputs");
+    const size_t requiredVertexCount = std::max<size_t>(1, vertexCount);
+    const VkDeviceSize requiredSize = static_cast<VkDeviceSize>(requiredVertexCount * sizeof(GraphicsVertexGpu));
+    if (GraphicsSceneVertexBuffer != VK_NULL_HANDLE && GraphicsSceneVertexBufferSize >= requiredSize)
+        return true;
+
+    destroyGraphicsSceneVertexBuffer();
+
+    if (!createBufferAllocation(
+            Device,
+            [&](u32 typeBits, VkMemoryPropertyFlags properties) { return findMemoryType(typeBits, properties); },
+            requiredSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            GraphicsSceneVertexBuffer,
+            GraphicsSceneVertexMemory,
+            &GraphicsSceneVertexMapped))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to allocate graphics scene vertex buffer");
+        destroyGraphicsSceneVertexBuffer();
+        return false;
+    }
+
+    GraphicsSceneVertexBufferSize = requiredSize;
+    return true;
+}
+
+void VulkanRenderer3D::destroyGraphicsSceneVertexBuffer()
+{
+    if (GraphicsSceneVertexMapped != nullptr)
+    {
+        vkUnmapMemory(Device, GraphicsSceneVertexMemory);
+        GraphicsSceneVertexMapped = nullptr;
+    }
+
+    if (GraphicsSceneVertexBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(Device, GraphicsSceneVertexBuffer, nullptr);
+        GraphicsSceneVertexBuffer = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsSceneVertexMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(Device, GraphicsSceneVertexMemory, nullptr);
+        GraphicsSceneVertexMemory = VK_NULL_HANDLE;
+    }
+
+    GraphicsSceneVertexBufferSize = 0;
+}
+
+bool VulkanRenderer3D::ensureGraphicsEdgeIndexBuffer(size_t indexCount)
+{
+    const size_t requiredIndexCount = std::max<size_t>(1, indexCount);
+    const VkDeviceSize requiredSize = static_cast<VkDeviceSize>(requiredIndexCount * sizeof(u16));
+    if (GraphicsEdgeIndexBuffer != VK_NULL_HANDLE && GraphicsEdgeIndexBufferSize >= requiredSize)
+        return true;
+
+    destroyGraphicsEdgeIndexBuffer();
+
+    if (!createBufferAllocation(
+            Device,
+            [&](u32 typeBits, VkMemoryPropertyFlags properties) { return findMemoryType(typeBits, properties); },
+            requiredSize,
+            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            GraphicsEdgeIndexBuffer,
+            GraphicsEdgeIndexMemory,
+            &GraphicsEdgeIndexMapped))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to allocate graphics edge index buffer");
+        destroyGraphicsEdgeIndexBuffer();
+        return false;
+    }
+
+    GraphicsEdgeIndexBufferSize = requiredSize;
+    return true;
+}
+
+void VulkanRenderer3D::destroyGraphicsEdgeIndexBuffer()
+{
+    if (GraphicsEdgeIndexMapped != nullptr)
+    {
+        vkUnmapMemory(Device, GraphicsEdgeIndexMemory);
+        GraphicsEdgeIndexMapped = nullptr;
+    }
+
+    if (GraphicsEdgeIndexBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(Device, GraphicsEdgeIndexBuffer, nullptr);
+        GraphicsEdgeIndexBuffer = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsEdgeIndexMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(Device, GraphicsEdgeIndexMemory, nullptr);
+        GraphicsEdgeIndexMemory = VK_NULL_HANDLE;
+    }
+
+    GraphicsEdgeIndexBufferSize = 0;
 }
 
 bool VulkanRenderer3D::ensureCpuBinBuffers(RenderContext& context, size_t triangleCount, u32 width, u32 height)
@@ -3406,8 +5845,156 @@ bool VulkanRenderer3D::updateToonBuffer(RenderContext* context, const u16* toonT
     return true;
 }
 
+bool VulkanRenderer3D::ensureGraphicsClearBuffer(RenderContext* context)
+{
+    VkBuffer& clearBuffer = context != nullptr ? context->ClearBuffer : ClearBuffer;
+    VkDeviceMemory& clearMemory = context != nullptr ? context->ClearMemory : ClearMemory;
+    VkDeviceSize& clearBufferSize = context != nullptr ? context->ClearBufferSize : ClearBufferSize;
+    void*& clearMapped = context != nullptr ? context->ClearMapped : ClearMapped;
+    constexpr VkDeviceSize requiredSize = static_cast<VkDeviceSize>(256u * 192u * 3u) * sizeof(u32);
+
+    if (clearBuffer != VK_NULL_HANDLE && clearBufferSize >= requiredSize && clearMapped != nullptr)
+    {
+        updateGraphicsDescriptorSet(context);
+        return true;
+    }
+
+    destroyGraphicsClearBuffer(context);
+
+    if (!createBufferAllocation(
+            Device,
+            [&](u32 typeBits, VkMemoryPropertyFlags properties) { return findMemoryType(typeBits, properties); },
+            requiredSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            clearBuffer,
+            clearMemory,
+            &clearMapped))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to allocate graphics clear buffer");
+        destroyGraphicsClearBuffer(context);
+        return false;
+    }
+
+    clearBufferSize = requiredSize;
+    updateGraphicsDescriptorSet(context);
+    return true;
+}
+
+void VulkanRenderer3D::destroyGraphicsClearBuffer(RenderContext* context)
+{
+    if (context != nullptr)
+        invalidateGraphicsDescriptorSetCache(context);
+    else
+        invalidateAllGraphicsDescriptorSetCaches();
+
+    VkBuffer& clearBuffer = context != nullptr ? context->ClearBuffer : ClearBuffer;
+    VkDeviceMemory& clearMemory = context != nullptr ? context->ClearMemory : ClearMemory;
+    VkDeviceSize& clearBufferSize = context != nullptr ? context->ClearBufferSize : ClearBufferSize;
+    void*& clearMapped = context != nullptr ? context->ClearMapped : ClearMapped;
+
+    if (clearMapped != nullptr && clearMemory != VK_NULL_HANDLE)
+    {
+        vkUnmapMemory(Device, clearMemory);
+        clearMapped = nullptr;
+    }
+
+    if (clearBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(Device, clearBuffer, nullptr);
+        clearBuffer = VK_NULL_HANDLE;
+    }
+
+    if (clearMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(Device, clearMemory, nullptr);
+        clearMemory = VK_NULL_HANDLE;
+    }
+
+    clearBufferSize = 0;
+}
+
+bool VulkanRenderer3D::updateGraphicsClearBuffer(RenderContext* context, const GPU& gpu)
+{
+    const void* clearMapped = context != nullptr ? context->ClearMapped : ClearMapped;
+    const VkBuffer clearBuffer = context != nullptr ? context->ClearBuffer : ClearBuffer;
+    const VkDeviceMemory clearMemory = context != nullptr ? context->ClearMemory : ClearMemory;
+
+    if (clearBuffer == VK_NULL_HANDLE || clearMemory == VK_NULL_HANDLE || clearMapped == nullptr)
+        return false;
+
+    u32* clearWords = reinterpret_cast<u32*>(const_cast<void*>(clearMapped));
+    constexpr size_t clearPixelCount = 256u * 192u;
+    u32* clearColorWords = clearWords;
+    u32* clearAttrWords = clearWords + clearPixelCount;
+    u32* clearDepthWords = clearWords + (clearPixelCount * 2u);
+
+    const u32 clearAttr1 = gpu.GPU3D.RenderClearAttr1;
+    const u32 clearAttr2 = gpu.GPU3D.RenderClearAttr2;
+    const u32 clearPolyId = (clearAttr1 >> 24u) & 0x3Fu;
+    const u32 clearFogFlag = (clearAttr1 >> 15u) & 0x1u;
+    const u32 clearColor = Debug3dClearMagenta ? 0xFFFF00FFu : buildClearColorRgba8(gpu);
+    const u32 clearDepth = ((clearAttr2 & 0x7FFFu) * 0x200u) + 0x1FFu;
+    const u32 clearPolyIdByte = ((clearPolyId * 255u) + 31u) / 63u;
+    const u32 clearFogByte = clearFogFlag != 0u ? 0xFFu : 0u;
+    const u32 plainAttr = clearPolyIdByte | (clearFogByte << 16u) | 0xFF000000u;
+    const u32 clearDepthBits = BitCastFloatToU32(static_cast<float>(clearDepth) * (1.0f / 16777215.0f));
+
+    if ((gpu.GPU3D.RenderDispCnt & (1u << 14u)) == 0u)
+    {
+        std::fill_n(clearColorWords, clearPixelCount, clearColor);
+        std::fill_n(clearAttrWords, clearPixelCount, plainAttr);
+        std::fill_n(clearDepthWords, clearPixelCount, clearDepthBits);
+        return true;
+    }
+
+    u8 baseXOff = (clearAttr2 >> 16u) & 0xFFu;
+    u8 yOff = (clearAttr2 >> 24u) & 0xFFu;
+
+    for (u32 y = 0; y < 192u; y++)
+    {
+        u8 xOff = baseXOff;
+        for (u32 x = 0; x < 256u; x++)
+        {
+            const size_t offset = static_cast<size_t>(y) * 256u + x;
+            const u16 colorSource = gpu.ReadVRAMFlat_Texture<u16>(0x40000u + (static_cast<u32>(yOff) << 9u) + (static_cast<u32>(xOff) << 1u));
+            const u16 depthSource = gpu.ReadVRAMFlat_Texture<u16>(0x60000u + (static_cast<u32>(yOff) << 9u) + (static_cast<u32>(xOff) << 1u));
+
+            u32 r = (static_cast<u32>(colorSource) << 1u) & 0x3Eu;
+            u32 g = (static_cast<u32>(colorSource) >> 4u) & 0x3Eu;
+            u32 b = (static_cast<u32>(colorSource) >> 9u) & 0x3Eu;
+            if (r) r++;
+            if (g) g++;
+            if (b) b++;
+            const u32 a = (colorSource & 0x8000u) != 0u ? 0x1Fu : 0u;
+
+            const u32 r8 = (r << 2u) | (r >> 4u);
+            const u32 g8 = (g << 2u) | (g >> 4u);
+            const u32 b8 = (b << 2u) | (b >> 4u);
+            const u32 a8 = (a << 3u) | (a >> 2u);
+            clearColorWords[offset] = Debug3dClearMagenta ? 0xFFFF00FFu : (r8 | (g8 << 8u) | (b8 << 16u) | (a8 << 24u));
+
+            const u32 fogByte = (depthSource & 0x8000u) != 0u ? 0xFFu : 0u;
+            clearAttrWords[offset] = clearPolyIdByte | (fogByte << 16u) | 0xFF000000u;
+
+            const u32 pixelDepth = ((static_cast<u32>(depthSource & 0x7FFFu)) * 0x200u) + 0x1FFu;
+            clearDepthWords[offset] = BitCastFloatToU32(static_cast<float>(pixelDepth) * (1.0f / 16777215.0f));
+
+            xOff++;
+        }
+
+        yOff++;
+    }
+
+    return true;
+}
+
 bool VulkanRenderer3D::ensureCaptureLineBuffer(RenderContext* context)
 {
+    if (context == nullptr)
+        syncActiveCaptureLineBufferSlot();
+
     VkBuffer& captureLineBuffer = context != nullptr ? context->CaptureLineBuffer : CaptureLineBuffer;
     VkDeviceMemory& captureLineMemory = context != nullptr ? context->CaptureLineMemory : CaptureLineMemory;
     VkDeviceSize& captureLineBufferSize = context != nullptr ? context->CaptureLineBufferSize : CaptureLineBufferSize;
@@ -3440,6 +6027,8 @@ bool VulkanRenderer3D::ensureCaptureLineBuffer(RenderContext* context)
 
     std::memset(captureLineMapped, 0, static_cast<size_t>(requiredSize));
     captureLineBufferSize = requiredSize;
+    if (context == nullptr)
+        storeActiveCaptureLineBufferSlot();
     updateDescriptorSet(context);
     return true;
 }
@@ -3477,7 +6066,23 @@ void VulkanRenderer3D::destroyCaptureLineBuffer(RenderContext* context)
     captureLineBufferSize = 0;
 
     if (context == nullptr)
+    {
+        storeActiveCaptureLineBufferSlot();
         resetCaptureLineState();
+    }
+}
+
+void VulkanRenderer3D::destroyAllCaptureLineBuffers()
+{
+    const u32 previousSlot = ActiveCaptureLineBufferSlot;
+    for (u32 slot = 0; slot < CaptureLineBufferSlotCount; slot++)
+    {
+        selectActiveCaptureLineBufferSlot(slot);
+        destroyCaptureLineBuffer(nullptr);
+    }
+    ActiveCaptureLineBufferSlot = std::min<u32>(previousSlot, CaptureLineBufferSlotCount - 1u);
+    syncActiveCaptureLineBufferSlot();
+    resetCaptureLineState();
 }
 
 bool VulkanRenderer3D::createFallbackTexture()
@@ -4032,6 +6637,37 @@ u32 VulkanRenderer3D::getTextureBindingDescriptorCount() const noexcept
     return MaxTextureDescriptors;
 }
 
+VulkanRenderer3D::BackendMode VulkanRenderer3D::resolveRequestedBackendMode() const noexcept
+{
+    if (RequestedBackendMode == BackendMode::ComputeLegacy)
+        return RequestedBackendMode;
+    return BackendMode::GraphicsHardware;
+}
+
+void VulkanRenderer3D::refreshActiveBackendMode() noexcept
+{
+    ActiveBackendMode = resolveRequestedBackendMode();
+}
+
+void VulkanRenderer3D::InvalidatePresentationState(bool discardColorTarget) noexcept
+{
+    FrameIdentical = false;
+    HasCpuFrame = false;
+    LastSubmittedRenderPolygonCount = 0;
+    CaptureDebugLogsRemaining = MelonDSAndroid::areRendererDebugToolsEnabled() ? 48u : 0u;
+    CaptureReadbackPending = false;
+    PendingCaptureReadbackContext = nullptr;
+    RawReadbackWidth = 0;
+    RawReadbackHeight = 0;
+    RawReadbackRgba.clear();
+    CaptureReadbackImageInitialized = false;
+    resetCaptureLineState();
+    clearLineCache();
+    LastSubmittedRenderContext = nullptr;
+    if (discardColorTarget)
+        ColorImageInitialized = false;
+}
+
 VulkanRenderer3D::TextureSamplingPath VulkanRenderer3D::resolveTextureSamplingPath() const noexcept
 {
     if (!VulkanContext::Get().SupportsDynamicTextureIndexing())
@@ -4051,6 +6687,88 @@ const char* VulkanRenderer3D::textureSamplingPathName(TextureSamplingPath path) 
             return "compat-dynamic-uniform";
         case TextureSamplingPath::NonUniform:
             return "nonuniform";
+    }
+    return "unknown";
+}
+
+const char* VulkanRenderer3D::backendModeName(BackendMode mode) noexcept
+{
+    switch (mode)
+    {
+        case BackendMode::GraphicsHardware:
+            return "simple_graphics";
+        case BackendMode::ComputeLegacy:
+            return "compute_legacy";
+    }
+    return "unknown";
+}
+
+const char* VulkanRenderer3D::rasterExecutionProfileName(RasterExecutionProfile profile) noexcept
+{
+    switch (profile)
+    {
+        case RasterExecutionProfile::AdrenoCpuDense:
+            return "adreno_cpu_dense";
+        case RasterExecutionProfile::AdrenoCpuSparse:
+            return "adreno_cpu_sparse";
+        case RasterExecutionProfile::MaliDenseScan:
+            return "mali_dense_scan";
+        case RasterExecutionProfile::MaliCpuDense:
+            return "mali_cpu_dense";
+        case RasterExecutionProfile::GeneralNonUniform:
+            return "general_nonuniform";
+        case RasterExecutionProfile::LegacyFallback:
+            return "legacy_fallback";
+        case RasterExecutionProfile::Count:
+            break;
+    }
+    return "unknown";
+}
+
+const char* VulkanRenderer3D::rasterSceneModeName(RasterSceneMode mode) noexcept
+{
+    switch (mode)
+    {
+        case RasterSceneMode::DenseNoBoundary:
+            return "dense_no_boundary";
+        case RasterSceneMode::DenseBoundary:
+            return "dense_boundary";
+        case RasterSceneMode::SparseActive:
+            return "sparse_active";
+        case RasterSceneMode::Count:
+            break;
+    }
+    return "unknown";
+}
+
+const char* VulkanRenderer3D::rasterTileLoopModeName(RasterTileLoopMode mode) noexcept
+{
+    switch (mode)
+    {
+        case RasterTileLoopMode::DenseGroupList:
+            return "dense_group_list";
+        case RasterTileLoopMode::SparseActive:
+            return "sparse_active";
+        case RasterTileLoopMode::LegacyWorklist:
+            return "legacy_worklist";
+        case RasterTileLoopMode::Count:
+            break;
+    }
+    return "unknown";
+}
+
+const char* VulkanRenderer3D::capturePathModeName(CapturePathMode mode) noexcept
+{
+    switch (mode)
+    {
+        case CapturePathMode::Disabled:
+            return "disabled";
+        case CapturePathMode::CaptureLineExport:
+            return "capture_line";
+        case CapturePathMode::FallbackReadback:
+            return "fallback_readback";
+        case CapturePathMode::Count:
+            break;
     }
     return "unknown";
 }
@@ -4075,6 +6793,11 @@ VulkanRenderer3D::DescriptorSetCache& VulkanRenderer3D::getDescriptorSetCache(Re
     return context != nullptr
         ? context->SingleTextureDescriptorCaches[resolvedDescriptorIndex]
         : SingleTextureDescriptorCaches[resolvedDescriptorIndex];
+}
+
+VulkanRenderer3D::GraphicsDescriptorSetCache& VulkanRenderer3D::getGraphicsDescriptorSetCache(RenderContext* context)
+{
+    return context != nullptr ? context->GraphicsDescriptorCache : GraphicsDescriptorCache;
 }
 
 void VulkanRenderer3D::invalidateDescriptorSetCache(RenderContext* context)
@@ -4112,6 +6835,18 @@ void VulkanRenderer3D::invalidateAllDescriptorSetCaches()
         for (DescriptorSetCache& cache : renderContext.SingleTextureDescriptorCaches)
             cache.Ready = false;
     }
+}
+
+void VulkanRenderer3D::invalidateGraphicsDescriptorSetCache(RenderContext* context)
+{
+    getGraphicsDescriptorSetCache(context).Ready = false;
+}
+
+void VulkanRenderer3D::invalidateAllGraphicsDescriptorSetCaches()
+{
+    GraphicsDescriptorCache.Ready = false;
+    for (RenderContext& renderContext : RenderContexts)
+        renderContext.GraphicsDescriptorCache.Ready = false;
 }
 
 void VulkanRenderer3D::updateDescriptorSet(RenderContext* context, u32 singleTextureDescriptorIndex)
@@ -4294,6 +7029,147 @@ void VulkanRenderer3D::updateDescriptorSet(RenderContext* context, u32 singleTex
     descriptorCache.TextureInfos = textureInfos;
 }
 
+bool VulkanRenderer3D::updateCaptureExportDescriptorSet(RenderContext* context)
+{
+    const VkDescriptorSet descriptorSet = getDescriptorSet(context, FallbackTextureDescriptorIndex);
+    const VkBuffer captureLineBuffer = context != nullptr ? context->CaptureLineBuffer : this->CaptureLineBuffer;
+    if (descriptorSet == VK_NULL_HANDLE || ColorImageView == VK_NULL_HANDLE || captureLineBuffer == VK_NULL_HANDLE)
+        return false;
+
+    DescriptorSetCache& descriptorCache = getDescriptorSetCache(context, FallbackTextureDescriptorIndex);
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.imageView = ColorImageView;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorBufferInfo captureLineInfo{};
+    captureLineInfo.buffer = captureLineBuffer;
+    captureLineInfo.offset = 0;
+    captureLineInfo.range = VK_WHOLE_SIZE;
+
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    u32 writeCount = 0;
+    if (!descriptorCache.Ready || descriptorCache.ColorImageView != ColorImageView)
+        writes[writeCount++] = makeImageDescriptorWrite(descriptorSet, 0, &imageInfo, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    if (!descriptorCache.Ready || descriptorCache.CaptureLineBuffer != captureLineBuffer)
+        writes[writeCount++] = makeBufferDescriptorWrite(descriptorSet, 9, &captureLineInfo);
+
+    if (writeCount > 0)
+        vkUpdateDescriptorSets(Device, writeCount, writes.data(), 0, nullptr);
+
+    descriptorCache.Ready = true;
+    descriptorCache.ColorImageView = ColorImageView;
+    descriptorCache.CaptureLineBuffer = captureLineBuffer;
+    return true;
+}
+
+void VulkanRenderer3D::updateGraphicsDescriptorSet(RenderContext* context)
+{
+    const VkDescriptorSet descriptorSet = context != nullptr ? context->GraphicsDescriptorSet : GraphicsDescriptorSet;
+    const VkBuffer triangleBuffer = context != nullptr ? context->TriangleBuffer : TriangleBuffer;
+    const VkBuffer toonBuffer = context != nullptr ? context->ToonBuffer : ToonBuffer;
+    const VkBuffer clearBuffer = context != nullptr ? context->ClearBuffer : ClearBuffer;
+
+    if (descriptorSet == VK_NULL_HANDLE
+        || triangleBuffer == VK_NULL_HANDLE
+        || toonBuffer == VK_NULL_HANDLE
+        || clearBuffer == VK_NULL_HANDLE
+        || AttrImageView == VK_NULL_HANDLE
+        || DepthImageView == VK_NULL_HANDLE
+        || GraphicsAttachmentSampler == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    GraphicsDescriptorSetCache& descriptorCache = getGraphicsDescriptorSetCache(context);
+
+    VkDescriptorBufferInfo triangleInfo{};
+    triangleInfo.buffer = triangleBuffer;
+    triangleInfo.offset = 0;
+    triangleInfo.range = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo toonInfo{};
+    toonInfo.buffer = toonBuffer;
+    toonInfo.offset = 0;
+    toonInfo.range = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo clearInfo{};
+    clearInfo.buffer = clearBuffer;
+    clearInfo.offset = 0;
+    clearInfo.range = VK_WHOLE_SIZE;
+
+    std::array<VkDescriptorImageInfo, MaxTextureDescriptors> textureInfos{};
+    VkDescriptorImageInfo fallbackInfo{};
+    fallbackInfo.sampler = FallbackTextureSampler;
+    fallbackInfo.imageView = FallbackTextureView;
+    fallbackInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    textureInfos.fill(fallbackInfo);
+    for (u32 i = 0; i < ActiveTextureDescriptorCount && i < MaxActiveTextureDescriptors; i++)
+        textureInfos[i] = ActiveTextureDescriptors[i];
+
+    VkDescriptorImageInfo attrInfo{};
+    attrInfo.sampler = GraphicsAttachmentSampler;
+    attrInfo.imageView = AttrImageView;
+    attrInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorImageInfo depthInfo{};
+    depthInfo.sampler = GraphicsAttachmentSampler;
+    depthInfo.imageView = DepthImageView;
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    std::array<VkWriteDescriptorSet, 6> writes{};
+    u32 writeCount = 0;
+
+    if (!descriptorCache.Ready || descriptorCache.TriangleBuffer != triangleBuffer)
+        writes[writeCount++] = makeBufferDescriptorWrite(descriptorSet, 0, &triangleInfo);
+
+    bool texturesChanged = !descriptorCache.Ready;
+    if (!texturesChanged)
+    {
+        for (u32 i = 0; i < MaxTextureDescriptors; i++)
+        {
+            if (!descriptorImageInfoEquals(descriptorCache.TextureInfos[i], textureInfos[i]))
+            {
+                texturesChanged = true;
+                break;
+            }
+        }
+    }
+    if (texturesChanged)
+    {
+        writes[writeCount++] = makeImageDescriptorWrite(
+            descriptorSet,
+            1,
+            textureInfos.data(),
+            getTextureBindingDescriptorCount(),
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    }
+
+    if (!descriptorCache.Ready || descriptorCache.ToonBuffer != toonBuffer)
+        writes[writeCount++] = makeBufferDescriptorWrite(descriptorSet, 2, &toonInfo);
+
+    if (!descriptorCache.Ready || descriptorCache.AttrImageView != AttrImageView || descriptorCache.AttachmentSampler != GraphicsAttachmentSampler)
+        writes[writeCount++] = makeImageDescriptorWrite(descriptorSet, 3, &attrInfo, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+
+    if (!descriptorCache.Ready || descriptorCache.DepthImageView != DepthImageView || descriptorCache.AttachmentSampler != GraphicsAttachmentSampler)
+        writes[writeCount++] = makeImageDescriptorWrite(descriptorSet, 4, &depthInfo, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+
+    if (!descriptorCache.Ready || descriptorCache.ClearBuffer != clearBuffer)
+        writes[writeCount++] = makeBufferDescriptorWrite(descriptorSet, 5, &clearInfo);
+
+    if (writeCount > 0)
+        vkUpdateDescriptorSets(Device, writeCount, writes.data(), 0, nullptr);
+
+    descriptorCache.Ready = true;
+    descriptorCache.TriangleBuffer = triangleBuffer;
+    descriptorCache.ToonBuffer = toonBuffer;
+    descriptorCache.ClearBuffer = clearBuffer;
+    descriptorCache.AttrImageView = AttrImageView;
+    descriptorCache.DepthImageView = DepthImageView;
+    descriptorCache.AttachmentSampler = GraphicsAttachmentSampler;
+    descriptorCache.TextureInfos = textureInfos;
+}
+
 u32 VulkanRenderer3D::findMemoryType(u32 typeBits, VkMemoryPropertyFlags properties) const
 {
     return VulkanContext::Get().FindMemoryType(typeBits, properties);
@@ -4315,12 +7191,44 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     bool readbackToCpu,
     bool captureReadbackPath)
 {
-    auto hasAllRasterPipelines = [&]() -> bool {
-        for (const VkPipeline pipeline : RasterPipelines)
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        return dispatchGraphicsRasterAndReadback(
+            context,
+            rgbaColor,
+            clearDepth,
+            dispCnt,
+            alphaRef,
+            fogColor,
+            fogOffset,
+            fogShift,
+            clearAttr,
+            fogDensityTable,
+            edgeColorTable,
+            toonTable,
+            readbackToCpu,
+            captureReadbackPath);
+    }
+
+    auto hasRequiredRasterPipelines = [&]() -> bool {
+        constexpr u32 kFallbackShadeMode = RasterShadeModeCount - 1u;
+        constexpr u32 kFallbackTextureMode = RasterTextureModeCount - 1u;
+        constexpr u32 kFallbackTranslucencyMode = RasterTranslucencyModeCount - 1u;
+
+        for (u32 sceneMode = 0; sceneMode < RasterSceneModeCount; sceneMode++)
         {
-            if (pipeline == VK_NULL_HANDLE)
-                return false;
+            for (u32 rasterWMode = 0; rasterWMode < RasterWModeCount; rasterWMode++)
+            {
+                const u32 fallbackIndex =
+                    ((((sceneMode * RasterWModeCount) + rasterWMode) * RasterShadeModeCount + kFallbackShadeMode)
+                        * RasterTextureModeCount + kFallbackTextureMode)
+                    * RasterTranslucencyModeCount
+                    + kFallbackTranslucencyMode;
+                if (fallbackIndex >= RasterPipelineVariantCount || RasterPipelines[fallbackIndex] == VK_NULL_HANDLE)
+                    return false;
+            }
         }
+
         return true;
     };
 
@@ -4380,7 +7288,7 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         || WorkOffsetsPipeline == VK_NULL_HANDLE
         || SortPipeline == VK_NULL_HANDLE
         || DepthBlendPipeline == VK_NULL_HANDLE
-        || !hasAllRasterPipelines()
+        || !hasRequiredRasterPipelines()
         || !hasAllFinalPipelines()
         || ColorImage == VK_NULL_HANDLE
         || ResultBuffer == VK_NULL_HANDLE
@@ -4488,6 +7396,16 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
     constexpr u32 kDebugFlagFinalActiveTileMask = 1u << 31u;
     constexpr u32 kVariantPipelineMask = (1u << 8u) - 1u;
     constexpr u32 kTriangleFlagWBuffer = 1u << 4u;
+    constexpr u32 kTriangleFlagBoundaryEdge0 = 1u << 7u;
+    constexpr u32 kTriangleFlagBoundaryEdge1 = 1u << 8u;
+    constexpr u32 kTriangleFlagBoundaryEdge2 = 1u << 9u;
+    constexpr u32 kTriangleBoundaryEdgeMask =
+        kTriangleFlagBoundaryEdge0
+        | kTriangleFlagBoundaryEdge1
+        | kTriangleFlagBoundaryEdge2;
+    constexpr u32 kRasterSceneModeDenseNoBoundary = 0u;
+    constexpr u32 kRasterSceneModeDenseBoundary = 1u;
+    constexpr u32 kRasterSceneModeSparseActive = 2u;
     constexpr u32 kRasterWModeZ = 0u;
     constexpr u32 kRasterWModeW = 1u;
     constexpr u32 kRasterWModeAny = 2u;
@@ -4536,8 +7454,12 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
             return kRasterShadeModeModulate;
         return kRasterShadeModeAny;
     };
-    auto makeRasterPipelineIndex = [&](u32 rasterWMode, u32 rasterShadeMode, u32 rasterTextureMode, u32 rasterTranslucencyMode) -> u32 {
-        return (((rasterWMode * RasterShadeModeCount) + rasterShadeMode) * RasterTextureModeCount + rasterTextureMode)
+    auto makeRasterPipelineIndex = [&](u32 rasterSceneMode,
+                                       u32 rasterWMode,
+                                       u32 rasterShadeMode,
+                                       u32 rasterTextureMode,
+                                       u32 rasterTranslucencyMode) -> u32 {
+        return ((((rasterSceneMode * RasterWModeCount) + rasterWMode) * RasterShadeModeCount + rasterShadeMode) * RasterTextureModeCount + rasterTextureMode)
             * RasterTranslucencyModeCount
             + rasterTranslucencyMode;
     };
@@ -4928,14 +7850,17 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
 
     PassCountWindow.Add(static_cast<u64>(rasterPasses.size()));
 
+    const bool frameNeedsBoundaryAttrs = ((dispCnt & (1u << 4u)) != 0u) || ((dispCnt & (1u << 5u)) != 0u);
     auto resolveRasterModesForRange = [&](u32 triangleBase,
                                           u32 triangleCount,
                                           u32& outShadeMode,
                                           u32& outTextureMode,
-                                          u32& outTranslucencyMode) {
+                                          u32& outTranslucencyMode,
+                                          bool& outNeedsDenseBoundaryMode) {
         outShadeMode = kRasterShadeModeAny;
         outTextureMode = kRasterTextureModeAny;
         outTranslucencyMode = kRasterTranslucencyModeAny;
+        outNeedsDenseBoundaryMode = false;
 
         if (triangleCount == 0u)
             return;
@@ -4952,10 +7877,13 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
             const TriangleGpu& triangle = Triangles[triangleIndex];
             const bool isTextured = (triangle.variantKey & kVariantFlagTextured) != 0u;
             const bool isTranslucent = (triangle.variantKey & kVariantFlagTranslucent) != 0u;
+            const bool hasBoundaryEdges = (triangle.flags & kTriangleBoundaryEdgeMask) != 0u;
+            const bool isWireframe = ((triangle.polyAttr >> 16u) & 0x1Fu) == 0u;
             allTextured &= isTextured;
             allUntextured &= !isTextured;
             allTranslucent &= isTranslucent;
             allOpaque &= !isTranslucent;
+            outNeedsDenseBoundaryMode |= hasBoundaryEdges && (frameNeedsBoundaryAttrs || isWireframe);
 
             if (uniformShadeMode && resolveRasterShadeMode(triangle.variantKey) != firstShadeMode)
                 uniformShadeMode = false;
@@ -5002,12 +7930,14 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         u32 rasterShadeMode = kRasterShadeModeAny;
         u32 rasterTextureMode = kRasterTextureModeAny;
         u32 rasterTranslucencyMode = kRasterTranslucencyModeAny;
+        bool denseBoundaryMode = false;
         resolveRasterModesForRange(
             rasterPass.triangleBase,
             rasterPass.triangleCount,
             rasterShadeMode,
             rasterTextureMode,
-            rasterTranslucencyMode
+            rasterTranslucencyMode,
+            denseBoundaryMode
         );
 
         if (rasterTextureMode != kRasterTextureModeAny)
@@ -5022,18 +7952,6 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         {
             RasterSpecializedAllModesCount++;
         }
-
-        const u32 rasterPipelineIndex = makeRasterPipelineIndex(
-            rasterWMode,
-            rasterShadeMode,
-            rasterTextureMode,
-            rasterTranslucencyMode
-        );
-        if (rasterPipelineIndex >= RasterPipelineVariantCount)
-            return false;
-        VkPipeline rasterPipeline = RasterPipelines[rasterPipelineIndex];
-        if (rasterPipeline == VK_NULL_HANDLE)
-            return false;
 
         if (!useCpuDirectTiles)
         {
@@ -5101,12 +8019,12 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
             SortCpuWindow.Add(0);
             CpuDirectTilesPathCount++;
 
-            std::array<VkBufferMemoryBarrier, 4> rasterReadBarriers = {
-                spanSetupHostToReadBarrier,
-                binMaskHostToReadBarrier,
-                groupListHostToReadBarrier,
-                workOffsetHostToReadBarrier,
-            };
+            std::array<VkBufferMemoryBarrier, 3> rasterReadBarriers{};
+            rasterReadBarriers[0] = spanSetupHostToReadBarrier;
+            rasterReadBarriers[1] = binMaskHostToReadBarrier;
+            rasterReadBarriers[2] = passUsesCpuActiveTileDispatch
+                ? workOffsetHostToReadBarrier
+                : groupListHostToReadBarrier;
             vkCmdPipelineBarrier(
                 CommandBuffer,
                 VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -5266,6 +8184,48 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         cpuActiveDispatchAccum += cpuActiveDispatchSample;
         if (canUseFinalActiveTileDispatch)
             finalUsesCpuActiveTileDispatch = passUsesCpuActiveTileDispatch;
+
+        const u32 rasterSceneMode =
+            (useLegacyRasterWorklist || passUsesCpuActiveTileDispatch)
+                ? kRasterSceneModeSparseActive
+                : (denseBoundaryMode ? kRasterSceneModeDenseBoundary : kRasterSceneModeDenseNoBoundary);
+        const u32 rasterPipelineIndex = makeRasterPipelineIndex(
+            rasterSceneMode,
+            rasterWMode,
+            rasterShadeMode,
+            rasterTextureMode,
+            rasterTranslucencyMode
+        );
+        const u32 rasterFallbackPipelineIndex = makeRasterPipelineIndex(
+            rasterSceneMode,
+            rasterWMode,
+            kRasterShadeModeAny,
+            kRasterTextureModeAny,
+            kRasterTranslucencyModeAny
+        );
+        if (rasterPipelineIndex >= RasterPipelineVariantCount || rasterFallbackPipelineIndex >= RasterPipelineVariantCount)
+            return false;
+        VkPipeline rasterPipeline = RasterPipelines[rasterPipelineIndex];
+        if (rasterPipeline == VK_NULL_HANDLE)
+            rasterPipeline = RasterPipelines[rasterFallbackPipelineIndex];
+        if (rasterPipeline == VK_NULL_HANDLE)
+            return false;
+
+        if (useCpuDirectTiles)
+        {
+            ActiveRasterExecutionProfile = passUsesCpuActiveTileDispatch
+                ? (VulkanContext::Get().GetDeviceProfile().IsArmMali
+                    ? RasterExecutionProfile::MaliCpuDense
+                    : RasterExecutionProfile::AdrenoCpuSparse)
+                : (VulkanContext::Get().GetDeviceProfile().IsArmMali
+                    ? RasterExecutionProfile::MaliCpuDense
+                    : RasterExecutionProfile::AdrenoCpuDense);
+        }
+        ActiveRasterTileLoopMode = useLegacyRasterWorklist
+            ? RasterTileLoopMode::LegacyWorklist
+            : (passUsesCpuActiveTileDispatch ? RasterTileLoopMode::SparseActive : RasterTileLoopMode::DenseGroupList);
+        RasterExecutionProfileCounts[static_cast<size_t>(ActiveRasterExecutionProfile)]++;
+        RasterTileLoopModeCounts[static_cast<size_t>(ActiveRasterTileLoopMode)]++;
 
         const u64 rasterCpuStartNs = PerfNowNs();
         vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rasterPipeline);
@@ -5822,18 +8782,1538 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
         {
             CaptureLinePending = false;
             PendingCaptureLineContext = nullptr;
+            PendingCaptureLineBufferSlot = -1;
             CaptureLineReady = ReadyCaptureLineData != nullptr;
+            ReadyCaptureLineBufferSlot = CaptureLineReady ? static_cast<int>(ActiveCaptureLineBufferSlot) : -1;
         }
         else
         {
             CaptureLinePending = true;
             PendingCaptureLineContext = context;
+            PendingCaptureLineBufferSlot = -1;
             CaptureLineReady = false;
+            ReadyCaptureLineBufferSlot = -1;
         }
     }
 
     ColorImageInitialized = true;
     HasCpuFrame = readbackToCpu && !deferCaptureReadbackCompletion;
+    return true;
+}
+
+bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
+    RenderContext* context,
+    u32 rgbaColor,
+    u32 clearDepth,
+    u32 dispCnt,
+    u32 alphaRef,
+    u32 fogColor,
+    u32 fogOffset,
+    u32 fogShift,
+    u32 clearAttr,
+    const u8* fogDensityTable,
+    const u16* edgeColorTable,
+    const u16* toonTable,
+    bool readbackToCpu,
+    bool captureReadbackPath)
+{
+    constexpr u32 kTriangleFlagWBuffer = 1u << 4u;
+    constexpr u32 kCaptureReadbackWidth = 256u;
+    constexpr u32 kCaptureReadbackHeight = 192u;
+
+    if (Device == VK_NULL_HANDLE
+        || Queue == VK_NULL_HANDLE
+        || !GraphicsReady
+        || ColorImage == VK_NULL_HANDLE
+        || ColorImageView == VK_NULL_HANDLE
+        || AttrImage == VK_NULL_HANDLE
+        || AttrImageView == VK_NULL_HANDLE
+        || DepthImage == VK_NULL_HANDLE
+        || DepthImageView == VK_NULL_HANDLE
+        || DepthStencilImage == VK_NULL_HANDLE
+        || DepthStencilImageView == VK_NULL_HANDLE
+        || GraphicsRasterRenderPass == VK_NULL_HANDLE
+        || GraphicsFinalRenderPass == VK_NULL_HANDLE
+        || GraphicsRasterFramebuffer == VK_NULL_HANDLE
+        || GraphicsFinalFramebuffer == VK_NULL_HANDLE
+        || GraphicsPipelineLayout == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    const bool useSynchronousContext = context == nullptr;
+    const VkCommandBuffer commandBuffer = context != nullptr ? context->CommandBuffer : CommandBuffer;
+    const VkFence frameFence = context != nullptr ? context->FrameFence : FrameFence;
+    const VkBuffer triangleBuffer = context != nullptr ? context->TriangleBuffer : TriangleBuffer;
+    const VkBuffer graphicsVertexBuffer = context != nullptr ? context->GraphicsVertexBuffer : GraphicsVertexBuffer;
+    const VkBuffer graphicsSceneVertexBuffer = GraphicsSceneVertexBuffer;
+    const VkBuffer graphicsEdgeIndexBuffer = GraphicsEdgeIndexBuffer;
+    const VkBuffer toonBuffer = context != nullptr ? context->ToonBuffer : ToonBuffer;
+    const VkBuffer clearBuffer = context != nullptr ? context->ClearBuffer : ClearBuffer;
+    void* triangleMapped = context != nullptr ? context->TriangleMapped : TriangleMapped;
+    void* graphicsVertexMapped = context != nullptr ? context->GraphicsVertexMapped : GraphicsVertexMapped;
+    void* graphicsSceneVertexMapped = GraphicsSceneVertexMapped;
+    void* graphicsEdgeIndexMapped = GraphicsEdgeIndexMapped;
+    const VkBuffer captureLineBuffer = context != nullptr ? context->CaptureLineBuffer : CaptureLineBuffer;
+    void* captureLineMapped = context != nullptr ? context->CaptureLineMapped : CaptureLineMapped;
+    VkQueryPool timestampQueryPool = context != nullptr ? context->TimestampQueryPool : TimestampQueryPool;
+    bool& timestampPending = context != nullptr ? context->TimestampPending : TimestampPending;
+
+    if (triangleBuffer == VK_NULL_HANDLE || triangleMapped == nullptr
+        || graphicsVertexBuffer == VK_NULL_HANDLE || graphicsVertexMapped == nullptr)
+        return false;
+    if (graphicsSceneVertexBuffer == VK_NULL_HANDLE || graphicsSceneVertexMapped == nullptr
+        || graphicsEdgeIndexBuffer == VK_NULL_HANDLE || graphicsEdgeIndexMapped == nullptr)
+        return false;
+    if (captureReadbackPath && (captureLineBuffer == VK_NULL_HANDLE || captureLineMapped == nullptr))
+        return false;
+
+    if (!updateToonBuffer(context, toonTable))
+        return false;
+
+    if (!Triangles.empty())
+        std::memcpy(triangleMapped, Triangles.data(), Triangles.size() * sizeof(TriangleGpu));
+    if (!GraphicsVertices.empty())
+        std::memcpy(graphicsVertexMapped, GraphicsVertices.data(), GraphicsVertices.size() * sizeof(GraphicsVertexGpu));
+    if (!GraphicsSceneVertices.empty())
+        std::memcpy(graphicsSceneVertexMapped, GraphicsSceneVertices.data(), GraphicsSceneVertices.size() * sizeof(GraphicsVertexGpu));
+    if (!SharedGraphicsScene.EdgeIndices.empty())
+        std::memcpy(graphicsEdgeIndexMapped, SharedGraphicsScene.EdgeIndices.data(), SharedGraphicsScene.EdgeIndices.size() * sizeof(u16));
+
+    updateGraphicsDescriptorSet(context);
+    const VkDescriptorSet descriptorSet = context != nullptr ? context->GraphicsDescriptorSet : GraphicsDescriptorSet;
+    if (descriptorSet == VK_NULL_HANDLE)
+        return false;
+
+    const bool useCaptureDownscaleForReadback = readbackToCpu
+        && captureReadbackPath
+        && (ColorImageWidth != kCaptureReadbackWidth || ColorImageHeight != kCaptureReadbackHeight);
+    const u32 readbackWidth = useCaptureDownscaleForReadback ? kCaptureReadbackWidth : ColorImageWidth;
+    const u32 readbackHeight = useCaptureDownscaleForReadback ? kCaptureReadbackHeight : ColorImageHeight;
+
+    if (readbackToCpu)
+    {
+        if (useCaptureDownscaleForReadback && !ensureCaptureReadbackImage())
+            return false;
+        const VkDeviceSize requiredReadbackSize = static_cast<VkDeviceSize>(readbackWidth) * static_cast<VkDeviceSize>(readbackHeight) * sizeof(u32);
+        if (ReadbackBuffer == VK_NULL_HANDLE || ReadbackMemory == VK_NULL_HANDLE || ReadbackSize != requiredReadbackSize)
+        {
+            destroyReadbackBuffer();
+            if (!createReadbackBuffer(readbackWidth, readbackHeight))
+                return false;
+        }
+    }
+
+    if (useSynchronousContext)
+    {
+        const u64 waitStartNs = PerfNowNs();
+        const VkResult waitResult = vkWaitForFences(Device, 1, &frameFence, VK_TRUE, UINT64_MAX);
+        if (waitResult != VK_SUCCESS)
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: graphics vkWaitForFences failed (%d)", static_cast<int>(waitResult));
+            return false;
+        }
+
+        FenceWaitCpuWindow.Add(PerfNowNs() - waitStartNs);
+        consumeGpuTiming(nullptr);
+    }
+
+    if (vkResetFences(Device, 1, &frameFence) != VK_SUCCESS)
+        return false;
+    if (vkResetCommandBuffer(commandBuffer, 0) != VK_SUCCESS)
+        return false;
+
+    RasterPushConstants pushConstants{};
+    pushConstants.width = ColorImageWidth;
+    pushConstants.height = ColorImageHeight;
+    pushConstants.clearColor = rgbaColor;
+    pushConstants.clearDepth = clearDepth;
+    pushConstants.triangleCount = static_cast<u32>(Triangles.size());
+    pushConstants.dispCnt = dispCnt;
+    pushConstants.alphaRef = alphaRef;
+    pushConstants.fogColor = fogColor;
+    pushConstants.fogOffset = fogOffset;
+    pushConstants.fogShift = fogShift;
+    pushConstants.clearAttr = clearAttr;
+    for (u32 i = 0; i < 34; i++)
+    {
+        const u32 density = fogDensityTable != nullptr ? static_cast<u32>(fogDensityTable[i]) : 0u;
+        pushConstants.fogDensityPacked[i / 4u] |= (density & 0xFFu) << ((i % 4u) * 8u);
+    }
+    for (u32 i = 0; i < 8; i++)
+    {
+        const u16 edgeColor = edgeColorTable != nullptr ? edgeColorTable[i] : 0u;
+        u32 r = (edgeColor << 1u) & 0x3Eu;
+        u32 g = (edgeColor >> 4u) & 0x3Eu;
+        u32 b = (edgeColor >> 9u) & 0x3Eu;
+        if (r) r++;
+        if (g) g++;
+        if (b) b++;
+        pushConstants.edgeColorPacked[i] =
+            ((r << 2u) | (r >> 4u)) |
+            ((((g << 2u) | (g >> 4u)) & 0xFFu) << 8u) |
+            ((((b << 2u) | (b >> 4u)) & 0xFFu) << 16u);
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS)
+        return false;
+
+    if (timestampQueryPool != VK_NULL_HANDLE && ResetQueryPool != nullptr)
+    {
+        ResetQueryPool(Device, timestampQueryPool, 0, TimestampQueryCount);
+        timestampPending = true;
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampQueryPool, 0);
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampQueryPool, 1);
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampQueryPool, 2);
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestampQueryPool, 3);
+    }
+
+    std::array<VkBufferMemoryBarrier, 6> graphicsReadBarriers{};
+    u32 graphicsReadBarrierCount = 0;
+
+    VkBufferMemoryBarrier triangleBufferBarrier{};
+    triangleBufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    triangleBufferBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    triangleBufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    triangleBufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    triangleBufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    triangleBufferBarrier.buffer = triangleBuffer;
+    triangleBufferBarrier.offset = 0;
+    triangleBufferBarrier.size = VK_WHOLE_SIZE;
+    graphicsReadBarriers[graphicsReadBarrierCount++] = triangleBufferBarrier;
+
+    VkBufferMemoryBarrier graphicsVertexBufferBarrier{};
+    graphicsVertexBufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    graphicsVertexBufferBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    graphicsVertexBufferBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    graphicsVertexBufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    graphicsVertexBufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    graphicsVertexBufferBarrier.buffer = graphicsVertexBuffer;
+    graphicsVertexBufferBarrier.offset = 0;
+    graphicsVertexBufferBarrier.size = VK_WHOLE_SIZE;
+    graphicsReadBarriers[graphicsReadBarrierCount++] = graphicsVertexBufferBarrier;
+
+    VkBufferMemoryBarrier graphicsSceneVertexBufferBarrier{};
+    graphicsSceneVertexBufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    graphicsSceneVertexBufferBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    graphicsSceneVertexBufferBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    graphicsSceneVertexBufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    graphicsSceneVertexBufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    graphicsSceneVertexBufferBarrier.buffer = graphicsSceneVertexBuffer;
+    graphicsSceneVertexBufferBarrier.offset = 0;
+    graphicsSceneVertexBufferBarrier.size = VK_WHOLE_SIZE;
+    graphicsReadBarriers[graphicsReadBarrierCount++] = graphicsSceneVertexBufferBarrier;
+
+    VkBufferMemoryBarrier graphicsEdgeIndexBufferBarrier{};
+    graphicsEdgeIndexBufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    graphicsEdgeIndexBufferBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    graphicsEdgeIndexBufferBarrier.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+    graphicsEdgeIndexBufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    graphicsEdgeIndexBufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    graphicsEdgeIndexBufferBarrier.buffer = graphicsEdgeIndexBuffer;
+    graphicsEdgeIndexBufferBarrier.offset = 0;
+    graphicsEdgeIndexBufferBarrier.size = VK_WHOLE_SIZE;
+    graphicsReadBarriers[graphicsReadBarrierCount++] = graphicsEdgeIndexBufferBarrier;
+
+    if (toonBuffer != VK_NULL_HANDLE)
+    {
+        VkBufferMemoryBarrier toonBufferBarrier{};
+        toonBufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        toonBufferBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        toonBufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toonBufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toonBufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toonBufferBarrier.buffer = toonBuffer;
+        toonBufferBarrier.offset = 0;
+        toonBufferBarrier.size = VK_WHOLE_SIZE;
+        graphicsReadBarriers[graphicsReadBarrierCount++] = toonBufferBarrier;
+    }
+
+    if (clearBuffer != VK_NULL_HANDLE)
+    {
+        VkBufferMemoryBarrier clearBufferBarrier{};
+        clearBufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        clearBufferBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        clearBufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        clearBufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        clearBufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        clearBufferBarrier.buffer = clearBuffer;
+        clearBufferBarrier.offset = 0;
+        clearBufferBarrier.size = VK_WHOLE_SIZE;
+        graphicsReadBarriers[graphicsReadBarrierCount++] = clearBufferBarrier;
+    }
+
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0,
+        0,
+        nullptr,
+        graphicsReadBarrierCount,
+        graphicsReadBarriers.data(),
+        0,
+        nullptr
+    );
+
+    // graphics_hw reuses the same images across frames. Adreno is especially
+    // sensitive to beginning a render pass with reused attachments still in the
+    // previous frame's layout while the render pass declares UNDEFINED-like
+    // semantics. Explicitly transition each attachment back into the layout
+    // that the raster render pass expects before the clear/draw pass starts.
+    std::array<VkImageMemoryBarrier, 4> rasterAttachmentBarriers{};
+    for (VkImageMemoryBarrier& barrier : rasterAttachmentBarriers)
+    {
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+    }
+
+    rasterAttachmentBarriers[0].image = ColorImage;
+    rasterAttachmentBarriers[0].srcAccessMask = ColorImageInitialized
+        ? (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT)
+        : 0u;
+    rasterAttachmentBarriers[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    rasterAttachmentBarriers[0].oldLayout = ColorImageInitialized
+        ? VK_IMAGE_LAYOUT_GENERAL
+        : VK_IMAGE_LAYOUT_UNDEFINED;
+    rasterAttachmentBarriers[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    rasterAttachmentBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    rasterAttachmentBarriers[1].image = AttrImage;
+    rasterAttachmentBarriers[1].srcAccessMask = ColorImageInitialized
+        ? (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT)
+        : 0u;
+    rasterAttachmentBarriers[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    rasterAttachmentBarriers[1].oldLayout = ColorImageInitialized
+        ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        : VK_IMAGE_LAYOUT_UNDEFINED;
+    rasterAttachmentBarriers[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    rasterAttachmentBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    rasterAttachmentBarriers[2].image = DepthImage;
+    rasterAttachmentBarriers[2].srcAccessMask = ColorImageInitialized
+        ? (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT)
+        : 0u;
+    rasterAttachmentBarriers[2].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    rasterAttachmentBarriers[2].oldLayout = ColorImageInitialized
+        ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        : VK_IMAGE_LAYOUT_UNDEFINED;
+    rasterAttachmentBarriers[2].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    rasterAttachmentBarriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    rasterAttachmentBarriers[3].image = DepthStencilImage;
+    rasterAttachmentBarriers[3].srcAccessMask = ColorImageInitialized
+        ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+        : 0u;
+    rasterAttachmentBarriers[3].dstAccessMask =
+        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    rasterAttachmentBarriers[3].oldLayout = ColorImageInitialized
+        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        : VK_IMAGE_LAYOUT_UNDEFINED;
+    rasterAttachmentBarriers[3].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    rasterAttachmentBarriers[3].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+
+    const VkPipelineStageFlags rasterAttachmentSrcStage = ColorImageInitialized
+        ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+        : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        rasterAttachmentSrcStage,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        static_cast<u32>(rasterAttachmentBarriers.size()),
+        rasterAttachmentBarriers.data()
+    );
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(ColorImageWidth);
+    viewport.height = static_cast<float>(ColorImageHeight);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    VkRect2D scissor{};
+    scissor.extent.width = ColorImageWidth;
+    scissor.extent.height = ColorImageHeight;
+
+    auto unpackNormalizedByte = [](u32 value) -> float {
+        return static_cast<float>(value & 0xFFu) * (1.0f / 255.0f);
+    };
+    const float clearDepthNormalized = static_cast<float>(clearDepth) * (1.0f / 16777215.0f);
+    const float clearFog = ((clearAttr >> 15u) & 0x1u) != 0u ? 1.0f : 0.0f;
+    const float clearPolyId = static_cast<float>((clearAttr >> 24u) & 0x3Fu) * (1.0f / 63.0f);
+
+    std::array<VkClearValue, 4> clearValues{};
+    clearValues[0].color.float32[0] = unpackNormalizedByte(rgbaColor);
+    clearValues[0].color.float32[1] = unpackNormalizedByte(rgbaColor >> 8u);
+    clearValues[0].color.float32[2] = unpackNormalizedByte(rgbaColor >> 16u);
+    clearValues[0].color.float32[3] = unpackNormalizedByte(rgbaColor >> 24u);
+    clearValues[1].color.float32[0] = clearPolyId;
+    clearValues[1].color.float32[1] = 0.0f;
+    clearValues[1].color.float32[2] = clearFog;
+    clearValues[1].color.float32[3] = 1.0f;
+    clearValues[2].color.float32[0] = clearDepthNormalized;
+    clearValues[3].depthStencil.depth = clearDepthNormalized;
+    clearValues[3].depthStencil.stencil = 0xFFu;
+
+    VkRenderPassBeginInfo rasterBeginInfo{};
+    rasterBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rasterBeginInfo.renderPass = GraphicsRasterRenderPass;
+    rasterBeginInfo.framebuffer = GraphicsRasterFramebuffer;
+    rasterBeginInfo.renderArea.extent.width = ColorImageWidth;
+    rasterBeginInfo.renderArea.extent.height = ColorImageHeight;
+    rasterBeginInfo.clearValueCount = static_cast<u32>(clearValues.size());
+    rasterBeginInfo.pClearValues = clearValues.data();
+    vkCmdBeginRenderPass(commandBuffer, &rasterBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    if (GraphicsClearPipeline != VK_NULL_HANDLE)
+    {
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsClearPipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        vkCmdSetStencilCompareMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFu);
+        vkCmdSetStencilWriteMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFu);
+        vkCmdSetStencilReference(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFu);
+        vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
+    }
+
+    const VkDeviceSize graphicsVertexOffset = 0u;
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, &graphicsVertexBuffer, &graphicsVertexOffset);
+
+    const u64 rasterCpuStartNs = PerfNowNs();
+    const u64 graphicsMainCpuStartNs = PerfNowNs();
+    u32 drawCount = 0;
+    struct GraphicsPassDebugStats
+    {
+        u32 opaque = 0;
+        u32 edge = 0;
+        u32 bgZeroShadowMask = 0;
+        u32 bgZeroNeedOpaque = 0;
+        u32 bgZeroShadowBlend = 0;
+        u32 bgZeroTranslucent = 0;
+        u32 bgZeroShadowSkippedPolyId = 0;
+        u32 mainShadowMask = 0;
+        u32 mainNeedOpaque = 0;
+        u32 mainShadowClear = 0;
+        u32 mainShadowBlend = 0;
+        u32 mainTranslucent = 0;
+    } graphicsPassDebugStats{};
+
+    const auto opaquePipelineIndexFor = [&](const GraphicsPolygonDraw& draw) -> u32 {
+        const bool wBuffer = draw.triangleCount > 0u
+            && draw.firstTriangle < Triangles.size()
+            && ((Triangles[draw.firstTriangle].flags & kTriangleFlagWBuffer) != 0u);
+        const u32 wMode = wBuffer ? 1u : 0u;
+        const u32 depthCompareMode = (draw.polyAttr & (1u << 14u)) != 0u ? 1u : 0u;
+        return (wMode * GraphicsDepthCompareModeCount) + depthCompareMode;
+    };
+    const auto bgZeroTranslucentPipelineIndexFor = [&](const GraphicsPolygonDraw& draw, bool fogWrite) -> u32 {
+        const bool wBuffer = draw.triangleCount > 0u
+            && draw.firstTriangle < Triangles.size()
+            && ((Triangles[draw.firstTriangle].flags & kTriangleFlagWBuffer) != 0u);
+        const u32 wMode = wBuffer ? 1u : 0u;
+        const u32 depthCompareMode = (draw.polyAttr & (1u << 14u)) != 0u ? 1u : 0u;
+        const u32 depthWriteMode = (draw.polyAttr & (1u << 11u)) != 0u ? 1u : 0u;
+        const u32 fogWriteMode = fogWrite ? 1u : 0u;
+        return (((wMode * GraphicsDepthCompareModeCount) + depthCompareMode) * GraphicsDepthWriteModeCount + depthWriteMode)
+            * GraphicsFogWriteModeCount
+            + fogWriteMode;
+    };
+    const auto translucentPipelineIndexFor = [&](const GraphicsPolygonDraw& draw, bool fogWrite, bool alphaBlendEnabled) -> u32 {
+        const bool wBuffer = draw.triangleCount > 0u
+            && draw.firstTriangle < Triangles.size()
+            && ((Triangles[draw.firstTriangle].flags & kTriangleFlagWBuffer) != 0u);
+        const u32 wMode = wBuffer ? 1u : 0u;
+        const u32 depthCompareMode = (draw.polyAttr & (1u << 14u)) != 0u ? 1u : 0u;
+        const u32 depthWriteMode = (draw.polyAttr & (1u << 11u)) != 0u ? 1u : 0u;
+        const u32 fogWriteMode = fogWrite ? 1u : 0u;
+        const u32 alphaBlendMode = alphaBlendEnabled ? 1u : 0u;
+        return ((((wMode * GraphicsDepthCompareModeCount) + depthCompareMode) * GraphicsDepthWriteModeCount + depthWriteMode)
+            * GraphicsFogWriteModeCount
+            + fogWriteMode)
+            * GraphicsAlphaBlendModeCount
+            + alphaBlendMode;
+    };
+    const auto fogWriteEnabledFor = [&](const GraphicsPolygonDraw& draw) -> bool {
+        return ((dispCnt & (1u << 7u)) != 0u) && ((draw.polyAttr & (1u << 15u)) == 0u);
+    };
+    const auto bindAndDrawGraphics = [&](const GraphicsPolygonDraw& draw,
+                                         VkPipeline pipeline,
+                                         u32 stencilCompareMask,
+                                         u32 stencilWriteMask,
+                                         u32 stencilReference) -> bool {
+        if (pipeline == VK_NULL_HANDLE || draw.triangleCount == 0u || draw.firstTriangle >= Triangles.size())
+            return false;
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        pushConstants.depthBlendMode = (Triangles[draw.firstTriangle].flags & kTriangleFlagWBuffer) != 0u ? 1u : 0u;
+        pushConstants.triangleBase = draw.firstTriangle;
+        pushConstants.triangleCount = draw.triangleCount;
+        vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        vkCmdSetStencilCompareMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, stencilCompareMask);
+        vkCmdSetStencilWriteMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, stencilWriteMask);
+        vkCmdSetStencilReference(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, stencilReference);
+        vkCmdDraw(commandBuffer, draw.triangleCount * 3u, 1u, draw.firstTriangle * 3u, 0u);
+        drawCount++;
+        return true;
+    };
+    const auto drawNeedOpaquePass = [&](const GraphicsPolygonDraw& draw) {
+        const u32 pipelineIndex = opaquePipelineIndexFor(draw);
+        const VkPipeline pipeline = pipelineIndex < GraphicsOpaquePipelines.size()
+            ? GraphicsOpaquePipelines[pipelineIndex]
+            : VK_NULL_HANDLE;
+        bindAndDrawGraphics(draw, pipeline, 0xFFu, 0xFFu, (draw.polyAttr >> 24u) & 0x3Fu);
+    };
+    const auto bindAndDrawGraphicsEdges = [&](const GraphicsPolygonDraw& draw) -> bool {
+        if (draw.edgeIndexCount == 0u)
+            return false;
+
+        const u32 wMode = (draw.flags & AcceleratedPolygonFlagWBuffer) != 0u ? 1u : 0u;
+        const VkPipeline pipeline = wMode < GraphicsEdgeMarkPipelines.size()
+            ? GraphicsEdgeMarkPipelines[wMode]
+            : VK_NULL_HANDLE;
+        if (pipeline == VK_NULL_HANDLE)
+            return false;
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        pushConstants.depthBlendMode = wMode;
+        pushConstants.triangleBase = draw.firstTriangle;
+        pushConstants.triangleCount = draw.triangleCount;
+        vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        vkCmdDrawIndexed(commandBuffer, draw.edgeIndexCount, 1u, draw.firstEdgeIndex, 0, 0u);
+        drawCount++;
+        return true;
+    };
+    const auto clearShadowStencilBit = [&]() {
+        if (GraphicsStencilBitClearPipeline == VK_NULL_HANDLE)
+            return;
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsStencilBitClearPipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        vkCmdSetStencilCompareMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0x80u);
+        vkCmdSetStencilWriteMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0x80u);
+        vkCmdSetStencilReference(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0x00u);
+        vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
+        drawCount++;
+    };
+    const bool clearPlaneAlphaZero = ((clearAttr >> 16u) & 0x1Fu) == 0u;
+    const u32 clearPlanePolyId = (clearAttr >> 24u) & 0x3Fu;
+    const bool alphaBlendEnabled = (dispCnt & (1u << 3u)) != 0u;
+
+    for (u32 drawIndex : GraphicsOpaqueDrawIndices)
+    {
+        if (drawIndex >= GraphicsPolygons.size())
+            continue;
+
+        const GraphicsPolygonDraw& draw = GraphicsPolygons[drawIndex];
+        const u32 pipelineIndex = opaquePipelineIndexFor(draw);
+        const VkPipeline pipeline = pipelineIndex < GraphicsOpaquePipelines.size() ? GraphicsOpaquePipelines[pipelineIndex] : VK_NULL_HANDLE;
+        if (bindAndDrawGraphics(draw, pipeline, 0xFFu, 0xFFu, (draw.polyAttr >> 24u) & 0x3Fu))
+            graphicsPassDebugStats.opaque++;
+    }
+
+    if ((dispCnt & (1u << 5u)) != 0u)
+    {
+        const VkDeviceSize graphicsSceneVertexOffset = 0u;
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &graphicsSceneVertexBuffer, &graphicsSceneVertexOffset);
+        vkCmdBindIndexBuffer(commandBuffer, graphicsEdgeIndexBuffer, 0u, VK_INDEX_TYPE_UINT16);
+
+        for (const GraphicsPolygonDraw& draw : GraphicsPolygons)
+        {
+            if ((draw.flags & AcceleratedPolygonFlagShadowMask) != 0u)
+                continue;
+
+            if (bindAndDrawGraphicsEdges(draw))
+                graphicsPassDebugStats.edge++;
+        }
+
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &graphicsVertexBuffer, &graphicsVertexOffset);
+    }
+
+    if ((timestampQueryPool != VK_NULL_HANDLE) && timestampPending)
+    {
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 4);
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 5);
+    }
+    GraphicsMainCpuWindow.Add(PerfNowNs() - graphicsMainCpuStartNs);
+
+    const u64 graphicsAlphaCpuStartNs = PerfNowNs();
+    if (clearPlaneAlphaZero)
+    {
+        for (const GraphicsPolygonDraw& draw : GraphicsPolygons)
+        {
+            if (draw.triangleCount == 0u)
+                continue;
+
+            const bool isShadowMask = (draw.flags & AcceleratedPolygonFlagShadowMask) != 0u;
+            const bool isTranslucent = (draw.flags & AcceleratedPolygonFlagTranslucent) != 0u;
+            const bool isShadow = (draw.flags & AcceleratedPolygonFlagShadow) != 0u;
+            const bool needOpaque = (draw.flags & AcceleratedPolygonFlagNeedOpaquePass) != 0u;
+            const u32 polyId = (draw.polyAttr >> 24u) & 0x3Fu;
+
+            if (isShadowMask)
+            {
+                const bool wBuffer = (Triangles[draw.firstTriangle].flags & kTriangleFlagWBuffer) != 0u;
+                const u32 wMode = wBuffer ? 1u : 0u;
+                const VkPipeline pipeline = wMode < GraphicsShadowMaskBgZeroPipelines.size()
+                    ? GraphicsShadowMaskBgZeroPipelines[wMode]
+                    : VK_NULL_HANDLE;
+                if (bindAndDrawGraphics(draw, pipeline, 0xFFu, 0x01u, 0xFFu))
+                    graphicsPassDebugStats.bgZeroShadowMask++;
+                continue;
+            }
+
+            if (!isTranslucent)
+                continue;
+
+            if (needOpaque)
+            {
+                drawNeedOpaquePass(draw);
+                graphicsPassDebugStats.bgZeroNeedOpaque++;
+            }
+
+            const bool fogWrite = fogWriteEnabledFor(draw);
+            const u32 writeMask = static_cast<u32>(~(0x40u | polyId)) & 0xFFu;
+            if (isShadow)
+            {
+                if (polyId != clearPlanePolyId)
+                {
+                    graphicsPassDebugStats.bgZeroShadowSkippedPolyId++;
+                    continue;
+                }
+
+                const u32 pipelineIndex = translucentPipelineIndexFor(draw, fogWrite, alphaBlendEnabled);
+                const VkPipeline pipeline = pipelineIndex < GraphicsShadowBlendBgZeroPipelines.size()
+                    ? GraphicsShadowBlendBgZeroPipelines[pipelineIndex]
+                    : VK_NULL_HANDLE;
+                if (bindAndDrawGraphics(draw, pipeline, 0xFFu, writeMask, 0xFEu))
+                    graphicsPassDebugStats.bgZeroShadowBlend++;
+            }
+            else
+            {
+                const u32 pipelineIndex = bgZeroTranslucentPipelineIndexFor(draw, fogWrite);
+                const VkPipeline pipeline = pipelineIndex < GraphicsBgZeroTranslucentPipelines.size()
+                    ? GraphicsBgZeroTranslucentPipelines[pipelineIndex]
+                    : VK_NULL_HANDLE;
+                if (bindAndDrawGraphics(draw, pipeline, 0xFEu, writeMask, 0xFFu))
+                    graphicsPassDebugStats.bgZeroTranslucent++;
+            }
+        }
+    }
+
+    for (const GraphicsPolygonDraw& draw : GraphicsPolygons)
+    {
+        if (draw.triangleCount == 0u)
+            continue;
+
+        const bool isShadowMask = (draw.flags & AcceleratedPolygonFlagShadowMask) != 0u;
+        const bool isTranslucent = (draw.flags & AcceleratedPolygonFlagTranslucent) != 0u;
+        const bool isShadow = (draw.flags & AcceleratedPolygonFlagShadow) != 0u;
+        const bool needOpaque = (draw.flags & AcceleratedPolygonFlagNeedOpaquePass) != 0u;
+        const u32 polyId = (draw.polyAttr >> 24u) & 0x3Fu;
+
+        if (isShadowMask)
+        {
+            clearShadowStencilBit();
+
+            const bool wBuffer = (Triangles[draw.firstTriangle].flags & kTriangleFlagWBuffer) != 0u;
+            const u32 wMode = wBuffer ? 1u : 0u;
+            const VkPipeline pipeline = wMode < GraphicsShadowMaskPipelines.size()
+                ? GraphicsShadowMaskPipelines[wMode]
+                : VK_NULL_HANDLE;
+            if (bindAndDrawGraphics(draw, pipeline, 0x80u, 0x80u, 0x80u))
+                graphicsPassDebugStats.mainShadowMask++;
+            continue;
+        }
+
+        if (!isTranslucent)
+            continue;
+
+        if (needOpaque)
+        {
+            drawNeedOpaquePass(draw);
+            graphicsPassDebugStats.mainNeedOpaque++;
+        }
+
+        const bool fogWrite = fogWriteEnabledFor(draw);
+        if (isShadow)
+        {
+            const u32 clearPipelineIndex = opaquePipelineIndexFor(draw);
+            const VkPipeline clearPipeline = clearPipelineIndex < GraphicsShadowClearPipelines.size()
+                ? GraphicsShadowClearPipelines[clearPipelineIndex]
+                : VK_NULL_HANDLE;
+            if (bindAndDrawGraphics(draw, clearPipeline, 0x3Fu, 0x80u, polyId))
+                graphicsPassDebugStats.mainShadowClear++;
+
+            const u32 blendPipelineIndex = translucentPipelineIndexFor(draw, fogWrite, alphaBlendEnabled);
+            const VkPipeline blendPipeline = blendPipelineIndex < GraphicsShadowBlendPipelines.size()
+                ? GraphicsShadowBlendPipelines[blendPipelineIndex]
+                : VK_NULL_HANDLE;
+            if (bindAndDrawGraphics(draw, blendPipeline, 0x80u, 0x7Fu, 0xC0u | polyId))
+                graphicsPassDebugStats.mainShadowBlend++;
+        }
+        else
+        {
+            const u32 pipelineIndex = translucentPipelineIndexFor(draw, fogWrite, alphaBlendEnabled);
+            const VkPipeline pipeline = pipelineIndex < GraphicsTranslucentPipelines.size()
+                ? GraphicsTranslucentPipelines[pipelineIndex]
+                : VK_NULL_HANDLE;
+            if (bindAndDrawGraphics(draw, pipeline, 0x7Fu, 0x7Fu, 0x40u | polyId))
+                graphicsPassDebugStats.mainTranslucent++;
+        }
+    }
+    GraphicsAlphaCpuWindow.Add(PerfNowNs() - graphicsAlphaCpuStartNs);
+
+    if (MelonDSAndroid::areRendererDebugToolsEnabled() && CaptureDebugLogsRemaining > 0u)
+    {
+        Log(
+            LogLevel::Warn,
+            "VulkanGraphics[Passes]: clearAlphaZero=%u clearPolyId=%u alphaBlend=%u opaque=%u edge=%u bgZeroShadowMask=%u bgZeroNeedOpaque=%u bgZeroShadowBlend=%u bgZeroTrans=%u bgZeroShadowSkipPolyId=%u mainShadowMask=%u mainNeedOpaque=%u mainShadowClear=%u mainShadowBlend=%u mainTrans=%u",
+            clearPlaneAlphaZero ? 1u : 0u,
+            clearPlanePolyId,
+            alphaBlendEnabled ? 1u : 0u,
+            graphicsPassDebugStats.opaque,
+            graphicsPassDebugStats.edge,
+            graphicsPassDebugStats.bgZeroShadowMask,
+            graphicsPassDebugStats.bgZeroNeedOpaque,
+            graphicsPassDebugStats.bgZeroShadowBlend,
+            graphicsPassDebugStats.bgZeroTranslucent,
+            graphicsPassDebugStats.bgZeroShadowSkippedPolyId,
+            graphicsPassDebugStats.mainShadowMask,
+            graphicsPassDebugStats.mainNeedOpaque,
+            graphicsPassDebugStats.mainShadowClear,
+            graphicsPassDebugStats.mainShadowBlend,
+            graphicsPassDebugStats.mainTranslucent);
+        CaptureDebugLogsRemaining--;
+    }
+
+    RasterCpuWindow.Add(PerfNowNs() - rasterCpuStartNs);
+    TriangleCountWindow.Add(static_cast<u64>(Triangles.size()));
+    PassCountWindow.Add(drawCount > 0u ? 1u : 0u);
+    BinCpuWindow.Add(0);
+    WorkOffsetsCpuWindow.Add(0);
+    SortCpuWindow.Add(0);
+    CpuActiveTileCountWindow.Add(0);
+    CpuTileCountWindow.Add(0);
+    CpuActiveGroupCountWindow.Add(0);
+    CpuActiveDispatchWindow.Add(0);
+
+    vkCmdEndRenderPass(commandBuffer);
+
+    VkImageMemoryBarrier samplingBarriers[3]{};
+    for (VkImageMemoryBarrier& barrier : samplingBarriers)
+    {
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+    }
+    samplingBarriers[0].image = ColorImage;
+    samplingBarriers[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    samplingBarriers[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    samplingBarriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    samplingBarriers[1].image = AttrImage;
+    samplingBarriers[1].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    samplingBarriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    samplingBarriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    samplingBarriers[2].image = DepthImage;
+    samplingBarriers[2].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    samplingBarriers[2].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    samplingBarriers[2].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        3,
+        samplingBarriers
+    );
+
+    const bool runEdgePass = (dispCnt & (1u << 5u)) != 0u;
+    const bool runFogPass = (dispCnt & (1u << 7u)) != 0u;
+    const u64 finalCpuStartNs = PerfNowNs();
+
+    VkRenderPassBeginInfo finalBeginInfo{};
+    finalBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    finalBeginInfo.renderPass = GraphicsFinalRenderPass;
+    finalBeginInfo.framebuffer = GraphicsFinalFramebuffer;
+    finalBeginInfo.renderArea.extent.width = ColorImageWidth;
+    finalBeginInfo.renderArea.extent.height = ColorImageHeight;
+    vkCmdBeginRenderPass(commandBuffer, &finalBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    if (runEdgePass && GraphicsFinalEdgePipeline != VK_NULL_HANDLE)
+    {
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsFinalEdgePipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        const float edgeBlendConstants[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        vkCmdSetBlendConstants(commandBuffer, edgeBlendConstants);
+        vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
+    }
+
+    if (runFogPass && GraphicsFinalFogPipeline != VK_NULL_HANDLE)
+    {
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsFinalFogPipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        const float fogBlendConstants[4] = {
+            static_cast<float>(fogColor & 0x1Fu) * (1.0f / 31.0f),
+            static_cast<float>((fogColor >> 5u) & 0x1Fu) * (1.0f / 31.0f),
+            static_cast<float>((fogColor >> 10u) & 0x1Fu) * (1.0f / 31.0f),
+            static_cast<float>((fogColor >> 16u) & 0x1Fu) * (1.0f / 31.0f),
+        };
+        vkCmdSetBlendConstants(commandBuffer, fogBlendConstants);
+        vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
+    }
+
+    vkCmdEndRenderPass(commandBuffer);
+    FinalCpuWindow.Add(PerfNowNs() - finalCpuStartNs);
+
+    if ((timestampQueryPool != VK_NULL_HANDLE) && timestampPending)
+    {
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 6);
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 7);
+    }
+
+    bool deferCaptureReadbackCompletion = false;
+    if (captureReadbackPath || readbackToCpu)
+    {
+        VkImageMemoryBarrier colorToTransferSrcBarrier{};
+        colorToTransferSrcBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        colorToTransferSrcBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        colorToTransferSrcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        colorToTransferSrcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        colorToTransferSrcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        colorToTransferSrcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        colorToTransferSrcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        colorToTransferSrcBarrier.image = ColorImage;
+        colorToTransferSrcBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        colorToTransferSrcBarrier.subresourceRange.baseMipLevel = 0;
+        colorToTransferSrcBarrier.subresourceRange.levelCount = 1;
+        colorToTransferSrcBarrier.subresourceRange.baseArrayLayer = 0;
+        colorToTransferSrcBarrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &colorToTransferSrcBarrier
+        );
+
+        if (captureReadbackPath)
+        {
+            if (CaptureLineExportPipeline == VK_NULL_HANDLE || !updateCaptureExportDescriptorSet(context))
+                return false;
+
+            VkImageMemoryBarrier colorToCaptureReadBarrier{};
+            colorToCaptureReadBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            colorToCaptureReadBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            colorToCaptureReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            colorToCaptureReadBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            colorToCaptureReadBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            colorToCaptureReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            colorToCaptureReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            colorToCaptureReadBarrier.image = ColorImage;
+            colorToCaptureReadBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            colorToCaptureReadBarrier.subresourceRange.baseMipLevel = 0;
+            colorToCaptureReadBarrier.subresourceRange.levelCount = 1;
+            colorToCaptureReadBarrier.subresourceRange.baseArrayLayer = 0;
+            colorToCaptureReadBarrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                nullptr,
+                0,
+                nullptr,
+                1,
+                &colorToCaptureReadBarrier
+            );
+
+            const VkDescriptorSet captureExportDescriptorSet = getDescriptorSet(context, FallbackTextureDescriptorIndex);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, CaptureLineExportPipeline);
+            vkCmdBindDescriptorSets(
+                commandBuffer,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                PipelineLayout,
+                0,
+                1,
+                &captureExportDescriptorSet,
+                0,
+                nullptr
+            );
+            vkCmdPushConstants(commandBuffer, PipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+            vkCmdDispatch(commandBuffer, 32u, 24u, 1u);
+
+            VkBufferMemoryBarrier captureToHostBarrier{};
+            captureToHostBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            captureToHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            captureToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            captureToHostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            captureToHostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            captureToHostBarrier.buffer = captureLineBuffer;
+            captureToHostBarrier.offset = 0;
+            captureToHostBarrier.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(
+                commandBuffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                0,
+                nullptr,
+                1,
+                &captureToHostBarrier,
+                0,
+                nullptr
+            );
+            CaptureLineExportCount++;
+            CaptureLineExportCpuWindow.Add(0);
+            deferCaptureReadbackCompletion = true;
+        }
+
+        if (readbackToCpu)
+        {
+            VkBufferImageCopy copyRegion{};
+            copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.imageSubresource.layerCount = 1;
+            copyRegion.imageExtent.width = readbackWidth;
+            copyRegion.imageExtent.height = readbackHeight;
+            copyRegion.imageExtent.depth = 1;
+
+            if (useCaptureDownscaleForReadback)
+            {
+                VkImageMemoryBarrier captureToTransferDstBarrier{};
+                captureToTransferDstBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                captureToTransferDstBarrier.srcAccessMask = CaptureReadbackImageInitialized ? VK_ACCESS_TRANSFER_READ_BIT : 0u;
+                captureToTransferDstBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                captureToTransferDstBarrier.oldLayout = CaptureReadbackImageInitialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+                captureToTransferDstBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                captureToTransferDstBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                captureToTransferDstBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                captureToTransferDstBarrier.image = CaptureReadbackImage;
+                captureToTransferDstBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                captureToTransferDstBarrier.subresourceRange.levelCount = 1;
+                captureToTransferDstBarrier.subresourceRange.layerCount = 1;
+                vkCmdPipelineBarrier(commandBuffer, CaptureReadbackImageInitialized ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &captureToTransferDstBarrier);
+
+                VkImageBlit blitRegion{};
+                blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blitRegion.srcSubresource.layerCount = 1;
+                blitRegion.srcOffsets[1] = {static_cast<int32_t>(ColorImageWidth), static_cast<int32_t>(ColorImageHeight), 1};
+                blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blitRegion.dstSubresource.layerCount = 1;
+                blitRegion.dstOffsets[1] = {static_cast<int32_t>(readbackWidth), static_cast<int32_t>(readbackHeight), 1};
+                vkCmdBlitImage(commandBuffer, ColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, CaptureReadbackImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_NEAREST);
+
+                VkImageMemoryBarrier captureToTransferSrcBarrier{};
+                captureToTransferSrcBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                captureToTransferSrcBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                captureToTransferSrcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                captureToTransferSrcBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                captureToTransferSrcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                captureToTransferSrcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                captureToTransferSrcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                captureToTransferSrcBarrier.image = CaptureReadbackImage;
+                captureToTransferSrcBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                captureToTransferSrcBarrier.subresourceRange.levelCount = 1;
+                captureToTransferSrcBarrier.subresourceRange.layerCount = 1;
+                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &captureToTransferSrcBarrier);
+                vkCmdCopyImageToBuffer(commandBuffer, CaptureReadbackImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ReadbackBuffer, 1, &copyRegion);
+
+                VkImageMemoryBarrier captureBackToGeneralBarrier{};
+                captureBackToGeneralBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                captureBackToGeneralBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                captureBackToGeneralBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                captureBackToGeneralBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                captureBackToGeneralBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                captureBackToGeneralBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                captureBackToGeneralBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                captureBackToGeneralBarrier.image = CaptureReadbackImage;
+                captureBackToGeneralBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                captureBackToGeneralBarrier.subresourceRange.levelCount = 1;
+                captureBackToGeneralBarrier.subresourceRange.layerCount = 1;
+                vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &captureBackToGeneralBarrier);
+                CaptureReadbackImageInitialized = true;
+            }
+            else
+            {
+                vkCmdCopyImageToBuffer(commandBuffer, ColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ReadbackBuffer, 1, &copyRegion);
+            }
+
+            VkBufferMemoryBarrier toHostBarrier{};
+            toHostBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            toHostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            toHostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toHostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toHostBarrier.buffer = ReadbackBuffer;
+            toHostBarrier.offset = 0;
+            toHostBarrier.size = ReadbackSize;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &toHostBarrier, 0, nullptr);
+        }
+
+        VkImageMemoryBarrier colorBackToGeneralBarrier{};
+        colorBackToGeneralBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        colorBackToGeneralBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        colorBackToGeneralBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        colorBackToGeneralBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        colorBackToGeneralBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        colorBackToGeneralBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        colorBackToGeneralBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        colorBackToGeneralBarrier.image = ColorImage;
+        colorBackToGeneralBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        colorBackToGeneralBarrier.subresourceRange.levelCount = 1;
+        colorBackToGeneralBarrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &colorBackToGeneralBarrier);
+    }
+
+    if ((timestampQueryPool != VK_NULL_HANDLE) && timestampPending)
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampQueryPool, 8);
+
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
+        return false;
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    {
+        std::scoped_lock queueLock(VulkanContext::Get().GetQueueLock());
+        const VkResult submitResult = vkQueueSubmit(Queue, 1, &submitInfo, frameFence);
+        if (submitResult != VK_SUCCESS)
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: graphics vkQueueSubmit failed (%d)", static_cast<int>(submitResult));
+            return false;
+        }
+    }
+
+    if (context != nullptr && Threaded)
+        LastSubmittedRenderContext = context;
+
+    if (timestampQueryPool != VK_NULL_HANDLE)
+    {
+        if (context != nullptr)
+            context->TimestampPending = true;
+        else
+            TimestampPending = true;
+    }
+
+    if (captureReadbackPath)
+    {
+        PendingCaptureLineContext = context;
+        CaptureLinePending = true;
+        CaptureLineDataIsRgba8 = false;
+        PendingCaptureLineBufferSlot = -1;
+        CaptureLineReady = false;
+        ReadyCaptureLineBufferSlot = -1;
+        ReadyCaptureLineData = nullptr;
+        ActiveCapturePathMode = CapturePathMode::CaptureLineExport;
+        CapturePathModeCounts[static_cast<size_t>(CapturePathMode::CaptureLineExport)]++;
+    }
+    else
+    {
+        resetCaptureLineState();
+    }
+
+    if (readbackToCpu)
+    {
+        CaptureReadbackPending = true;
+        PendingCaptureReadbackContext = context;
+        RawReadbackWidth = readbackWidth;
+        RawReadbackHeight = readbackHeight;
+    }
+    else
+    {
+        CaptureReadbackPending = false;
+        PendingCaptureReadbackContext = nullptr;
+    }
+
+    ColorImageInitialized = true;
+    HasCpuFrame = readbackToCpu && !deferCaptureReadbackCompletion;
+    return true;
+}
+
+bool VulkanRenderer3D::submitGraphicsCaptureExportForCurrentFrame()
+{
+    constexpr u32 kCaptureReadbackWidth = 256u;
+    constexpr u32 kCaptureReadbackHeight = 192u;
+
+    if (ActiveBackendMode != BackendMode::GraphicsHardware
+        || !ensureInitialized()
+        || Device == VK_NULL_HANDLE
+        || Queue == VK_NULL_HANDLE
+        || CommandBuffer == VK_NULL_HANDLE
+        || FrameFence == VK_NULL_HANDLE
+        || ColorImage == VK_NULL_HANDLE
+        || !ColorImageInitialized)
+    {
+        return false;
+    }
+
+    if (!ensureCaptureLineBuffer(nullptr) || !ensureCaptureReadbackImage())
+        return false;
+
+    if (CaptureLineMapped == nullptr)
+        return false;
+
+    const VkResult fenceStatus = vkGetFenceStatus(Device, FrameFence);
+    if (fenceStatus == VK_NOT_READY)
+        return false;
+    if (fenceStatus != VK_SUCCESS)
+        return false;
+
+    consumeGpuTiming(nullptr);
+
+    if (vkResetFences(Device, 1, &FrameFence) != VK_SUCCESS)
+        return false;
+    if (vkResetCommandBuffer(CommandBuffer, 0) != VK_SUCCESS)
+        return false;
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(CommandBuffer, &beginInfo) != VK_SUCCESS)
+        return false;
+
+    VkImageMemoryBarrier colorToTransferSrcBarrier{};
+    colorToTransferSrcBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    colorToTransferSrcBarrier.srcAccessMask =
+        VK_ACCESS_SHADER_READ_BIT |
+        VK_ACCESS_SHADER_WRITE_BIT |
+        VK_ACCESS_TRANSFER_READ_BIT |
+        VK_ACCESS_TRANSFER_WRITE_BIT |
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    colorToTransferSrcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    colorToTransferSrcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    colorToTransferSrcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    colorToTransferSrcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    colorToTransferSrcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    colorToTransferSrcBarrier.image = ColorImage;
+    colorToTransferSrcBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    colorToTransferSrcBarrier.subresourceRange.levelCount = 1;
+    colorToTransferSrcBarrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(
+        CommandBuffer,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &colorToTransferSrcBarrier
+    );
+
+    VkImageMemoryBarrier captureToTransferDstBarrier{};
+    captureToTransferDstBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    captureToTransferDstBarrier.srcAccessMask = CaptureReadbackImageInitialized ? VK_ACCESS_TRANSFER_READ_BIT : 0u;
+    captureToTransferDstBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    captureToTransferDstBarrier.oldLayout = CaptureReadbackImageInitialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    captureToTransferDstBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    captureToTransferDstBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureToTransferDstBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureToTransferDstBarrier.image = CaptureReadbackImage;
+    captureToTransferDstBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    captureToTransferDstBarrier.subresourceRange.levelCount = 1;
+    captureToTransferDstBarrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(
+        CommandBuffer,
+        CaptureReadbackImageInitialized ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &captureToTransferDstBarrier
+    );
+
+    VkImageBlit blitRegion{};
+    blitRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.srcSubresource.layerCount = 1;
+    blitRegion.srcOffsets[1] = {static_cast<int32_t>(ColorImageWidth), static_cast<int32_t>(ColorImageHeight), 1};
+    blitRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blitRegion.dstSubresource.layerCount = 1;
+    blitRegion.dstOffsets[1] = {static_cast<int32_t>(kCaptureReadbackWidth), static_cast<int32_t>(kCaptureReadbackHeight), 1};
+    vkCmdBlitImage(
+        CommandBuffer,
+        ColorImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        CaptureReadbackImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &blitRegion,
+        VK_FILTER_NEAREST
+    );
+
+    VkImageMemoryBarrier captureToTransferSrcBarrier{};
+    captureToTransferSrcBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    captureToTransferSrcBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    captureToTransferSrcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    captureToTransferSrcBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    captureToTransferSrcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    captureToTransferSrcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureToTransferSrcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureToTransferSrcBarrier.image = CaptureReadbackImage;
+    captureToTransferSrcBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    captureToTransferSrcBarrier.subresourceRange.levelCount = 1;
+    captureToTransferSrcBarrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(
+        CommandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &captureToTransferSrcBarrier
+    );
+
+    VkBufferImageCopy captureCopyRegion{};
+    captureCopyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    captureCopyRegion.imageSubresource.layerCount = 1;
+    captureCopyRegion.imageExtent.width = kCaptureReadbackWidth;
+    captureCopyRegion.imageExtent.height = kCaptureReadbackHeight;
+    captureCopyRegion.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(
+        CommandBuffer,
+        CaptureReadbackImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        CaptureLineBuffer,
+        1,
+        &captureCopyRegion
+    );
+
+    VkBufferMemoryBarrier captureToHostBarrier{};
+    captureToHostBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    captureToHostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    captureToHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    captureToHostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureToHostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureToHostBarrier.buffer = CaptureLineBuffer;
+    captureToHostBarrier.offset = 0;
+    captureToHostBarrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(
+        CommandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        0,
+        nullptr,
+        1,
+        &captureToHostBarrier,
+        0,
+        nullptr
+    );
+
+    VkImageMemoryBarrier captureBackToGeneralBarrier{};
+    captureBackToGeneralBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    captureBackToGeneralBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    captureBackToGeneralBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    captureBackToGeneralBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    captureBackToGeneralBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    captureBackToGeneralBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureBackToGeneralBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    captureBackToGeneralBarrier.image = CaptureReadbackImage;
+    captureBackToGeneralBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    captureBackToGeneralBarrier.subresourceRange.levelCount = 1;
+    captureBackToGeneralBarrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(
+        CommandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &captureBackToGeneralBarrier
+    );
+
+    VkImageMemoryBarrier colorBackToGeneralBarrier{};
+    colorBackToGeneralBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    colorBackToGeneralBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    colorBackToGeneralBarrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT |
+        VK_ACCESS_SHADER_WRITE_BIT |
+        VK_ACCESS_TRANSFER_READ_BIT |
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    colorBackToGeneralBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    colorBackToGeneralBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    colorBackToGeneralBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    colorBackToGeneralBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    colorBackToGeneralBarrier.image = ColorImage;
+    colorBackToGeneralBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    colorBackToGeneralBarrier.subresourceRange.levelCount = 1;
+    colorBackToGeneralBarrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(
+        CommandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &colorBackToGeneralBarrier
+    );
+
+    if (vkEndCommandBuffer(CommandBuffer) != VK_SUCCESS)
+        return false;
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &CommandBuffer;
+    {
+        std::scoped_lock queueLock(VulkanContext::Get().GetQueueLock());
+        const VkResult submitResult = vkQueueSubmit(Queue, 1, &submitInfo, FrameFence);
+        if (submitResult != VK_SUCCESS)
+            return false;
+    }
+
+    CaptureReadbackImageInitialized = true;
+    CaptureLineExportCount++;
+    CaptureLineExportCpuWindow.Add(0);
+    PendingCaptureLineContext = nullptr;
+    CaptureLinePending = true;
+    CaptureLineDataIsRgba8 = true;
+    PendingCaptureLineBufferSlot = static_cast<int>(ActiveCaptureLineBufferSlot);
+    CaptureLineReady = false;
+    ReadyCaptureLineBufferSlot = -1;
+    ReadyCaptureLineData = nullptr;
+    ActiveCapturePathMode = CapturePathMode::CaptureLineExport;
+    CapturePathModeCounts[static_cast<size_t>(CapturePathMode::CaptureLineExport)]++;
+    return true;
+}
+
+bool VulkanRenderer3D::readbackGraphicsAttrImageToCpu(std::vector<u32>& outAttrPixels)
+{
+    if (!ensureInitialized() || AttrImage == VK_NULL_HANDLE || ColorImageWidth == 0 || ColorImageHeight == 0)
+        return false;
+    if (!waitForReadbackSource())
+        return false;
+
+    const VkDeviceSize requiredReadbackSize = static_cast<VkDeviceSize>(ColorImageWidth) * static_cast<VkDeviceSize>(ColorImageHeight) * sizeof(u32);
+    if (ReadbackBuffer == VK_NULL_HANDLE || ReadbackMemory == VK_NULL_HANDLE || ReadbackSize != requiredReadbackSize)
+    {
+        destroyReadbackBuffer();
+        if (!createReadbackBuffer(ColorImageWidth, ColorImageHeight))
+            return false;
+    }
+
+    if (vkWaitForFences(Device, 1, &FrameFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return false;
+    if (vkResetFences(Device, 1, &FrameFence) != VK_SUCCESS)
+        return false;
+    if (vkResetCommandBuffer(CommandBuffer, 0) != VK_SUCCESS)
+        return false;
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(CommandBuffer, &beginInfo) != VK_SUCCESS)
+        return false;
+
+    VkImageMemoryBarrier toTransferBarrier{};
+    toTransferBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransferBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toTransferBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toTransferBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferBarrier.image = AttrImage;
+    toTransferBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransferBarrier.subresourceRange.levelCount = 1;
+    toTransferBarrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransferBarrier);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageExtent.width = ColorImageWidth;
+    copyRegion.imageExtent.height = ColorImageHeight;
+    copyRegion.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(CommandBuffer, AttrImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ReadbackBuffer, 1, &copyRegion);
+
+    VkBufferMemoryBarrier toHostBarrier{};
+    toHostBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    toHostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    toHostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHostBarrier.buffer = ReadbackBuffer;
+    toHostBarrier.size = ReadbackSize;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &toHostBarrier, 0, nullptr);
+
+    VkImageMemoryBarrier backToShaderBarrier = toTransferBarrier;
+    backToShaderBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    backToShaderBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    backToShaderBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    backToShaderBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &backToShaderBarrier);
+
+    if (vkEndCommandBuffer(CommandBuffer) != VK_SUCCESS)
+        return false;
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &CommandBuffer;
+    {
+        std::scoped_lock queueLock(VulkanContext::Get().GetQueueLock());
+        if (vkQueueSubmit(Queue, 1, &submitInfo, FrameFence) != VK_SUCCESS)
+            return false;
+    }
+    if (vkWaitForFences(Device, 1, &FrameFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return false;
+    if (ReadbackMapped == nullptr)
+        return false;
+
+    const size_t pixelCount = static_cast<size_t>(ColorImageWidth) * static_cast<size_t>(ColorImageHeight);
+    std::vector<u32> rawPixels(pixelCount);
+    std::memcpy(rawPixels.data(), ReadbackMapped, pixelCount * sizeof(u32));
+    outAttrPixels.resize(pixelCount);
+    for (size_t i = 0; i < pixelCount; i++)
+        outAttrPixels[i] = PackOpenGlAttrToLogical(rawPixels[i]);
+    return true;
+}
+
+bool VulkanRenderer3D::readbackGraphicsDepthImageToCpu(std::vector<u32>& outDepthPixels)
+{
+    if (!ensureInitialized() || DepthImage == VK_NULL_HANDLE || ColorImageWidth == 0 || ColorImageHeight == 0)
+        return false;
+    if (!waitForReadbackSource())
+        return false;
+
+    const VkDeviceSize requiredReadbackSize = static_cast<VkDeviceSize>(ColorImageWidth) * static_cast<VkDeviceSize>(ColorImageHeight) * sizeof(float);
+    if (ReadbackBuffer == VK_NULL_HANDLE || ReadbackMemory == VK_NULL_HANDLE || ReadbackSize != requiredReadbackSize)
+    {
+        destroyReadbackBuffer();
+        if (!createReadbackBuffer(ColorImageWidth, ColorImageHeight))
+            return false;
+    }
+
+    if (vkWaitForFences(Device, 1, &FrameFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return false;
+    if (vkResetFences(Device, 1, &FrameFence) != VK_SUCCESS)
+        return false;
+    if (vkResetCommandBuffer(CommandBuffer, 0) != VK_SUCCESS)
+        return false;
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(CommandBuffer, &beginInfo) != VK_SUCCESS)
+        return false;
+
+    VkImageMemoryBarrier toTransferBarrier{};
+    toTransferBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransferBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransferBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toTransferBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toTransferBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransferBarrier.image = DepthImage;
+    toTransferBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransferBarrier.subresourceRange.levelCount = 1;
+    toTransferBarrier.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransferBarrier);
+
+    VkBufferImageCopy copyRegion{};
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageExtent.width = ColorImageWidth;
+    copyRegion.imageExtent.height = ColorImageHeight;
+    copyRegion.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(CommandBuffer, DepthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ReadbackBuffer, 1, &copyRegion);
+
+    VkBufferMemoryBarrier toHostBarrier{};
+    toHostBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    toHostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    toHostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toHostBarrier.buffer = ReadbackBuffer;
+    toHostBarrier.size = ReadbackSize;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &toHostBarrier, 0, nullptr);
+
+    VkImageMemoryBarrier backToShaderBarrier = toTransferBarrier;
+    backToShaderBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    backToShaderBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    backToShaderBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    backToShaderBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &backToShaderBarrier);
+
+    if (vkEndCommandBuffer(CommandBuffer) != VK_SUCCESS)
+        return false;
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &CommandBuffer;
+    {
+        std::scoped_lock queueLock(VulkanContext::Get().GetQueueLock());
+        if (vkQueueSubmit(Queue, 1, &submitInfo, FrameFence) != VK_SUCCESS)
+            return false;
+    }
+    if (vkWaitForFences(Device, 1, &FrameFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        return false;
+    if (ReadbackMapped == nullptr)
+        return false;
+
+    const size_t pixelCount = static_cast<size_t>(ColorImageWidth) * static_cast<size_t>(ColorImageHeight);
+    outDepthPixels.resize(pixelCount);
+    const auto* depthValues = reinterpret_cast<const float*>(ReadbackMapped);
+    for (size_t i = 0; i < pixelCount; i++)
+    {
+        const float depth = std::clamp(depthValues[i], 0.0f, 1.0f);
+        outDepthPixels[i] = static_cast<u32>(std::lround(depth * 16777215.0f));
+    }
     return true;
 }
 
@@ -5883,6 +10363,7 @@ bool VulkanRenderer3D::readbackColorTargetToCpu(bool capturePath)
     VkImageMemoryBarrier colorToTransferSrcBarrier{};
     colorToTransferSrcBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     colorToTransferSrcBarrier.srcAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
         VK_ACCESS_SHADER_READ_BIT |
         VK_ACCESS_SHADER_WRITE_BIT |
         VK_ACCESS_TRANSFER_WRITE_BIT |
@@ -6094,7 +10575,11 @@ bool VulkanRenderer3D::readbackColorTargetToCpu(bool capturePath)
     VkImageMemoryBarrier colorBackToGeneralBarrier{};
     colorBackToGeneralBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     colorBackToGeneralBarrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    colorBackToGeneralBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    colorBackToGeneralBarrier.dstAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_SHADER_READ_BIT |
+        VK_ACCESS_SHADER_WRITE_BIT |
+        VK_ACCESS_TRANSFER_READ_BIT;
     colorBackToGeneralBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     colorBackToGeneralBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     colorBackToGeneralBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -6108,7 +10593,7 @@ bool VulkanRenderer3D::readbackColorTargetToCpu(bool capturePath)
     vkCmdPipelineBarrier(
         CommandBuffer,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0,
         0,
         nullptr,
@@ -6150,6 +10635,11 @@ bool VulkanRenderer3D::readbackColorTargetToCpu(bool capturePath)
     ColorImageInitialized = true;
     if (canUseCaptureDownscale)
         CaptureReadbackImageInitialized = true;
+    if (capturePath)
+    {
+        ActiveCapturePathMode = CapturePathMode::FallbackReadback;
+        CapturePathModeCounts[static_cast<size_t>(CapturePathMode::FallbackReadback)]++;
+    }
     return true;
 }
 
@@ -6285,12 +10775,737 @@ bool VulkanRenderer3D::readbackResultBufferToCpu()
     return true;
 }
 
+void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
+{
+    struct TextureFrameData
+    {
+        u32 DescriptorIndex = 0;
+    };
+
+    struct TextureLookupKey
+    {
+        TexcacheVulkanLoader::TextureHandle Handle = 0;
+
+        bool operator==(const TextureLookupKey& other) const noexcept
+        {
+            return Handle == other.Handle;
+        }
+    };
+
+    struct TextureLookupHasher
+    {
+        size_t operator()(const TextureLookupKey& key) const noexcept
+        {
+            return std::hash<u64>{}(key.Handle);
+        }
+    };
+
+    const u32 scaleFactor = static_cast<u32>(std::max(1, ScaleFactor));
+    const u32 targetHeight = 192u * scaleFactor;
+    const float scale = static_cast<float>(scaleFactor);
+    const float maxTargetX = 256.0f * scale;
+    const float maxTargetY = 192.0f * scale;
+    const bool textureMapsEnabled = (gpu.GPU3D.RenderDispCnt & (1u << 0u)) != 0u;
+    const bool highlightEnabled = (gpu.GPU3D.RenderDispCnt & (1u << 1u)) != 0u;
+    const bool disablePassiveRepeatCoverageExpand =
+        (MelonDSAndroid::getVulkanDiagnosticFlags() & kVulkanDiagnosticDisablePassiveRepeatCoverageExpand) != 0u;
+    const float coverageDepthBias = CoverageFixDepthBias * 16777215.0f;
+
+    AcceleratedSceneBuildConfig sceneBuildConfig{};
+    sceneBuildConfig.Scale = ScaleFactor;
+    sceneBuildConfig.BetterPolygons = BetterPolygons;
+    sceneBuildConfig.UseHiresCoordinates = true;
+    sceneBuildConfig.MaxFixedX = static_cast<s32>((256u * scaleFactor * 16u) - 1u);
+    sceneBuildConfig.MaxFixedY = static_cast<s32>((192u * scaleFactor * 16u) - 1u);
+    sceneBuildConfig.CoverageFix.Enabled = CoverageFixEnabled;
+    sceneBuildConfig.CoverageFix.UserPx = CoverageFixPx;
+    sceneBuildConfig.CoverageFix.ApplyRepeat = CoverageFixApplyRepeat;
+    sceneBuildConfig.CoverageFix.ApplyClamp = CoverageFixApplyClamp;
+    sceneBuildConfig.CoverageFix.PassiveRepeatPx = PassiveCoverageFixRepeatPx;
+    sceneBuildConfig.CoverageFix.DisablePassiveRepeat = disablePassiveRepeatCoverageExpand;
+
+    const u64 sceneBuildCpuStartNs = PerfNowNs();
+    BuildAcceleratedScene(gpu.GPU3D, sceneBuildConfig, SharedGraphicsScene);
+    GraphicsSceneBuildCpuWindow.Add(PerfNowNs() - sceneBuildCpuStartNs);
+
+    const size_t estimatedTriangleCount =
+        SharedGraphicsScene.Triangles.size() + (SharedGraphicsScene.Draws.size() * 2u);
+    Triangles.reserve(std::max(Triangles.capacity(), estimatedTriangleCount));
+    GraphicsVertices.reserve(std::max(GraphicsVertices.capacity(), estimatedTriangleCount * 3u));
+    GraphicsSceneVertices.resize(SharedGraphicsScene.Vertices.size());
+    GraphicsPolygons.reserve(std::max(GraphicsPolygons.capacity(), SharedGraphicsScene.Draws.size()));
+    GraphicsOpaqueDrawIndices.reserve(std::max(GraphicsOpaqueDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
+    GraphicsNeedOpaqueDrawIndices.reserve(std::max(GraphicsNeedOpaqueDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
+    GraphicsAlphaDrawIndices.reserve(std::max(GraphicsAlphaDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
+    GraphicsShadowMaskDrawIndices.reserve(std::max(GraphicsShadowMaskDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
+    GraphicsShadowDrawIndices.reserve(std::max(GraphicsShadowDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
+
+    std::unordered_map<TextureLookupKey, TextureFrameData, TextureLookupHasher> textureLookup{};
+    textureLookup.reserve(SharedGraphicsScene.Draws.size());
+
+    const auto to8From6 = [](u32 c6) -> u32 {
+        c6 &= 0x3Fu;
+        return (c6 << 2u) | (c6 >> 4u);
+    };
+
+    const auto to8From5 = [](u32 c5) -> u32 {
+        c5 &= 0x1Fu;
+        return (c5 << 3u) | (c5 >> 2u);
+    };
+
+    const auto packRgba8 = [](u32 r, u32 g, u32 b, u32 a) -> u32 {
+        return (r & 0xFFu) | ((g & 0xFFu) << 8u) | ((b & 0xFFu) << 16u) | ((a & 0xFFu) << 24u);
+    };
+
+    struct TriangleVertexData
+    {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float w = 1.0f;
+        float u = 0.0f;
+        float v = 0.0f;
+        u32 colorRgba8 = 0;
+        u32 wRaw = 1u;
+    };
+
+    constexpr u32 kTriangleFlagTranslucent = 1u << 0u;
+    constexpr u32 kTriangleFlagTextured = 1u << 1u;
+    constexpr u32 kTriangleFlagDecal = 1u << 2u;
+    constexpr u32 kTriangleFlagCoverageFix = 1u << 3u;
+    constexpr u32 kTriangleFlagWBuffer = 1u << 4u;
+    constexpr u32 kTriangleFlagShadowMask = 1u << 5u;
+    constexpr u32 kTriangleFlagLinear = 1u << 6u;
+    constexpr u32 kTriangleFlagBoundaryEdge0 = 1u << 7u;
+    constexpr u32 kTriangleFlagBoundaryEdge1 = 1u << 8u;
+    constexpr u32 kTriangleFlagBoundaryEdge2 = 1u << 9u;
+    constexpr u32 kTriangleFlagFrontFacing = 1u << 10u;
+    constexpr u32 kTriangleFlagTopLeftEdge0 = 1u << 11u;
+    constexpr u32 kTriangleFlagTopLeftEdge1 = 1u << 12u;
+    constexpr u32 kTriangleFlagTopLeftEdge2 = 1u << 13u;
+    constexpr u32 kVariantFlagTextured = 1u << 0u;
+    constexpr u32 kVariantFlagDecal = 1u << 1u;
+    constexpr u32 kVariantFlagModulate = 1u << 2u;
+    constexpr u32 kVariantFlagToon = 1u << 3u;
+    constexpr u32 kVariantFlagHighlight = 1u << 4u;
+    constexpr u32 kVariantFlagShadowMask = 1u << 5u;
+    constexpr u32 kVariantFlagWBuffer = 1u << 6u;
+    constexpr u32 kVariantFlagTranslucent = 1u << 7u;
+    constexpr u32 kVariantFlagCoverageFix = 1u << 8u;
+
+    const auto packYBounds = [&](const float* yValues, size_t yValueCount) -> std::optional<u32> {
+        u32 polygonYTop = targetHeight;
+        u32 polygonYBot = 0u;
+        bool hasPolygonYBounds = false;
+        for (size_t yIndex = 0; yIndex < yValueCount; yIndex++)
+        {
+            const float clampedY = std::clamp(yValues[yIndex], 0.0f, static_cast<float>(targetHeight));
+            const u32 yTopLine = static_cast<u32>(std::floor(clampedY));
+            const u32 yBottomLine = std::min<u32>(targetHeight, static_cast<u32>(std::ceil(clampedY)));
+            polygonYTop = std::min(polygonYTop, yTopLine);
+            polygonYBot = std::max(polygonYBot, yBottomLine);
+            hasPolygonYBounds = true;
+        }
+
+        if (!hasPolygonYBounds)
+            return std::nullopt;
+
+        if (polygonYBot <= polygonYTop)
+            polygonYBot = std::min<u32>(targetHeight, polygonYTop + 1u);
+
+        return (polygonYTop & 0xFFFFu) | ((polygonYBot & 0xFFFFu) << 16u);
+    };
+
+    for (const AcceleratedSceneDraw& sceneDraw : SharedGraphicsScene.Draws)
+    {
+        const Polygon* polygon = sceneDraw.SourcePolygon;
+        if (polygon == nullptr)
+            continue;
+
+        const size_t polygonTriangleBase = Triangles.size();
+        const AcceleratedPolygonMeta& polygonMeta = sceneDraw.Meta;
+        const u32 alpha5 = polygonMeta.Alpha5;
+        const bool polygonUsesGlTranslucentPass =
+            HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagTranslucent);
+        const bool isTranslucent = polygonUsesGlTranslucentPass || (alpha5 != 0u && alpha5 < 0x1Fu);
+        const u32 blendMode = (polygonMeta.PolyAttr >> 4u) & 0x3u;
+        const float effectiveCoverageDepthBias =
+            sceneDraw.CoverageFixState.ApplyUserFix ? coverageDepthBias : 0.0f;
+
+        bool polygonTextured = textureMapsEnabled && (((polygon->TexParam >> 26u) & 0x7u) != 0u);
+        TexcacheVulkanLoader::TextureHandle textureHandle = 0;
+        u32 textureLayer = 0;
+        u32* helper = nullptr;
+        u32 textureDescriptorIndex = FallbackTextureDescriptorIndex;
+        bool textureFallbackUsed = false;
+        u32 texWidth = 0u;
+        u32 texHeight = 0u;
+        if (polygonTextured)
+        {
+            Texcache.GetTexture(
+                gpu,
+                polygon->TexParam,
+                polygon->TexPalette,
+                textureHandle,
+                textureLayer,
+                helper
+            );
+
+            texWidth = TextureWidth(polygon->TexParam);
+            texHeight = TextureHeight(polygon->TexParam);
+            if (texWidth == 0u || texHeight == 0u)
+            {
+                polygonTextured = false;
+            }
+            else
+            {
+                const TextureLookupKey textureKey{textureHandle};
+                auto textureIt = textureLookup.find(textureKey);
+                if (textureIt == textureLookup.end())
+                {
+                    VkDescriptorImageInfo textureDescriptorInfo{};
+                    if (Texcache.GetLoader().GetTextureDescriptor(textureHandle, &textureDescriptorInfo)
+                        && ActiveTextureDescriptorCount < MaxActiveTextureDescriptors)
+                    {
+                        textureDescriptorIndex = ActiveTextureDescriptorCount;
+                        ActiveTextureDescriptors[textureDescriptorIndex] = textureDescriptorInfo;
+                        ActiveTextureDescriptorCount++;
+                        textureLookup.emplace(textureKey, TextureFrameData{textureDescriptorIndex});
+                    }
+                    else
+                    {
+                        textureDescriptorIndex = FallbackTextureDescriptorIndex;
+                        textureLayer = 0u;
+                        texWidth = 1u;
+                        texHeight = 1u;
+                        textureFallbackUsed = true;
+                    }
+                }
+                else
+                {
+                    textureDescriptorIndex = textureIt->second.DescriptorIndex;
+                }
+            }
+        }
+
+        const bool hasTexture = polygonTextured && texWidth > 0u && texHeight > 0u;
+        u32 sceneVertexFlags = 0u;
+        if (hasTexture)
+        {
+            sceneVertexFlags |= kTriangleFlagTextured;
+            if ((blendMode & 0x1u) != 0u && !textureFallbackUsed)
+                sceneVertexFlags |= kTriangleFlagDecal;
+        }
+        if (sceneDraw.CoverageFixState.Apply)
+            sceneVertexFlags |= kTriangleFlagCoverageFix;
+        if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagWBuffer))
+            sceneVertexFlags |= kTriangleFlagWBuffer;
+        if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask))
+            sceneVertexFlags |= kTriangleFlagShadowMask;
+        if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagFacingView))
+            sceneVertexFlags |= kTriangleFlagFrontFacing;
+
+        const auto makeColor = [&](const AcceleratedSceneVertex& vertex) -> u32 {
+            const u32 vr = static_cast<u32>(vertex.FinalColorR) >> 3u;
+            const u32 vg = static_cast<u32>(vertex.FinalColorG) >> 3u;
+            const u32 vb = static_cast<u32>(vertex.FinalColorB) >> 3u;
+            return packRgba8(
+                to8From6(vr),
+                to8From6(vg),
+                to8From6(vb),
+                to8From5(std::min<u32>(31u, vertex.Alpha5)));
+        };
+
+        const auto makeSceneGraphicsVertex = [&](const AcceleratedSceneVertex& vertex) -> GraphicsVertexGpu {
+            GraphicsVertexGpu graphicsVertex{};
+            graphicsVertex.x = vertex.X;
+            graphicsVertex.y = vertex.Y;
+            graphicsVertex.z = static_cast<float>(vertex.Z);
+            graphicsVertex.reciprocalW = 1.0f / static_cast<float>(std::max<u32>(1u, vertex.W));
+            graphicsVertex.u = static_cast<float>(vertex.TexCoordS);
+            graphicsVertex.v = static_cast<float>(vertex.TexCoordT);
+            graphicsVertex.colorRgba8 = makeColor(vertex);
+            graphicsVertex.flags = sceneVertexFlags;
+            graphicsVertex.texLayer = textureLayer;
+            graphicsVertex.texArrayIndex = hasTexture ? textureDescriptorIndex : 0u;
+            graphicsVertex.texWidth = hasTexture ? texWidth : 0u;
+            graphicsVertex.texHeight = hasTexture ? texHeight : 0u;
+            graphicsVertex.texParam = hasTexture ? polygon->TexParam : 0u;
+            graphicsVertex.polyAttr = polygonMeta.PolyAttr;
+            return graphicsVertex;
+        };
+
+        for (u32 vertexOffset = 0; vertexOffset < sceneDraw.VertexCount; vertexOffset++)
+        {
+            const u32 sceneVertexIndex = sceneDraw.FirstVertex + vertexOffset;
+            if (sceneVertexIndex >= SharedGraphicsScene.Vertices.size() || sceneVertexIndex >= GraphicsSceneVertices.size())
+                break;
+            GraphicsSceneVertices[sceneVertexIndex] = makeSceneGraphicsVertex(SharedGraphicsScene.Vertices[sceneVertexIndex]);
+        }
+
+        const auto makeTriangleVertex = [&](const AcceleratedSceneVertex& vertex, float x, float y) -> TriangleVertexData {
+            TriangleVertexData triangleVertex{};
+            triangleVertex.x = std::clamp(x, 0.0f, maxTargetX);
+            triangleVertex.y = std::clamp(y, 0.0f, maxTargetY);
+            triangleVertex.z = static_cast<float>(vertex.Z);
+            triangleVertex.wRaw = std::max<u32>(1u, vertex.W);
+            triangleVertex.w = static_cast<float>(triangleVertex.wRaw);
+            if (sceneDraw.CoverageFixState.Apply && effectiveCoverageDepthBias > 0.0f)
+                triangleVertex.z = std::max(0.0f, triangleVertex.z - effectiveCoverageDepthBias);
+            triangleVertex.u = static_cast<float>(vertex.TexCoordS);
+            triangleVertex.v = static_cast<float>(vertex.TexCoordT);
+            triangleVertex.colorRgba8 = makeColor(vertex);
+            return triangleVertex;
+        };
+
+        const auto appendTriangle = [&](const TriangleVertexData& vertex0,
+                                        const TriangleVertexData& vertex1,
+                                        const TriangleVertexData& vertex2,
+                                        u32 boundaryFlags,
+                                        u32 packedYBounds) {
+            TriangleGpu triangle{};
+            triangle.x0 = vertex0.x;
+            triangle.y0 = vertex0.y;
+            triangle.z0 = vertex0.z;
+            triangle.w0 = vertex0.w;
+            triangle.x1 = vertex1.x;
+            triangle.y1 = vertex1.y;
+            triangle.z1 = vertex1.z;
+            triangle.w1 = vertex1.w;
+            triangle.x2 = vertex2.x;
+            triangle.y2 = vertex2.y;
+            triangle.z2 = vertex2.z;
+            triangle.w2 = vertex2.w;
+            triangle.u0 = vertex0.u;
+            triangle.v0 = vertex0.v;
+            triangle.u1 = vertex1.u;
+            triangle.v1 = vertex1.v;
+            triangle.u2 = vertex2.u;
+            triangle.v2 = vertex2.v;
+            triangle.yBounds = packedYBounds;
+            triangle.texLayer = textureLayer;
+            triangle.color0Rgba8 = vertex0.colorRgba8;
+            triangle.color1Rgba8 = vertex1.colorRgba8;
+            triangle.color2Rgba8 = vertex2.colorRgba8;
+
+            const u32 a0 = (triangle.color0Rgba8 >> 24u) & 0xFFu;
+            const u32 a1 = (triangle.color1Rgba8 >> 24u) & 0xFFu;
+            const u32 a2 = (triangle.color2Rgba8 >> 24u) & 0xFFu;
+            const bool alphaTranslucent = (a0 < 255u) || (a1 < 255u) || (a2 < 255u);
+
+            triangle.flags = boundaryFlags;
+            if (isTranslucent || alphaTranslucent)
+                triangle.flags |= kTriangleFlagTranslucent;
+            if (hasTexture)
+            {
+                triangle.flags |= kTriangleFlagTextured;
+                if ((blendMode & 0x1u) != 0u && !textureFallbackUsed)
+                    triangle.flags |= kTriangleFlagDecal;
+                triangle.texArrayIndex = textureDescriptorIndex;
+                triangle.texWidth = texWidth;
+                triangle.texHeight = texHeight;
+                triangle.texParam = polygon->TexParam;
+            }
+            if (sceneDraw.CoverageFixState.Apply)
+                triangle.flags |= kTriangleFlagCoverageFix;
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagWBuffer))
+                triangle.flags |= kTriangleFlagWBuffer;
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask))
+                triangle.flags |= kTriangleFlagShadowMask;
+            if (vertex0.wRaw == vertex1.wRaw && vertex1.wRaw == vertex2.wRaw && (vertex0.wRaw & 0x7Fu) == 0u)
+                triangle.flags |= kTriangleFlagLinear;
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagFacingView))
+                triangle.flags |= kTriangleFlagFrontFacing;
+
+            const auto isTopLeftEdge = [](const TriangleVertexData& start, const TriangleVertexData& end) -> bool {
+                const float deltaY = end.y - start.y;
+                if (std::fabs(deltaY) < 0.000001f)
+                    return (end.x - start.x) > 0.0f;
+                return deltaY < 0.0f;
+            };
+            const float signedArea = (vertex2.x - vertex0.x) * (vertex1.y - vertex0.y)
+                - (vertex2.y - vertex0.y) * (vertex1.x - vertex0.x);
+            const bool positiveArea = signedArea > 0.0f;
+            if ((triangle.flags & kTriangleFlagBoundaryEdge0) == 0u
+                && (positiveArea ? isTopLeftEdge(vertex1, vertex2) : isTopLeftEdge(vertex2, vertex1)))
+            {
+                triangle.flags |= kTriangleFlagTopLeftEdge0;
+            }
+            if ((triangle.flags & kTriangleFlagBoundaryEdge1) == 0u
+                && (positiveArea ? isTopLeftEdge(vertex2, vertex0) : isTopLeftEdge(vertex0, vertex2)))
+            {
+                triangle.flags |= kTriangleFlagTopLeftEdge1;
+            }
+            if ((triangle.flags & kTriangleFlagBoundaryEdge2) == 0u
+                && (positiveArea ? isTopLeftEdge(vertex0, vertex1) : isTopLeftEdge(vertex1, vertex0)))
+            {
+                triangle.flags |= kTriangleFlagTopLeftEdge2;
+            }
+
+            triangle.polyAttr = polygonMeta.PolyAttr;
+            triangle.variantKey = 0u;
+            if (hasTexture)
+                triangle.variantKey |= kVariantFlagTextured;
+            if (blendMode == 2u)
+            {
+                triangle.variantKey |= highlightEnabled ? kVariantFlagHighlight : kVariantFlagToon;
+            }
+            else if (hasTexture && (blendMode & 0x1u) != 0u && !textureFallbackUsed)
+            {
+                triangle.variantKey |= kVariantFlagDecal;
+            }
+            else
+            {
+                triangle.variantKey |= kVariantFlagModulate;
+            }
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask))
+                triangle.variantKey |= kVariantFlagShadowMask;
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagWBuffer))
+                triangle.variantKey |= kVariantFlagWBuffer;
+            if (isTranslucent || alphaTranslucent)
+                triangle.variantKey |= kVariantFlagTranslucent;
+            if (sceneDraw.CoverageFixState.Apply)
+                triangle.variantKey |= kVariantFlagCoverageFix;
+
+            Triangles.push_back(triangle);
+
+            const auto reciprocalW = [](float w) {
+                return 1.0f / std::max(w, 1.0f);
+            };
+            const auto appendGraphicsVertex = [&](const TriangleVertexData& vertexData) {
+                GraphicsVertexGpu graphicsVertex{};
+                graphicsVertex.x = vertexData.x;
+                graphicsVertex.y = vertexData.y;
+                graphicsVertex.z = vertexData.z;
+                graphicsVertex.reciprocalW = reciprocalW(vertexData.w);
+                graphicsVertex.u = vertexData.u;
+                graphicsVertex.v = vertexData.v;
+                graphicsVertex.colorRgba8 = vertexData.colorRgba8;
+                graphicsVertex.flags = triangle.flags;
+                graphicsVertex.texLayer = triangle.texLayer;
+                graphicsVertex.texArrayIndex = triangle.texArrayIndex;
+                graphicsVertex.texWidth = triangle.texWidth;
+                graphicsVertex.texHeight = triangle.texHeight;
+                graphicsVertex.texParam = triangle.texParam;
+                graphicsVertex.polyAttr = triangle.polyAttr;
+                GraphicsVertices.push_back(graphicsVertex);
+            };
+
+            appendGraphicsVertex(vertex0);
+            appendGraphicsVertex(vertex1);
+            appendGraphicsVertex(vertex2);
+        };
+
+        const auto enqueueGraphicsDraw = [&](size_t polygonTriangleCount) {
+            if (polygonTriangleCount == 0u)
+                return;
+
+            GraphicsPolygonDraw draw{};
+            draw.firstTriangle = static_cast<u32>(polygonTriangleBase);
+            draw.triangleCount = static_cast<u32>(polygonTriangleCount);
+            draw.polyAttr = polygonMeta.PolyAttr;
+            draw.flags = polygonMeta.Flags;
+            draw.firstVertex = sceneDraw.FirstVertex;
+            draw.vertexCount = sceneDraw.VertexCount;
+            draw.firstEdgeIndex = sceneDraw.FirstEdgeIndex;
+            draw.edgeIndexCount = sceneDraw.EdgeIndexCount;
+
+            const u32 drawIndex = static_cast<u32>(GraphicsPolygons.size());
+            GraphicsPolygons.push_back(draw);
+
+            if (!polygonUsesGlTranslucentPass
+                && !HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask)
+                && !HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadow))
+            {
+                GraphicsOpaqueDrawIndices.push_back(drawIndex);
+            }
+
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagNeedOpaquePass))
+                GraphicsNeedOpaqueDrawIndices.push_back(drawIndex);
+
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask))
+            {
+                GraphicsShadowMaskDrawIndices.push_back(drawIndex);
+            }
+            else if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadow))
+            {
+                GraphicsShadowDrawIndices.push_back(drawIndex);
+            }
+            else if (polygonUsesGlTranslucentPass)
+            {
+                GraphicsAlphaDrawIndices.push_back(drawIndex);
+            }
+        };
+
+        if (sceneDraw.PrimitiveType == AcceleratedPrimitiveType::Lines)
+        {
+            if (sceneDraw.IndexCount < 2u || (sceneDraw.FirstIndex + 1u) >= SharedGraphicsScene.Indices.size())
+                continue;
+
+            const u16 vertexIndex0 = SharedGraphicsScene.Indices[sceneDraw.FirstIndex];
+            const u16 vertexIndex1 = SharedGraphicsScene.Indices[sceneDraw.FirstIndex + 1u];
+            if (vertexIndex0 >= SharedGraphicsScene.Vertices.size() || vertexIndex1 >= SharedGraphicsScene.Vertices.size())
+                continue;
+
+            const AcceleratedSceneVertex& lineVertex0 = SharedGraphicsScene.Vertices[vertexIndex0];
+            const AcceleratedSceneVertex& lineVertex1 = SharedGraphicsScene.Vertices[vertexIndex1];
+            const float lineX0 = lineVertex0.X;
+            const float lineY0 = lineVertex0.Y;
+            const float lineX1 = lineVertex1.X;
+            const float lineY1 = lineVertex1.Y;
+
+            const float deltaX = lineX1 - lineX0;
+            const float deltaY = lineY1 - lineY0;
+            const float lineLengthSquared = (deltaX * deltaX) + (deltaY * deltaY);
+            if (lineLengthSquared <= 0.000001f)
+                continue;
+
+            const float inverseLineLength = 1.0f / std::sqrt(lineLengthSquared);
+            const float halfLineWidth = 0.5f;
+            const float perpX = -deltaY * inverseLineLength * halfLineWidth;
+            const float perpY = deltaX * inverseLineLength * halfLineWidth;
+
+            const float quadPositionsX[4] = {
+                std::clamp(lineX0 + perpX, 0.0f, maxTargetX),
+                std::clamp(lineX0 - perpX, 0.0f, maxTargetX),
+                std::clamp(lineX1 - perpX, 0.0f, maxTargetX),
+                std::clamp(lineX1 + perpX, 0.0f, maxTargetX),
+            };
+            const float quadPositionsY[4] = {
+                std::clamp(lineY0 + perpY, 0.0f, maxTargetY),
+                std::clamp(lineY0 - perpY, 0.0f, maxTargetY),
+                std::clamp(lineY1 - perpY, 0.0f, maxTargetY),
+                std::clamp(lineY1 + perpY, 0.0f, maxTargetY),
+            };
+
+            const std::optional<u32> packedLineYBounds = packYBounds(quadPositionsY, 4u);
+            if (!packedLineYBounds.has_value())
+                continue;
+
+            appendTriangle(
+                makeTriangleVertex(lineVertex0, quadPositionsX[0], quadPositionsY[0]),
+                makeTriangleVertex(lineVertex0, quadPositionsX[1], quadPositionsY[1]),
+                makeTriangleVertex(lineVertex1, quadPositionsX[2], quadPositionsY[2]),
+                kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge2,
+                *packedLineYBounds);
+            appendTriangle(
+                makeTriangleVertex(lineVertex0, quadPositionsX[0], quadPositionsY[0]),
+                makeTriangleVertex(lineVertex1, quadPositionsX[2], quadPositionsY[2]),
+                makeTriangleVertex(lineVertex1, quadPositionsX[3], quadPositionsY[3]),
+                kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge1,
+                *packedLineYBounds);
+            enqueueGraphicsDraw(Triangles.size() - polygonTriangleBase);
+            continue;
+        }
+
+        for (u32 triangleIndex = sceneDraw.FirstTriangle;
+             triangleIndex < sceneDraw.FirstTriangle + sceneDraw.TriangleCount;
+             triangleIndex++)
+        {
+            if (triangleIndex >= SharedGraphicsScene.Triangles.size())
+                break;
+
+            const AcceleratedSceneTriangle& sceneTriangle = SharedGraphicsScene.Triangles[triangleIndex];
+            const u16 vertexIndex0 = sceneTriangle.Indices[0];
+            const u16 vertexIndex1 = sceneTriangle.Indices[1];
+            const u16 vertexIndex2 = sceneTriangle.Indices[2];
+            if (vertexIndex0 >= SharedGraphicsScene.Vertices.size()
+                || vertexIndex1 >= SharedGraphicsScene.Vertices.size()
+                || vertexIndex2 >= SharedGraphicsScene.Vertices.size())
+            {
+                continue;
+            }
+
+            u32 boundaryFlags = 0u;
+            if ((sceneTriangle.BoundaryFlags & AcceleratedTriangleBoundaryEdge0) != 0u)
+                boundaryFlags |= kTriangleFlagBoundaryEdge0;
+            if ((sceneTriangle.BoundaryFlags & AcceleratedTriangleBoundaryEdge1) != 0u)
+                boundaryFlags |= kTriangleFlagBoundaryEdge1;
+            if ((sceneTriangle.BoundaryFlags & AcceleratedTriangleBoundaryEdge2) != 0u)
+                boundaryFlags |= kTriangleFlagBoundaryEdge2;
+
+            const AcceleratedSceneVertex& vertex0 = SharedGraphicsScene.Vertices[vertexIndex0];
+            const AcceleratedSceneVertex& vertex1 = SharedGraphicsScene.Vertices[vertexIndex1];
+            const AcceleratedSceneVertex& vertex2 = SharedGraphicsScene.Vertices[vertexIndex2];
+            appendTriangle(
+                makeTriangleVertex(vertex0, vertex0.X, vertex0.Y),
+                makeTriangleVertex(vertex1, vertex1.X, vertex1.Y),
+                makeTriangleVertex(vertex2, vertex2.X, vertex2.Y),
+                boundaryFlags,
+                sceneTriangle.PackedYBounds);
+        }
+
+        enqueueGraphicsDraw(Triangles.size() - polygonTriangleBase);
+    }
+
+    LastGraphicsOpaqueDrawCount = static_cast<u32>(GraphicsOpaqueDrawIndices.size());
+    LastGraphicsNeedOpaqueDrawCount = static_cast<u32>(GraphicsNeedOpaqueDrawIndices.size());
+    LastGraphicsAlphaDrawCount = static_cast<u32>(
+        GraphicsAlphaDrawIndices.size() + GraphicsShadowMaskDrawIndices.size() + GraphicsShadowDrawIndices.size());
+
+    if (MelonDSAndroid::areRendererDebugToolsEnabled() && CaptureDebugLogsRemaining > 0u)
+    {
+        const u32 firstTranslucentDraw = SharedGraphicsScene.FirstTranslucentDraw == std::numeric_limits<u32>::max()
+            ? 0xFFFFFFFFu
+            : SharedGraphicsScene.FirstTranslucentDraw;
+        Log(
+            LogLevel::Warn,
+            "VulkanGraphics[Scene]: draws=%zu triangles=%zu vertices=%zu indices=%zu firstTranslucent=%u opaque=%u needOpaque=%u alpha=%zu shadowMask=%zu shadow=%zu",
+            GraphicsPolygons.size(),
+            Triangles.size(),
+            SharedGraphicsScene.Vertices.size(),
+            SharedGraphicsScene.Indices.size(),
+            firstTranslucentDraw,
+            LastGraphicsOpaqueDrawCount,
+            LastGraphicsNeedOpaqueDrawCount,
+            GraphicsAlphaDrawIndices.size(),
+            GraphicsShadowMaskDrawIndices.size(),
+            GraphicsShadowDrawIndices.size());
+        CaptureDebugLogsRemaining--;
+
+        const auto logGraphicsBucket = [&](const char* label, const std::vector<u32>& drawIndices) {
+            if (CaptureDebugLogsRemaining == 0u)
+                return;
+
+            Log(LogLevel::Warn, "VulkanGraphics[%s]: count=%zu", label, drawIndices.size());
+            CaptureDebugLogsRemaining--;
+
+            const size_t sampleCount = std::min<size_t>(drawIndices.size(), 6u);
+            for (size_t sampleIndex = 0; sampleIndex < sampleCount && CaptureDebugLogsRemaining > 0u; sampleIndex++)
+            {
+                const u32 drawIndex = drawIndices[sampleIndex];
+                if (drawIndex >= GraphicsPolygons.size())
+                    continue;
+
+                const GraphicsPolygonDraw& draw = GraphicsPolygons[drawIndex];
+                const u32 polyId = (draw.polyAttr >> 24u) & 0x3Fu;
+                const u32 alpha5 = (draw.polyAttr >> 16u) & 0x1Fu;
+                const u32 blendMode = (draw.polyAttr >> 4u) & 0x3u;
+                const u32 yBounds = draw.firstTriangle < Triangles.size()
+                    ? Triangles[draw.firstTriangle].yBounds
+                    : 0u;
+                Log(
+                    LogLevel::Warn,
+                    "VulkanGraphics[%s]: sample=%zu draw=%u triBase=%u triCount=%u polyId=%u alpha5=%u blend=%u flags=%#x depthEq=%u depthWrite=%u fogWrite=%u y=%u..%u",
+                    label,
+                    sampleIndex,
+                    drawIndex,
+                    draw.firstTriangle,
+                    draw.triangleCount,
+                    polyId,
+                    alpha5,
+                    blendMode,
+                    draw.flags,
+                    (draw.flags & AcceleratedPolygonFlagDepthEqual) != 0u ? 1u : 0u,
+                    (draw.polyAttr & (1u << 11u)) != 0u ? 1u : 0u,
+                    (draw.flags & AcceleratedPolygonFlagFogWrite) != 0u ? 1u : 0u,
+                    yBounds & 0xFFFFu,
+                    (yBounds >> 16u) & 0xFFFFu);
+                CaptureDebugLogsRemaining--;
+            }
+        };
+
+        logGraphicsBucket("OpaqueBucket", GraphicsOpaqueDrawIndices);
+        logGraphicsBucket("NeedOpaqueBucket", GraphicsNeedOpaqueDrawIndices);
+        logGraphicsBucket("AlphaBucket", GraphicsAlphaDrawIndices);
+        logGraphicsBucket("ShadowMaskBucket", GraphicsShadowMaskDrawIndices);
+        logGraphicsBucket("ShadowBucket", GraphicsShadowDrawIndices);
+    }
+
+    static bool loggedGraphicsTriangleSummary = false;
+    if (!loggedGraphicsTriangleSummary && !Triangles.empty())
+    {
+        size_t viewportIntersectingCount = 0u;
+        size_t nonDegenerateCount = 0u;
+        for (const TriangleGpu& triangle : Triangles)
+        {
+            const float minX = std::min({triangle.x0, triangle.x1, triangle.x2});
+            const float maxX = std::max({triangle.x0, triangle.x1, triangle.x2});
+            const float minY = std::min({triangle.y0, triangle.y1, triangle.y2});
+            const float maxY = std::max({triangle.y0, triangle.y1, triangle.y2});
+            if (maxX > 0.0f && maxY > 0.0f && minX < maxTargetX && minY < maxTargetY)
+                viewportIntersectingCount++;
+
+            const float signedArea =
+                ((triangle.x1 - triangle.x0) * (triangle.y2 - triangle.y0))
+                - ((triangle.y1 - triangle.y0) * (triangle.x2 - triangle.x0));
+            if (std::fabs(signedArea) > 0.001f)
+                nonDegenerateCount++;
+        }
+
+        const TriangleGpu& triangle = Triangles.front();
+        const float rawW0 = triangle.w0 > 0.000001f ? (1.0f / triangle.w0) : 0.0f;
+        const float rawW1 = triangle.w1 > 0.000001f ? (1.0f / triangle.w1) : 0.0f;
+        const float rawW2 = triangle.w2 > 0.000001f ? (1.0f / triangle.w2) : 0.0f;
+        Log(
+            LogLevel::Warn,
+            "VulkanGraphics[Triangles]: scale=%d count=%zu viewportIntersect=%zu nonDegenerate=%zu textures=%u first tri pos=(%.3f,%.3f,%.3f,w=%.3f)->(%.3f,%.3f,%.3f,w=%.3f)->(%.3f,%.3f,%.3f,w=%.3f) flags=%#x texDesc=%u texLayer=%u texSize=%ux%u texParam=%#x polyAttr=%#x yBounds=%#x",
+            ScaleFactor,
+            Triangles.size(),
+            viewportIntersectingCount,
+            nonDegenerateCount,
+            ActiveTextureDescriptorCount,
+            triangle.x0, triangle.y0, triangle.z0, rawW0,
+            triangle.x1, triangle.y1, triangle.z1, rawW1,
+            triangle.x2, triangle.y2, triangle.z2, rawW2,
+            triangle.flags,
+            triangle.texArrayIndex,
+            triangle.texLayer,
+            triangle.texWidth,
+            triangle.texHeight,
+            triangle.texParam,
+            triangle.polyAttr,
+            triangle.yBounds);
+        if (!GraphicsPolygons.empty())
+        {
+            const GraphicsPolygonDraw& draw = GraphicsPolygons.front();
+            Log(
+                LogLevel::Warn,
+                "VulkanGraphics[Draws]: polygons=%zu opaque=%u needOpaque=%u alphaShadow=%u shadowMask=%zu shadow=%zu first firstTriangle=%u triangleCount=%u polyAttr=%#x flags=%#x dispCnt=%#x alphaRef=%u",
+                GraphicsPolygons.size(),
+                LastGraphicsOpaqueDrawCount,
+                LastGraphicsNeedOpaqueDrawCount,
+                LastGraphicsAlphaDrawCount,
+                GraphicsShadowMaskDrawIndices.size(),
+                GraphicsShadowDrawIndices.size(),
+                draw.firstTriangle,
+                draw.triangleCount,
+                draw.polyAttr,
+                draw.flags,
+                gpu.GPU3D.RenderDispCnt,
+                gpu.GPU3D.RenderAlphaRef);
+        }
+        loggedGraphicsTriangleSummary = true;
+    }
+}
+
 void VulkanRenderer3D::buildTriangleList(GPU& gpu)
 {
     Triangles.clear();
+    GraphicsVertices.clear();
+    GraphicsSceneVertices.clear();
+    GraphicsPolygons.clear();
+    GraphicsOpaqueDrawIndices.clear();
+    GraphicsNeedOpaqueDrawIndices.clear();
+    GraphicsAlphaDrawIndices.clear();
+    GraphicsShadowMaskDrawIndices.clear();
+    GraphicsShadowDrawIndices.clear();
     ActiveTextureDescriptorCount = 0;
     ActiveTextureDescriptors.fill(VkDescriptorImageInfo{});
     Triangles.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons) * 3u);
+    GraphicsVertices.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons) * 9u);
+    GraphicsPolygons.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons));
+    GraphicsOpaqueDrawIndices.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons));
+    GraphicsNeedOpaqueDrawIndices.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons));
+    GraphicsAlphaDrawIndices.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons));
+    GraphicsShadowMaskDrawIndices.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons));
+    GraphicsShadowDrawIndices.reserve(static_cast<size_t>(gpu.GPU3D.RenderNumPolygons));
+
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        buildGraphicsTriangleList(gpu);
+        return;
+    }
 
     struct TextureFrameData
     {
@@ -6322,32 +11537,24 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
     const float scale = static_cast<float>(std::max(1, ScaleFactor));
     const float maxTargetX = 256.0f * scale;
     const float maxTargetY = 192.0f * scale;
-    const bool useHiresCoordinates = ScaleFactor > 1;
+    const s32 maxTargetFixedX = static_cast<s32>(256u * static_cast<u32>(std::max(1, ScaleFactor)) * 16u);
+    const s32 maxTargetFixedY = static_cast<s32>(192u * static_cast<u32>(std::max(1, ScaleFactor)) * 16u);
+    // Keep Vulkan geometry in subpixel space even at 1x. Integer-snapped FinalPosition
+    // opens visible cracks on repeat-textured floors once the passive coverage expand is disabled.
+    const bool useHiresCoordinates = true;
     const bool textureMapsEnabled = (gpu.GPU3D.RenderDispCnt & (1u << 0)) != 0;
     const bool disablePassiveRepeatCoverageExpand =
         (MelonDSAndroid::getVulkanDiagnosticFlags() & kVulkanDiagnosticDisablePassiveRepeatCoverageExpand) != 0u;
     const float coverageDepthBias = CoverageFixDepthBias * 16777215.0f;
 
     const auto resolveVertexX = [&](const Vertex* vertex) -> float {
-        if (useHiresCoordinates)
-        {
-            const float hiresX = (static_cast<float>(vertex->HiresPosition[0]) * scale) * (1.0f / 16.0f);
-            return std::clamp(hiresX, 0.0f, maxTargetX);
-        }
-
-        const int x = std::clamp(vertex->FinalPosition[0], 0, 256);
-        return std::clamp(static_cast<float>(x) * scale, 0.0f, maxTargetX);
+        const s32 xFixed = ResolveAcceleratedVertexFixedX(*vertex, ScaleFactor, useHiresCoordinates);
+        return std::clamp(static_cast<float>(xFixed) * (1.0f / 16.0f), 0.0f, maxTargetX);
     };
 
     const auto resolveVertexY = [&](const Vertex* vertex) -> float {
-        if (useHiresCoordinates)
-        {
-            const float hiresY = (static_cast<float>(vertex->HiresPosition[1]) * scale) * (1.0f / 16.0f);
-            return std::clamp(hiresY, 0.0f, maxTargetY);
-        }
-
-        const int y = std::clamp(vertex->FinalPosition[1], 0, 192);
-        return std::clamp(static_cast<float>(y) * scale, 0.0f, maxTargetY);
+        const s32 yFixed = ResolveAcceleratedVertexFixedY(*vertex, ScaleFactor, useHiresCoordinates);
+        return std::clamp(static_cast<float>(yFixed) * (1.0f / 16.0f), 0.0f, maxTargetY);
     };
 
     const auto to8From6 = [](u32 c6) -> u32 {
@@ -6372,85 +11579,58 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
             || (polygon->Type == 1 ? polygon->NumVertices < 2 : polygon->NumVertices < 3))
             continue;
 
-        const u32 alpha5 = (polygon->Attr >> 16) & 0x1F;
-        const bool isTranslucent = polygon->Translucent || (alpha5 != 0u && alpha5 < 0x1Fu);
-        const u32 blendMode = (polygon->Attr >> 4) & 0x3u;
-        const bool highlightEnabled = (gpu.GPU3D.RenderDispCnt & (1u << 1)) != 0;
-        const bool wrapS = (polygon->TexParam & (1u << 16)) != 0;
-        const bool wrapT = (polygon->TexParam & (1u << 17)) != 0;
-        const bool isRepeat = wrapS || wrapT;
-        const bool allowUserCoverageFix = CoverageFixEnabled && (CoverageFixPx > 0.0f) && (polygon->Type != 1);
-        const bool applyPassiveCoverageFix =
-            !disablePassiveRepeatCoverageExpand
-            && (polygon->Type != 1)
-            && isRepeat
-            && (PassiveCoverageFixRepeatPx > 0.0f);
-        bool applyUserCoverageFix = false;
-        if (allowUserCoverageFix)
-            applyUserCoverageFix = isRepeat ? CoverageFixApplyRepeat : CoverageFixApplyClamp;
+        const size_t polygonTriangleBase = Triangles.size();
+        const AcceleratedPolygonMeta polygonMeta = BuildAcceleratedPolygonMeta(*polygon);
 
-        const float effectiveCoverageFixPx =
-            (applyPassiveCoverageFix ? PassiveCoverageFixRepeatPx : 0.0f)
-            + (applyUserCoverageFix ? CoverageFixPx : 0.0f);
+        const u32 alpha5 = polygonMeta.Alpha5;
+        const bool polygonUsesGlTranslucentPass =
+            HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagTranslucent);
+        const bool isTranslucent = polygonUsesGlTranslucentPass || (alpha5 != 0u && alpha5 < 0x1Fu);
+        const u32 blendMode = (polygonMeta.PolyAttr >> 4) & 0x3u;
+        const bool highlightEnabled = (gpu.GPU3D.RenderDispCnt & (1u << 1)) != 0;
+        const AcceleratedCoverageFixState coverageFixState = ResolveAcceleratedCoverageFix(
+            *polygon,
+            AcceleratedCoverageFixConfig{
+                CoverageFixEnabled,
+                CoverageFixPx,
+                CoverageFixApplyRepeat,
+                CoverageFixApplyClamp,
+                PassiveCoverageFixRepeatPx,
+                disablePassiveRepeatCoverageExpand,
+            });
+        const float effectiveCoverageFixPx = coverageFixState.EffectivePx;
         const float effectiveCoverageDepthBias =
-            applyUserCoverageFix ? coverageDepthBias : 0.0f;
-        const bool applyCoverageFix = effectiveCoverageFixPx > 0.0f;
+            coverageFixState.ApplyUserFix ? coverageDepthBias : 0.0f;
+        const bool applyCoverageFix = coverageFixState.Apply;
 
         std::array<float, 10> expandedVertexX{};
         std::array<float, 10> expandedVertexY{};
         if (applyCoverageFix)
         {
-            float centerX = 0.0f;
-            float centerY = 0.0f;
-            u32 centerVertexCount = 0;
-            std::array<float, 10> baseVertexX{};
-            std::array<float, 10> baseVertexY{};
-
-            for (u32 vertexIndex = 0; vertexIndex < polygon->NumVertices; vertexIndex++)
-            {
-                const Vertex* vertex = polygon->Vertices[vertexIndex];
-                if (vertex == nullptr)
-                    continue;
-
-                const float x = resolveVertexX(vertex);
-                const float y = resolveVertexY(vertex);
-                baseVertexX[vertexIndex] = x;
-                baseVertexY[vertexIndex] = y;
-                centerX += x;
-                centerY += y;
-                centerVertexCount++;
-            }
-
-            if (centerVertexCount > 0u)
-            {
-                const float vertexCount = static_cast<float>(centerVertexCount);
-                centerX /= vertexCount;
-                centerY /= vertexCount;
-            }
-
+            std::array<u32, 10> expandedVertexFixedX{};
+            std::array<u32, 10> expandedVertexFixedY{};
+            ComputeAcceleratedCoverageExpandedVerticesFixed(
+                *polygon,
+                ScaleFactor,
+                useHiresCoordinates,
+                maxTargetFixedX,
+                maxTargetFixedY,
+                effectiveCoverageFixPx,
+                expandedVertexFixedX,
+                expandedVertexFixedY);
             for (u32 vertexIndex = 0; vertexIndex < polygon->NumVertices; vertexIndex++)
             {
                 if (polygon->Vertices[vertexIndex] == nullptr)
                     continue;
 
-                const float baseX = baseVertexX[vertexIndex];
-                const float baseY = baseVertexY[vertexIndex];
-
-                float outX = baseX;
-                float outY = baseY;
-
-                const float dx = baseX - centerX;
-                const float dy = baseY - centerY;
-                const float lengthSquared = (dx * dx) + (dy * dy);
-                if (lengthSquared > 0.000001f)
-                {
-                    const float inverseLength = 1.0f / std::sqrt(lengthSquared);
-                    outX = baseX + (dx * inverseLength * effectiveCoverageFixPx);
-                    outY = baseY + (dy * inverseLength * effectiveCoverageFixPx);
-                }
-
-                expandedVertexX[vertexIndex] = std::clamp(outX, 0.0f, maxTargetX);
-                expandedVertexY[vertexIndex] = std::clamp(outY, 0.0f, maxTargetY);
+                expandedVertexX[vertexIndex] = std::clamp(
+                    static_cast<float>(expandedVertexFixedX[vertexIndex]) * (1.0f / 16.0f),
+                    0.0f,
+                    maxTargetX);
+                expandedVertexY[vertexIndex] = std::clamp(
+                    static_cast<float>(expandedVertexFixedY[vertexIndex]) * (1.0f / 16.0f),
+                    0.0f,
+                    maxTargetY);
             }
         }
 
@@ -6722,23 +11902,19 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
             u32 boundaryFlags,
             u32 packedYBounds)
         {
-            auto reciprocalW = [](float w) {
-                return 1.0f / std::max(w, 1.0f);
-            };
-
             TriangleGpu triangle{};
             triangle.x0 = vertex0.x;
             triangle.y0 = vertex0.y;
             triangle.z0 = vertex0.z;
-            triangle.w0 = reciprocalW(vertex0.w);
+            triangle.w0 = vertex0.w;
             triangle.x1 = vertex1.x;
             triangle.y1 = vertex1.y;
             triangle.z1 = vertex1.z;
-            triangle.w1 = reciprocalW(vertex1.w);
+            triangle.w1 = vertex1.w;
             triangle.x2 = vertex2.x;
             triangle.y2 = vertex2.y;
             triangle.z2 = vertex2.z;
-            triangle.w2 = reciprocalW(vertex2.w);
+            triangle.w2 = vertex2.w;
 
             triangle.u0 = vertex0.u;
             triangle.v0 = vertex0.v;
@@ -6806,7 +11982,7 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
                 triangle.flags |= kTriangleFlagTopLeftEdge2;
             }
 
-            triangle.polyAttr = polygon->Attr;
+            triangle.polyAttr = polygonMeta.PolyAttr;
             triangle.variantKey = 0;
             if (hasTexture)
                 triangle.variantKey |= kVariantFlagTextured;
@@ -6833,44 +12009,76 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
                 triangle.variantKey |= kVariantFlagCoverageFix;
 
             Triangles.push_back(triangle);
+
+            auto reciprocalW = [](float w) {
+                return 1.0f / std::max(w, 1.0f);
+            };
+
+            const auto appendGraphicsVertex = [&](const TriangleVertexData& vertexData) {
+                GraphicsVertexGpu graphicsVertex{};
+                graphicsVertex.x = vertexData.x;
+                graphicsVertex.y = vertexData.y;
+                graphicsVertex.z = vertexData.z;
+                graphicsVertex.reciprocalW = reciprocalW(vertexData.w);
+                graphicsVertex.u = vertexData.u;
+                graphicsVertex.v = vertexData.v;
+                graphicsVertex.colorRgba8 = vertexData.colorRgba8;
+                graphicsVertex.flags = triangle.flags;
+                graphicsVertex.texLayer = triangle.texLayer;
+                graphicsVertex.texArrayIndex = triangle.texArrayIndex;
+                graphicsVertex.texWidth = triangle.texWidth;
+                graphicsVertex.texHeight = triangle.texHeight;
+                graphicsVertex.texParam = triangle.texParam;
+                graphicsVertex.polyAttr = triangle.polyAttr;
+                GraphicsVertices.push_back(graphicsVertex);
+            };
+
+            appendGraphicsVertex(vertex0);
+            appendGraphicsVertex(vertex1);
+            appendGraphicsVertex(vertex2);
+        };
+
+        const auto enqueueGraphicsDraw = [&](size_t polygonTriangleCount) {
+            if (polygonTriangleCount == 0u)
+                return;
+
+            GraphicsPolygonDraw draw{};
+            draw.firstTriangle = static_cast<u32>(polygonTriangleBase);
+            draw.triangleCount = static_cast<u32>(polygonTriangleCount);
+            draw.polyAttr = polygonMeta.PolyAttr;
+            draw.flags = polygonMeta.Flags;
+
+            const u32 drawIndex = static_cast<u32>(GraphicsPolygons.size());
+            GraphicsPolygons.push_back(draw);
+
+            if (!polygonUsesGlTranslucentPass
+                && !HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask)
+                && !HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadow))
+            {
+                GraphicsOpaqueDrawIndices.push_back(drawIndex);
+            }
+
+            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagNeedOpaquePass))
+                GraphicsNeedOpaqueDrawIndices.push_back(drawIndex);
+
+            if (polygonUsesGlTranslucentPass
+                && !HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask)
+                && !HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadow))
+            {
+                GraphicsAlphaDrawIndices.push_back(drawIndex);
+            }
         };
 
         if (polygon->Type == 1)
         {
-            const Vertex* lineVertices[2]{};
-            u32 lineVertexIndices[2]{};
-            u32 lineVertexCount = 0;
-            s32 lastLineX = 0;
-            s32 lastLineY = 0;
-            bool haveLastLineVertex = false;
-            for (u32 vertexIndex = 0; vertexIndex < polygon->NumVertices && lineVertexCount < 2u; vertexIndex++)
-            {
-                const Vertex* vertex = polygon->Vertices[vertexIndex];
-                if (vertex == nullptr)
-                    continue;
-
-                if (haveLastLineVertex
-                    && lastLineX == vertex->FinalPosition[0]
-                    && lastLineY == vertex->FinalPosition[1])
-                {
-                    continue;
-                }
-
-                lineVertices[lineVertexCount] = vertex;
-                lineVertexIndices[lineVertexCount] = vertexIndex;
-                lineVertexCount++;
-                lastLineX = vertex->FinalPosition[0];
-                lastLineY = vertex->FinalPosition[1];
-                haveLastLineVertex = true;
-            }
-
-            if (lineVertexCount < 2u)
+            const AcceleratedLineEndpoints lineEndpoints = ResolveAcceleratedLineEndpoints(*polygon);
+            if (lineEndpoints.Count < 2u)
                 continue;
 
-            const float lineX0 = makeX(lineVertices[0], lineVertexIndices[0]);
-            const float lineY0 = makeY(lineVertices[0], lineVertexIndices[0]);
-            const float lineX1 = makeX(lineVertices[1], lineVertexIndices[1]);
-            const float lineY1 = makeY(lineVertices[1], lineVertexIndices[1]);
+            const float lineX0 = makeX(lineEndpoints.Vertices[0], lineEndpoints.Indices[0]);
+            const float lineY0 = makeY(lineEndpoints.Vertices[0], lineEndpoints.Indices[0]);
+            const float lineX1 = makeX(lineEndpoints.Vertices[1], lineEndpoints.Indices[1]);
+            const float lineY1 = makeY(lineEndpoints.Vertices[1], lineEndpoints.Indices[1]);
 
             const float deltaX = lineX1 - lineX0;
             const float deltaY = lineY1 - lineY0;
@@ -6901,17 +12109,18 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
                 continue;
 
             appendTriangle(
-                makeTriangleVertex(lineVertices[0], lineVertexIndices[0], quadPositionsX[0], quadPositionsY[0]),
-                makeTriangleVertex(lineVertices[0], lineVertexIndices[0], quadPositionsX[1], quadPositionsY[1]),
-                makeTriangleVertex(lineVertices[1], lineVertexIndices[1], quadPositionsX[2], quadPositionsY[2]),
+                makeTriangleVertex(lineEndpoints.Vertices[0], lineEndpoints.Indices[0], quadPositionsX[0], quadPositionsY[0]),
+                makeTriangleVertex(lineEndpoints.Vertices[0], lineEndpoints.Indices[0], quadPositionsX[1], quadPositionsY[1]),
+                makeTriangleVertex(lineEndpoints.Vertices[1], lineEndpoints.Indices[1], quadPositionsX[2], quadPositionsY[2]),
                 kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge2,
                 *packedLineYBounds);
             appendTriangle(
-                makeTriangleVertex(lineVertices[0], lineVertexIndices[0], quadPositionsX[0], quadPositionsY[0]),
-                makeTriangleVertex(lineVertices[1], lineVertexIndices[1], quadPositionsX[2], quadPositionsY[2]),
-                makeTriangleVertex(lineVertices[1], lineVertexIndices[1], quadPositionsX[3], quadPositionsY[3]),
+                makeTriangleVertex(lineEndpoints.Vertices[0], lineEndpoints.Indices[0], quadPositionsX[0], quadPositionsY[0]),
+                makeTriangleVertex(lineEndpoints.Vertices[1], lineEndpoints.Indices[1], quadPositionsX[2], quadPositionsY[2]),
+                makeTriangleVertex(lineEndpoints.Vertices[1], lineEndpoints.Indices[1], quadPositionsX[3], quadPositionsY[3]),
                 kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge1,
                 *packedLineYBounds);
+            enqueueGraphicsDraw(Triangles.size() - polygonTriangleBase);
             continue;
         }
 
@@ -7008,6 +12217,7 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
                         makeY(firstOuterVertex, firstOuterVertexIndex)),
                     kTriangleFlagBoundaryEdge0,
                     packedYBounds);
+                enqueueGraphicsDraw(Triangles.size() - polygonTriangleBase);
                 continue;
             }
         }
@@ -7033,15 +12243,136 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
                 boundaryFlags,
                 packedYBounds);
         }
+
+        enqueueGraphicsDraw(Triangles.size() - polygonTriangleBase);
+    }
+
+    static bool loggedGraphicsTriangleSummary = false;
+    if (!loggedGraphicsTriangleSummary && !Triangles.empty())
+    {
+        size_t viewportIntersectingCount = 0;
+        size_t nonDegenerateCount = 0;
+        for (const TriangleGpu& triangle : Triangles)
+        {
+            const float minX = std::min({triangle.x0, triangle.x1, triangle.x2});
+            const float maxX = std::max({triangle.x0, triangle.x1, triangle.x2});
+            const float minY = std::min({triangle.y0, triangle.y1, triangle.y2});
+            const float maxY = std::max({triangle.y0, triangle.y1, triangle.y2});
+            if (maxX > 0.0f && maxY > 0.0f && minX < maxTargetX && minY < maxTargetY)
+                viewportIntersectingCount++;
+
+            const float signedArea =
+                ((triangle.x1 - triangle.x0) * (triangle.y2 - triangle.y0))
+                - ((triangle.y1 - triangle.y0) * (triangle.x2 - triangle.x0));
+            if (std::fabs(signedArea) > 0.001f)
+                nonDegenerateCount++;
+        }
+
+        const TriangleGpu& triangle = Triangles.front();
+        const float rawW0 = triangle.w0 > 0.000001f ? (1.0f / triangle.w0) : 0.0f;
+        const float rawW1 = triangle.w1 > 0.000001f ? (1.0f / triangle.w1) : 0.0f;
+        const float rawW2 = triangle.w2 > 0.000001f ? (1.0f / triangle.w2) : 0.0f;
+        Log(
+            LogLevel::Warn,
+            "VulkanGraphics[Triangles]: scale=%d count=%zu viewportIntersect=%zu nonDegenerate=%zu textures=%u first tri pos=(%.3f,%.3f,%.3f,w=%.3f)->(%.3f,%.3f,%.3f,w=%.3f)->(%.3f,%.3f,%.3f,w=%.3f) flags=%#x texDesc=%u texLayer=%u texSize=%ux%u texParam=%#x polyAttr=%#x yBounds=%#x",
+            ScaleFactor,
+            Triangles.size(),
+            viewportIntersectingCount,
+            nonDegenerateCount,
+            ActiveTextureDescriptorCount,
+            triangle.x0, triangle.y0, triangle.z0, rawW0,
+            triangle.x1, triangle.y1, triangle.z1, rawW1,
+            triangle.x2, triangle.y2, triangle.z2, rawW2,
+            triangle.flags,
+            triangle.texArrayIndex,
+            triangle.texLayer,
+            triangle.texWidth,
+            triangle.texHeight,
+            triangle.texParam,
+            triangle.polyAttr,
+            triangle.yBounds);
+        if (!GraphicsPolygons.empty())
+        {
+            const GraphicsPolygonDraw& draw = GraphicsPolygons.front();
+            Log(
+                LogLevel::Warn,
+                "VulkanGraphics[Draws]: polygons=%zu first firstTriangle=%u triangleCount=%u polyAttr=%#x flags=%#x dispCnt=%#x alphaRef=%u",
+                GraphicsPolygons.size(),
+                draw.firstTriangle,
+                draw.triangleCount,
+                draw.polyAttr,
+                draw.flags,
+                gpu.GPU3D.RenderDispCnt,
+                gpu.GPU3D.RenderAlphaRef);
+        }
+        loggedGraphicsTriangleSummary = true;
     }
 }
 
 bool VulkanRenderer3D::copyReadyCaptureLineToLineCache()
 {
-    if (ReadyCaptureLineData == nullptr)
+    // compute paths write DS-packed 6A5 values directly, but graphics_hw
+    // The ready capture source may belong to the threaded render context that
+    // produced the frame. Using the global CaptureLineMapped pointer in
+    // graphics_hw can read a different context's stale/zero buffer and causes
+    // top/bottom flicker even though the exact export finished correctly.
+    const u32* captureSource = ReadyCaptureLineData;
+
+    if (captureSource == nullptr)
+    {
+        resetCaptureLineState();
+        return false;
+    }
+
+    if (CaptureLineDataIsRgba8)
+    {
+        const size_t pixelCount = LineCache.size();
+        for (size_t i = 0; i < pixelCount; i++)
+        {
+            const u32 sourcePixel = captureSource[i];
+            const u32 r = sourcePixel & 0xFFu;
+            const u32 g = (sourcePixel >> 8u) & 0xFFu;
+            const u32 b = (sourcePixel >> 16u) & 0xFFu;
+            const u32 a = (sourcePixel >> 24u) & 0xFFu;
+
+            LineCache[i] =
+                (r >> 2u)
+                | ((g >> 2u) << 8u)
+                | ((b >> 2u) << 16u)
+                | ((a >> 3u) << 24u);
+        }
+    }
+    else
+    {
+        std::memcpy(LineCache.data(), captureSource, LineCache.size() * sizeof(u32));
+    }
+
+    ExactCaptureLineCachePrepared = ActiveBackendMode == BackendMode::GraphicsHardware;
+    ExactCaptureLineCacheFresh = ActiveBackendMode == BackendMode::GraphicsHardware;
+    if (ActiveBackendMode == BackendMode::GraphicsHardware)
+    {
+        LastValidExactCaptureLineCache = LineCache;
+        HasLastValidExactCapture = true;
+    }
+    CaptureLineReady = false;
+    ReadyCaptureLineData = nullptr;
+    ReadyCaptureLineBufferSlot = -1;
+    CaptureLineDataIsRgba8 = false;
+
+    ActiveCapturePathMode = CapturePathMode::CaptureLineExport;
+    CapturePathModeCounts[static_cast<size_t>(CapturePathMode::CaptureLineExport)]++;
+    clearRawReadbackState();
+    return true;
+}
+
+bool VulkanRenderer3D::restoreLastValidExactCaptureToLineCache()
+{
+    if (!HasLastValidExactCapture)
         return false;
 
-    std::memcpy(LineCache.data(), ReadyCaptureLineData, LineCache.size() * sizeof(u32));
+    LineCache = LastValidExactCaptureLineCache;
+    ExactCaptureLineCachePrepared = true;
+    ExactCaptureLineCacheFresh = false;
     return true;
 }
 
@@ -7074,6 +12405,7 @@ void VulkanRenderer3D::convertReadbackToLineCache()
                 | ((a >> 3) << 24);
         }
 
+        ExactCaptureLineCachePrepared = false;
         return;
     }
 
@@ -7099,6 +12431,14 @@ void VulkanRenderer3D::convertReadbackToLineCache()
                 | ((a >> 3) << 24);
         }
     }
+    ExactCaptureLineCachePrepared = false;
+}
+
+void VulkanRenderer3D::fillLineCacheWithCaptureFallbackColor()
+{
+    std::fill(LineCache.begin(), LineCache.end(), ExactCaptureFallbackPackedColor);
+    ExactCaptureLineCachePrepared = true;
+    ExactCaptureLineCacheFresh = false;
 }
 
 u32 VulkanRenderer3D::buildClearColorRgba8(const GPU& gpu) const
@@ -7130,6 +12470,8 @@ u32 VulkanRenderer3D::buildClearColorRgba8(const GPU& gpu) const
 void VulkanRenderer3D::clearLineCache()
 {
     std::fill(LineCache.begin(), LineCache.end(), 0);
+    ExactCaptureLineCachePrepared = false;
+    ExactCaptureLineCacheFresh = false;
 }
 
 void VulkanRenderer3D::WarmTextureCache(GPU& gpu)

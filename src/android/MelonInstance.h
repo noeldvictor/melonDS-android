@@ -3,6 +3,7 @@
 
 #include <string>
 #include <atomic>
+#include <mutex>
 #include "Args.h"
 #include "Configuration.h"
 #include "NDS.h"
@@ -70,12 +71,30 @@ public:
     std::vector<u32> captureCurrentFrameForDebug();
     std::vector<u32> captureCurrentPackedTopPrimaryForDebug();
     std::vector<u32> captureCurrentPackedBottomPrimaryForDebug();
+    std::vector<u32> captureCurrentPackedPlaneForDebug(int screenIndex, int planeIndex);
+    std::vector<u32> captureCurrentCapture3dSourceForDebug();
+    std::vector<u32> captureCurrentCaptureLineUses3dMaskForDebug();
+    std::vector<u32> captureCurrentComp4TopPlaceholderForDebug();
+    std::vector<u32> captureCurrentComp4BottomPlaceholderForDebug();
+    std::vector<u32> captureCurrentCaptureFallbackMaskForDebug();
+    std::string captureCurrentSoftPackedFrameMetaJsonForDebug();
     std::vector<u32> captureCurrent3dDimensionsForDebug();
     std::vector<u32> captureCurrent3dFrameForDebug();
     std::vector<u32> captureCurrent3dCaptureFrameForDebug();
     std::vector<u32> captureCurrent3dDepthForDebug();
     std::vector<u32> captureCurrent3dAttrForDebug();
     std::vector<u32> captureCurrent3dCoverageForDebug();
+    bool isCurrentFrameReadyForDebug() const;
+    int getCurrentFrameIndexForDebug() const;
+    void clearPreparedRendererDebugSnapshotForDebug();
+    void startDenseScreenBurstCaptureForDebug(int frameCount, int stepFrames, u32 captureKindsMask);
+    bool isDenseScreenBurstCaptureCompleteForDebug() const;
+    int getDenseScreenBurstCaptureFrameCountForDebug() const;
+    std::vector<u32> getDenseScreenBurstCaptureFrameForDebug(int index) const;
+    std::vector<u32> getDenseScreenBurstPackedTopFrameForDebug(int index) const;
+    std::vector<u32> getDenseScreenBurstPackedBottomFrameForDebug(int index) const;
+    std::vector<u32> getDenseScreenBurstRenderer3dCaptureFrameForDebug(int index) const;
+    void clearDenseScreenBurstCaptureForDebug();
     void dumpDebugSnapshot();
 
     void updateConfiguration(std::shared_ptr<EmulatorConfiguration> newConfiguration);
@@ -100,6 +119,47 @@ public:
     std::vector<long> getRuntimeSubsetIds();
 
 private:
+    struct PreparedVulkanDebugSnapshot
+    {
+        u64 frameId = 0;
+        std::vector<u32> screenFrame;
+        std::vector<u32> packedTopPrimary;
+        std::vector<u32> packedBottomPrimary;
+        std::vector<u32> packedTopPlane1;
+        std::vector<u32> packedTopControl;
+        std::vector<u32> packedBottomPlane1;
+        std::vector<u32> packedBottomControl;
+        std::vector<u32> capture3dSourceDsFrame;
+        std::vector<u32> captureLineUses3dMask;
+        std::vector<u32> comp4TopPlaceholder;
+        std::vector<u32> comp4BottomPlaceholder;
+        std::vector<u32> captureFallbackMask;
+        std::string softPackedFrameMetaJson;
+        std::vector<u32> captureFrame;
+        std::vector<u32> depth;
+        std::vector<u32> attr;
+        std::vector<u32> coverage;
+    };
+
+    struct DenseScreenBurstFrame
+    {
+        std::vector<u32> screenFrame;
+        std::vector<u32> packedTopPrimary;
+        std::vector<u32> packedBottomPrimary;
+        std::vector<u32> renderer3dCaptureFrame;
+    };
+
+    struct DenseScreenBurstCapture
+    {
+        bool active = false;
+        bool complete = false;
+        int requestedFrameCount = 0;
+        int captureStepFrames = 1;
+        int nextCaptureFrame = 0;
+        u32 captureKindsMask = 0;
+        std::vector<DenseScreenBurstFrame> frames;
+    };
+
     void updateRenderer();
     void updateVulkanFastForwardRenderScale();
     void handleVulkanRuntimeFailure(const char* reason);
@@ -108,7 +168,15 @@ private:
     void setBatteryLevels();
     void setDateTime();
     void saveRewindState(RewindSaveState* rewindSaveState);
+    void clearLatchedSoftPackedFrameSnapshot();
+    bool latchSoftPackedFrameSnapshot(const Frame* frame, int frontBuffer, bool screenSwap);
     std::vector<u32> captureCurrentPackedPrimaryForDebug(bool topScreen);
+    std::vector<u32> captureCurrentComp4PlaceholderForDebug(bool topScreen);
+    std::vector<u32> captureLiveScreenFrameForDebug(Frame* frameOverride, int scaleOverride);
+    void maybeCaptureDenseScreenBurstFrame(Frame* frameOverride, int scaleOverride, int completedFrame);
+    void clearPreparedVulkanDebugSnapshot();
+    bool ensurePreparedVulkanDebugSnapshot(Frame* frame, VulkanRenderer3D& renderer3D);
+    bool hasPreparedVulkanDebugSnapshot(const Frame* frame) const;
 
 private:
     int instanceId;
@@ -131,6 +199,19 @@ private:
     std::vector<u32> vulkanReadbackFrame;
     Frame* lastCompletedVulkanFrame;
     int lastCompletedVulkanScale;
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> lastValidTopScreenCapture3dDsFrame{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> lastValidBottomScreenCapture3dDsFrame{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> lastValidTopScreenResolvedPrimary{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> lastValidBottomScreenResolvedPrimary{};
+    std::array<u8, SoftPackedFrameSnapshot::kLineCount> lastValidTopScreenResolvedPrimaryLines{};
+    std::array<u8, SoftPackedFrameSnapshot::kLineCount> lastValidBottomScreenResolvedPrimaryLines{};
+    bool hasLastValidTopScreenCapture3dDsFrame = false;
+    bool hasLastValidBottomScreenCapture3dDsFrame = false;
+    SoftPackedFrameSnapshot lastSoftPackedFrameSnapshot;
+    SoftPackedFrameSnapshot previousSoftPackedFrameSnapshot;
+    PreparedVulkanDebugSnapshot preparedVulkanDebugSnapshot;
+    mutable std::mutex denseScreenBurstCaptureMutex;
+    DenseScreenBurstCapture denseScreenBurstCapture;
     ScreenshotRenderer screenshotRenderer;
     RewindManager rewindManager;
     Renderer currentRenderer;

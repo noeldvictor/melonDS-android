@@ -26,7 +26,6 @@ constexpr u32 kDrawModeBackground = 0u;
 constexpr u32 kDrawModeCompositeFrame = 1u;
 constexpr u32 kDrawModeTopScreen = 2u;
 constexpr u32 kDrawModeBottomScreen = 3u;
-constexpr u64 kFastForwardPresenterBudgetNs = 1'000'000ull;
 constexpr std::array<VkFormat, 9> kPreferredSurfaceFormats = {
     VK_FORMAT_R8G8B8A8_UNORM,
     VK_FORMAT_B8G8R8A8_UNORM,
@@ -46,8 +45,33 @@ struct PresenterPushConstants
     u32 rendererWidth;
     u32 rendererHeight;
     u32 packedStride;
+    u32 screenSwap;
     u32 filtering;
+    u32 previousTopSourceValid;
+    u32 previousBottomSourceValid;
+    u32 captureSourceValid;
 };
+
+bool presenterRectsEqual(const VulkanPresenterRect& left, const VulkanPresenterRect& right)
+{
+    return left.enabled == right.enabled
+        && left.x == right.x
+        && left.y == right.y
+        && left.width == right.width
+        && left.height == right.height;
+}
+
+bool surfaceConfigsEqual(const VulkanSurfaceConfig& left, const VulkanSurfaceConfig& right)
+{
+    return presenterRectsEqual(left.topScreen, right.topScreen)
+        && presenterRectsEqual(left.bottomScreen, right.bottomScreen)
+        && left.topAlpha == right.topAlpha
+        && left.bottomAlpha == right.bottomAlpha
+        && left.topOnTop == right.topOnTop
+        && left.bottomOnTop == right.bottomOnTop
+        && left.backgroundMode == right.backgroundMode
+        && left.filtering == right.filtering;
+}
 
 bool isPreferredAndroidSurfaceFormat(VkFormat format)
 {
@@ -267,8 +291,10 @@ bool VulkanSurfacePresenter::init()
     instance = melonDS::VulkanContext::Get().GetInstance();
     physicalDevice = melonDS::VulkanContext::Get().GetPhysicalDevice();
     device = melonDS::VulkanContext::Get().GetDevice();
-    queue = melonDS::VulkanContext::Get().GetPresenterQueue();
+    queue = melonDS::VulkanContext::Get().GetQueue();
     queueFamilyIndex = melonDS::VulkanContext::Get().GetQueueFamilyIndex();
+    useTimelineSemaphores = melonDS::VulkanContext::Get().SupportsTimelineSemaphores();
+    waitSemaphores = useTimelineSemaphores ? melonDS::VulkanContext::Get().GetWaitSemaphores() : nullptr;
     resetQueryPool = melonDS::VulkanContext::Get().GetResetQueryPool();
     timestampPeriodNs = melonDS::VulkanContext::Get().GetTimestampPeriod();
     timestampQueriesSupported = melonDS::VulkanContext::Get().SupportsTimestamps();
@@ -285,6 +311,12 @@ bool VulkanSurfacePresenter::init()
         return false;
     }
 
+    if (!createSyncObjects())
+    {
+        shutdown();
+        return false;
+    }
+
     initialized = true;
     return true;
 }
@@ -293,7 +325,7 @@ void VulkanSurfacePresenter::shutdown()
 {
     if (device != VK_NULL_HANDLE)
     {
-        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetPresenterQueueLock());
+        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetQueueLock());
         vkQueueWaitIdle(queue);
     }
 
@@ -302,6 +334,7 @@ void VulkanSurfacePresenter::shutdown()
         detachSurface(surfaces.begin()->first);
     }
 
+    destroySyncObjects();
     destroyCommonResources();
 
     if (contextAcquired)
@@ -317,9 +350,54 @@ void VulkanSurfacePresenter::shutdown()
     device = VK_NULL_HANDLE;
     queue = VK_NULL_HANDLE;
     queueFamilyIndex = 0;
+    useTimelineSemaphores = false;
+    timelineValue = 0;
+    timelineSemaphore = VK_NULL_HANDLE;
+    waitSemaphores = nullptr;
     resetQueryPool = nullptr;
     timestampPeriodNs = 0.0f;
     timestampQueriesSupported = false;
+}
+
+bool VulkanSurfacePresenter::createSyncObjects()
+{
+    if (!useTimelineSemaphores)
+        return true;
+
+    if (waitSemaphores == nullptr)
+    {
+        useTimelineSemaphores = false;
+        return true;
+    }
+
+    VkSemaphoreTypeCreateInfo semaphoreTypeInfo{};
+    semaphoreTypeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    semaphoreTypeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    semaphoreTypeInfo.initialValue = 0;
+
+    VkSemaphoreCreateInfo semaphoreCreateInfo{};
+    semaphoreCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semaphoreCreateInfo.pNext = &semaphoreTypeInfo;
+
+    if (vkCreateSemaphore(device, &semaphoreCreateInfo, nullptr, &timelineSemaphore) != VK_SUCCESS)
+    {
+        useTimelineSemaphores = false;
+        timelineSemaphore = VK_NULL_HANDLE;
+        return true;
+    }
+
+    timelineValue = 0;
+    return true;
+}
+
+void VulkanSurfacePresenter::destroySyncObjects()
+{
+    if (timelineSemaphore != VK_NULL_HANDLE)
+    {
+        vkDestroySemaphore(device, timelineSemaphore, nullptr);
+        timelineSemaphore = VK_NULL_HANDLE;
+    }
+    timelineValue = 0;
 }
 
 bool VulkanSurfacePresenter::createCommonResources()
@@ -348,11 +426,32 @@ bool VulkanSurfacePresenter::createCommonResources()
     bottomPackedBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bottomPackedBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    const std::array<VkDescriptorSetLayoutBinding, 4> bindings = {
+    VkDescriptorSetLayoutBinding previousTopRendererImageBinding{};
+    previousTopRendererImageBinding.binding = 4;
+    previousTopRendererImageBinding.descriptorCount = 1;
+    previousTopRendererImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    previousTopRendererImageBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutBinding capture3dBinding{};
+    capture3dBinding.binding = 5;
+    capture3dBinding.descriptorCount = 1;
+    capture3dBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    capture3dBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutBinding previousBottomRendererImageBinding{};
+    previousBottomRendererImageBinding.binding = 6;
+    previousBottomRendererImageBinding.descriptorCount = 1;
+    previousBottomRendererImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    previousBottomRendererImageBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    const std::array<VkDescriptorSetLayoutBinding, 7> bindings = {
         sampledTextureBinding,
         rendererImageBinding,
         topPackedBinding,
         bottomPackedBinding,
+        previousTopRendererImageBinding,
+        capture3dBinding,
+        previousBottomRendererImageBinding,
     };
 
     VkDescriptorSetLayoutCreateInfo descriptorSetLayoutInfo{};
@@ -367,9 +466,9 @@ bool VulkanSurfacePresenter::createCommonResources()
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     poolSizes[0].descriptorCount = kDescriptorSetCapacity;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[1].descriptorCount = kDescriptorSetCapacity;
+    poolSizes[1].descriptorCount = kDescriptorSetCapacity * 3u;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[2].descriptorCount = kDescriptorSetCapacity * 2u;
+    poolSizes[2].descriptorCount = kDescriptorSetCapacity * 3u;
 
     VkDescriptorPoolCreateInfo descriptorPoolInfo{};
     descriptorPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -578,6 +677,14 @@ bool VulkanSurfacePresenter::configureSurface(int surfaceId, const VulkanSurface
         return false;
 
     SurfaceState& surfaceState = iterator->second;
+    if (surfaceState.configured
+        && backgroundImage.pixels == nullptr
+        && surfaceState.background.imageView == VK_NULL_HANDLE
+        && surfaceConfigsEqual(surfaceState.config, config))
+    {
+        return true;
+    }
+
     if (waitForSurfaceIdle(surfaceState) != VK_SUCCESS)
         return false;
 
@@ -624,9 +731,32 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         && inputs.sourceImageView != VK_NULL_HANDLE
         && inputs.topPackedBuffer != VK_NULL_HANDLE
         && inputs.bottomPackedBuffer != VK_NULL_HANDLE;
+    const bool hasDualScreenSurface = std::any_of(
+        surfaces.begin(),
+        surfaces.end(),
+        [](const auto& entry) {
+            const SurfaceState& surfaceState = entry.second;
+            if (!surfaceState.configured)
+                return false;
+
+            const auto rectEnabled = [](const VulkanPresenterRect& rect) {
+                return rect.enabled && rect.width > 0 && rect.height > 0;
+            };
+
+            return rectEnabled(surfaceState.config.topScreen)
+                && rectEnabled(surfaceState.config.bottomScreen);
+        });
     const bool directPresentRequested = !inputs.needsReadback
         && !inputs.validationMode
-        && hasRequiredDirectHandles;
+        && !hasDualScreenSurface
+        && hasRequiredDirectHandles
+        // The direct presenter path samples live/capture/previous 3D inside the
+        // fragment shader. For frames that depend on DS-sized capture or temporal
+        // previous-source recovery, keep using the offscreen compositor so packed
+        // ownership and exact-frame 3D stay aligned on both screens.
+        && !inputs.capture3dSourceValid
+        && !inputs.previousTopSourceValid
+        && !inputs.previousBottomSourceValid;
 
     if (!directPresentRequested)
     {
@@ -636,7 +766,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
             fallbackReasonValidationMode++;
         if (!hasRequiredDirectHandles)
             fallbackReasonMissingHandles++;
-        if (surfaces.size() > 1)
+        if (surfaces.size() > 1 || hasDualScreenSurface)
             fallbackReasonSurfaceCount++;
     }
 
@@ -662,6 +792,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
     u64 recordCpuNs = 0;
     u64 submitCpuNs = 0;
     u64 presentCpuNs = 0;
+    u64 framePresentTimelineValue = 0;
     bool presentedAnySurface = false;
     for (auto& [surfaceId, surfaceState] : surfaces)
     {
@@ -679,7 +810,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
 
         const u64 remainingBudgetNs = [&]() -> u64 {
             if (fastForwardActive)
-                return kFastForwardPresenterBudgetNs;
+                return 0;
             if (deadlineNs == UINT64_MAX)
                 return UINT64_MAX;
 
@@ -718,7 +849,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         u32 imageIndex = 0;
         const u64 acquireBudgetNs = [&]() -> u64 {
             if (fastForwardActive)
-                return kFastForwardPresenterBudgetNs;
+                return 0;
             if (deadlineNs == UINT64_MAX)
                 return UINT64_MAX;
 
@@ -777,13 +908,15 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
 
         const u64 submitStartNs = PerfNowNs();
         u64 surfacePresentCpuNs = 0;
-        if (!submitSurfaceCommands(surfaceState, imageIndex, surfacePresentCpuNs))
+        u64 surfacePresentTimelineValue = 0;
+        if (!submitSurfaceCommands(surfaceState, imageIndex, surfacePresentCpuNs, surfacePresentTimelineValue))
         {
             recoverSwapchain(surfaceState, "submitSurfaceCommands");
             continue;
         }
         submitCpuNs += PerfNowNs() - submitStartNs;
         presentCpuNs += surfacePresentCpuNs;
+        framePresentTimelineValue = std::max(framePresentTimelineValue, surfacePresentTimelineValue);
 
         presentedAnySurface = true;
         lastPresentedDirect = directPresent;
@@ -797,6 +930,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
 
     if (presentedAnySurface)
     {
+        frame->presentTimelineValue = framePresentTimelineValue;
         descriptorCpuWindow.Add(descriptorCpuNs);
         vertexCpuWindow.Add(vertexCpuNs);
         acquireCpuWindow.Add(acquireCpuNs);
@@ -809,6 +943,29 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
     }
 
     return presentedAnySurface;
+}
+
+bool VulkanSurfacePresenter::waitForFrameConsumption(Frame* frame, u64 timeoutNs)
+{
+    if (!initialized || frame == nullptr || frame->presentTimelineValue == 0)
+        return true;
+
+    if (!useTimelineSemaphores || waitSemaphores == nullptr || timelineSemaphore == VK_NULL_HANDLE)
+    {
+        frame->presentTimelineValue = 0;
+        return true;
+    }
+
+    VkSemaphoreWaitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    waitInfo.semaphoreCount = 1;
+    waitInfo.pSemaphores = &timelineSemaphore;
+    waitInfo.pValues = &frame->presentTimelineValue;
+
+    const bool waitOk = waitSemaphores(device, &waitInfo, timeoutNs) == VK_SUCCESS;
+    if (waitOk)
+        frame->presentTimelineValue = 0;
+    return waitOk;
 }
 
 VulkanPresenterPacingStats VulkanSurfacePresenter::takePacingStatsSnapshotAndReset()
@@ -1763,7 +1920,7 @@ bool VulkanSurfacePresenter::createTextureFromPixels(BackgroundResource& resourc
     submitInfo.pCommandBuffers = &uploadCommandBuffer;
 
     {
-        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetPresenterQueueLock());
+        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetQueueLock());
         if (vkQueueSubmit(queue, 1, &submitInfo, uploadFence) != VK_SUCCESS)
             return false;
     }
@@ -1819,6 +1976,12 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
     VkDescriptorImageInfo rendererImageInfo{};
     rendererImageInfo.imageView = inputs.sourceImageView;
     rendererImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo previousTopRendererImageInfo{};
+    previousTopRendererImageInfo.imageView = inputs.previousTopSourceImageView;
+    previousTopRendererImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo previousBottomRendererImageInfo{};
+    previousBottomRendererImageInfo.imageView = inputs.previousBottomSourceImageView;
+    previousBottomRendererImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     VkDescriptorBufferInfo topPackedBufferInfo{};
     topPackedBufferInfo.buffer = inputs.topPackedBuffer;
@@ -1830,15 +1993,24 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
     bottomPackedBufferInfo.offset = 0;
     bottomPackedBufferInfo.range = inputs.packedBufferSize;
 
+    VkDescriptorBufferInfo capture3dBufferInfo{};
+    capture3dBufferInfo.buffer = inputs.capture3dBuffer;
+    capture3dBufferInfo.offset = 0;
+    capture3dBufferInfo.range = inputs.capture3dBufferSize;
+
     if (!screenCache.ready
         || screenCache.sampledImageView != frameImageView
         || screenCache.sampledImageLayout != screenImageInfo.imageLayout
         || screenCache.sampledSampler != screenImageInfo.sampler
         || screenCache.rendererImageView != inputs.sourceImageView
+        || screenCache.previousRendererImageView != inputs.previousSourceImageView
+        || screenCache.previousTopRendererImageView != inputs.previousTopSourceImageView
+        || screenCache.previousBottomRendererImageView != inputs.previousBottomSourceImageView
         || screenCache.topPackedBuffer != inputs.topPackedBuffer
-        || screenCache.bottomPackedBuffer != inputs.bottomPackedBuffer)
+        || screenCache.bottomPackedBuffer != inputs.bottomPackedBuffer
+        || screenCache.capture3dBuffer != inputs.capture3dBuffer)
     {
-        std::array<VkWriteDescriptorSet, 4> screenWrites{};
+        std::array<VkWriteDescriptorSet, 7> screenWrites{};
         u32 screenWriteCount = 0;
         auto appendScreenImageWrite = [&](u32 binding, const VkDescriptorImageInfo* info, VkDescriptorType descriptorType) {
             VkWriteDescriptorSet& write = screenWrites[screenWriteCount++];
@@ -1870,6 +2042,14 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         {
             appendScreenImageWrite(1, &rendererImageInfo, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         }
+        if (!screenCache.ready || screenCache.previousTopRendererImageView != inputs.previousTopSourceImageView)
+        {
+            appendScreenImageWrite(4, &previousTopRendererImageInfo, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        }
+        if (!screenCache.ready || screenCache.previousBottomRendererImageView != inputs.previousBottomSourceImageView)
+        {
+            appendScreenImageWrite(6, &previousBottomRendererImageInfo, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        }
         if (!screenCache.ready || screenCache.topPackedBuffer != inputs.topPackedBuffer)
         {
             appendScreenBufferWrite(2, &topPackedBufferInfo);
@@ -1877,6 +2057,10 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         if (!screenCache.ready || screenCache.bottomPackedBuffer != inputs.bottomPackedBuffer)
         {
             appendScreenBufferWrite(3, &bottomPackedBufferInfo);
+        }
+        if (!screenCache.ready || screenCache.capture3dBuffer != inputs.capture3dBuffer)
+        {
+            appendScreenBufferWrite(5, &capture3dBufferInfo);
         }
 
         if (screenWriteCount > 0)
@@ -1887,8 +2071,12 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         screenCache.sampledImageLayout = screenImageInfo.imageLayout;
         screenCache.sampledSampler = screenImageInfo.sampler;
         screenCache.rendererImageView = inputs.sourceImageView;
+        screenCache.previousRendererImageView = inputs.previousSourceImageView;
+        screenCache.previousTopRendererImageView = inputs.previousTopSourceImageView;
+        screenCache.previousBottomRendererImageView = inputs.previousBottomSourceImageView;
         screenCache.topPackedBuffer = inputs.topPackedBuffer;
         screenCache.bottomPackedBuffer = inputs.bottomPackedBuffer;
+        screenCache.capture3dBuffer = inputs.capture3dBuffer;
     }
 
     DescriptorSetCacheState& backgroundCache = surfaceState.backgroundDescriptorCache;
@@ -1899,15 +2087,19 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
             || backgroundCache.sampledImageLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
             || backgroundCache.sampledSampler != linearSampler
             || backgroundCache.rendererImageView != inputs.sourceImageView
+            || backgroundCache.previousRendererImageView != inputs.previousSourceImageView
+            || backgroundCache.previousTopRendererImageView != inputs.previousTopSourceImageView
+            || backgroundCache.previousBottomRendererImageView != inputs.previousBottomSourceImageView
             || backgroundCache.topPackedBuffer != inputs.topPackedBuffer
-            || backgroundCache.bottomPackedBuffer != inputs.bottomPackedBuffer))
+            || backgroundCache.bottomPackedBuffer != inputs.bottomPackedBuffer
+            || backgroundCache.capture3dBuffer != inputs.capture3dBuffer))
     {
         VkDescriptorImageInfo backgroundImageInfo{};
         backgroundImageInfo.sampler = linearSampler;
         backgroundImageInfo.imageView = surfaceState.background.imageView;
         backgroundImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        std::array<VkWriteDescriptorSet, 4> backgroundWrites{};
+        std::array<VkWriteDescriptorSet, 7> backgroundWrites{};
         u32 backgroundWriteCount = 0;
         auto appendBackgroundImageWrite = [&](u32 binding, const VkDescriptorImageInfo* info, VkDescriptorType descriptorType) {
             VkWriteDescriptorSet& write = backgroundWrites[backgroundWriteCount++];
@@ -1940,6 +2132,18 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         {
             appendBackgroundImageWrite(1, &rendererImageInfo, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         }
+        if (!backgroundCache.ready
+            || surfaceState.backgroundDescriptorDirty
+            || backgroundCache.previousTopRendererImageView != inputs.previousTopSourceImageView)
+        {
+            appendBackgroundImageWrite(4, &previousTopRendererImageInfo, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        }
+        if (!backgroundCache.ready
+            || surfaceState.backgroundDescriptorDirty
+            || backgroundCache.previousBottomRendererImageView != inputs.previousBottomSourceImageView)
+        {
+            appendBackgroundImageWrite(6, &previousBottomRendererImageInfo, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        }
         if (!backgroundCache.ready || surfaceState.backgroundDescriptorDirty || backgroundCache.topPackedBuffer != inputs.topPackedBuffer)
         {
             appendBackgroundBufferWrite(2, &topPackedBufferInfo);
@@ -1947,6 +2151,10 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         if (!backgroundCache.ready || surfaceState.backgroundDescriptorDirty || backgroundCache.bottomPackedBuffer != inputs.bottomPackedBuffer)
         {
             appendBackgroundBufferWrite(3, &bottomPackedBufferInfo);
+        }
+        if (!backgroundCache.ready || surfaceState.backgroundDescriptorDirty || backgroundCache.capture3dBuffer != inputs.capture3dBuffer)
+        {
+            appendBackgroundBufferWrite(5, &capture3dBufferInfo);
         }
 
         if (backgroundWriteCount > 0)
@@ -1957,8 +2165,12 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         backgroundCache.sampledImageLayout = backgroundImageInfo.imageLayout;
         backgroundCache.sampledSampler = backgroundImageInfo.sampler;
         backgroundCache.rendererImageView = inputs.sourceImageView;
+        backgroundCache.previousRendererImageView = inputs.previousSourceImageView;
+        backgroundCache.previousTopRendererImageView = inputs.previousTopSourceImageView;
+        backgroundCache.previousBottomRendererImageView = inputs.previousBottomSourceImageView;
         backgroundCache.topPackedBuffer = inputs.topPackedBuffer;
         backgroundCache.bottomPackedBuffer = inputs.bottomPackedBuffer;
+        backgroundCache.capture3dBuffer = inputs.capture3dBuffer;
         surfaceState.backgroundDescriptorDirty = false;
     }
 
@@ -2100,14 +2312,16 @@ bool VulkanSurfacePresenter::updateVertexBuffer(
         const u32 drawMode = directPresent
             ? (topScreen ? kDrawModeTopScreen : kDrawModeBottomScreen)
             : kDrawModeCompositeFrame;
+        const float topVertexUv = directPresent ? uvBottom : uvTop;
+        const float bottomVertexUv = directPresent ? uvTop : uvBottom;
 
         const u32 firstVertex = static_cast<u32>(vertices.size());
-        vertices.push_back(SurfaceVertex{left, bottom, 0.0f, uvTop, alpha});
-        vertices.push_back(SurfaceVertex{left, top, 0.0f, uvBottom, alpha});
-        vertices.push_back(SurfaceVertex{right, top, 1.0f, uvBottom, alpha});
-        vertices.push_back(SurfaceVertex{left, bottom, 0.0f, uvTop, alpha});
-        vertices.push_back(SurfaceVertex{right, top, 1.0f, uvBottom, alpha});
-        vertices.push_back(SurfaceVertex{right, bottom, 1.0f, uvTop, alpha});
+        vertices.push_back(SurfaceVertex{left, bottom, 0.0f, bottomVertexUv, alpha});
+        vertices.push_back(SurfaceVertex{left, top, 0.0f, topVertexUv, alpha});
+        vertices.push_back(SurfaceVertex{right, top, 1.0f, topVertexUv, alpha});
+        vertices.push_back(SurfaceVertex{left, bottom, 0.0f, bottomVertexUv, alpha});
+        vertices.push_back(SurfaceVertex{right, top, 1.0f, topVertexUv, alpha});
+        vertices.push_back(SurfaceVertex{right, bottom, 1.0f, bottomVertexUv, alpha});
 
         drawCalls.push_back(DrawCall{
             .descriptorSet = surfaceState.screenDescriptorSet,
@@ -2137,6 +2351,57 @@ bool VulkanSurfacePresenter::updateVertexBuffer(
     if (!vertices.empty())
         std::memcpy(surfaceState.mappedVertexMemory, vertices.data(), vertices.size() * sizeof(SurfaceVertex));
 
+    if (MelonDSAndroid::areRendererDebugToolsEnabled())
+    {
+        const auto logDrawVertices = [&](const DrawCall& drawCall) {
+            if (drawCall.vertexCount < 6 || drawCall.firstVertex + 5 >= vertices.size())
+                return;
+
+            const SurfaceVertex& v0 = vertices[drawCall.firstVertex + 0];
+            const SurfaceVertex& v1 = vertices[drawCall.firstVertex + 1];
+            const SurfaceVertex& v5 = vertices[drawCall.firstVertex + 5];
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Info,
+                "VulkanPresenter[Vertices]: surface=%d direct=%d drawMode=%u first=%u count=%u posLTRB=(%.3f,%.3f,%.3f,%.3f) uvTopBottom=(%.3f,%.3f)",
+                surfaceState.id,
+                directPresent ? 1 : 0,
+                drawCall.drawMode,
+                drawCall.firstVertex,
+                drawCall.vertexCount,
+                v0.x,
+                v5.x,
+                v1.y,
+                v0.y,
+                v1.v,
+                v0.v
+            );
+        };
+
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Info,
+            "VulkanPresenter[Config]: surface=%d extent=%ux%u direct=%d topRect=(%d,%d,%d,%d,%d) bottomRect=(%d,%d,%d,%d,%d) bottomOnTop=%d drawCalls=%zu",
+            surfaceState.id,
+            surfaceState.extent.width,
+            surfaceState.extent.height,
+            directPresent ? 1 : 0,
+            config.topScreen.enabled ? 1 : 0,
+            config.topScreen.x,
+            config.topScreen.y,
+            config.topScreen.width,
+            config.topScreen.height,
+            config.bottomScreen.enabled ? 1 : 0,
+            config.bottomScreen.x,
+            config.bottomScreen.y,
+            config.bottomScreen.width,
+            config.bottomScreen.height,
+            config.bottomOnTop ? 1 : 0,
+            drawCalls.size()
+        );
+
+        for (const DrawCall& drawCall : drawCalls)
+            logDrawVertices(drawCall);
+    }
+
     surfaceState.cachedDrawCalls = drawCalls;
     surfaceState.cachedDirectPresent = directPresent;
     surfaceState.vertexBufferDirty = false;
@@ -2152,6 +2417,8 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
     bool directPresent,
     const std::vector<DrawCall>& drawCalls)
 {
+    (void)directPresent;
+
     if (surfaceState.timestampQueryPool != VK_NULL_HANDLE && resetQueryPool != nullptr)
         resetQueryPool(device, surfaceState.timestampQueryPool, 0, 2);
 
@@ -2168,7 +2435,7 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
     if (surfaceState.timestampQueryPool != VK_NULL_HANDLE)
         vkCmdWriteTimestamp(surfaceState.commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, surfaceState.timestampQueryPool, 0);
 
-    std::array<VkImageMemoryBarrier, 2> sourceBarriers{};
+    std::array<VkImageMemoryBarrier, 4> sourceBarriers{};
     u32 sourceBarrierCount = 0;
 
     auto appendImageBarrier = [&](VkImage image) {
@@ -2190,8 +2457,20 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
     };
 
     appendImageBarrier(sampledImage);
-    if (directPresent && inputs.sourceImage != sampledImage && sourceBarrierCount < sourceBarriers.size())
+    if (inputs.sourceImage != sampledImage && sourceBarrierCount < sourceBarriers.size())
         appendImageBarrier(inputs.sourceImage);
+    if (inputs.previousTopSourceImage != sampledImage
+        && inputs.previousTopSourceImage != inputs.sourceImage
+        && sourceBarrierCount < sourceBarriers.size())
+    {
+        appendImageBarrier(inputs.previousTopSourceImage);
+    }
+    if (inputs.previousBottomSourceImage != sampledImage
+        && inputs.previousBottomSourceImage != inputs.sourceImage
+        && sourceBarrierCount < sourceBarriers.size())
+    {
+        appendImageBarrier(inputs.previousBottomSourceImage);
+    }
 
     if (sourceBarrierCount > 0)
     {
@@ -2209,7 +2488,7 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
         );
     }
 
-    std::array<VkBufferMemoryBarrier, 2> bufferBarriers{};
+    std::array<VkBufferMemoryBarrier, 3> bufferBarriers{};
     bufferBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     bufferBarriers[0].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
     bufferBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2228,10 +2507,19 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
     bufferBarriers[1].offset = 0;
     bufferBarriers[1].size = inputs.packedBufferSize;
 
+    bufferBarriers[2].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bufferBarriers[2].srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    bufferBarriers[2].dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    bufferBarriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferBarriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferBarriers[2].buffer = surfaceState.vertexBuffer;
+    bufferBarriers[2].offset = 0;
+    bufferBarriers[2].size = surfaceState.vertexBufferSize;
+
     vkCmdPipelineBarrier(
         surfaceState.commandBuffer,
         VK_PIPELINE_STAGE_HOST_BIT,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
         0,
         0,
         nullptr,
@@ -2292,7 +2580,30 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
         pushConstants.rendererWidth = inputs.rendererWidth;
         pushConstants.rendererHeight = inputs.rendererHeight;
         pushConstants.packedStride = inputs.packedStride;
+        pushConstants.screenSwap = inputs.screenSwap;
         pushConstants.filtering = surfaceState.config.filtering == VulkanPresenterFilter::Linear ? 1u : 0u;
+        pushConstants.previousTopSourceValid = inputs.previousTopSourceValid ? 1u : 0u;
+        pushConstants.previousBottomSourceValid = inputs.previousBottomSourceValid ? 1u : 0u;
+        pushConstants.captureSourceValid = inputs.capture3dSourceValid ? 1u : 0u;
+        if (MelonDSAndroid::areRendererDebugToolsEnabled())
+        {
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Info,
+                "VulkanPresenter[Draw]: surface=%d drawMode=%u first=%u count=%u scale=%u renderer=%ux%u packedStride=%u screenSwap=%u prevTop=%u prevBottom=%u capture=%u",
+                surfaceState.id,
+                drawCall.drawMode,
+                drawCall.firstVertex,
+                drawCall.vertexCount,
+                pushConstants.scale,
+                pushConstants.rendererWidth,
+                pushConstants.rendererHeight,
+                pushConstants.packedStride,
+                pushConstants.screenSwap,
+                pushConstants.previousTopSourceValid,
+                pushConstants.previousBottomSourceValid,
+                pushConstants.captureSourceValid
+            );
+        }
         vkCmdPushConstants(
             surfaceState.commandBuffer,
             pipelineLayout,
@@ -2312,8 +2623,13 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
     return vkEndCommandBuffer(surfaceState.commandBuffer) == VK_SUCCESS;
 }
 
-bool VulkanSurfacePresenter::submitSurfaceCommands(SurfaceState& surfaceState, u32 imageIndex, u64& presentCpuNs)
+bool VulkanSurfacePresenter::submitSurfaceCommands(
+    SurfaceState& surfaceState,
+    u32 imageIndex,
+    u64& presentCpuNs,
+    u64& presentTimelineValueOut)
 {
+    presentTimelineValueOut = 0;
     VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
 
     VkSubmitInfo submitInfo{};
@@ -2323,8 +2639,28 @@ bool VulkanSurfacePresenter::submitSurfaceCommands(SurfaceState& surfaceState, u
     submitInfo.pWaitDstStageMask = waitStages;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &surfaceState.commandBuffer;
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &surfaceState.renderFinishedSemaphore;
+
+    std::array<VkSemaphore, 2> signalSemaphores = {
+        surfaceState.renderFinishedSemaphore,
+        timelineSemaphore,
+    };
+    VkTimelineSemaphoreSubmitInfo timelineSubmitInfo{};
+    u64 signalValue = 0;
+    if (useTimelineSemaphores && timelineSemaphore != VK_NULL_HANDLE)
+    {
+        signalValue = ++timelineValue;
+        timelineSubmitInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timelineSubmitInfo.signalSemaphoreValueCount = 1;
+        timelineSubmitInfo.pSignalSemaphoreValues = &signalValue;
+        submitInfo.pNext = &timelineSubmitInfo;
+        submitInfo.signalSemaphoreCount = 2;
+        submitInfo.pSignalSemaphores = signalSemaphores.data();
+    }
+    else
+    {
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &surfaceState.renderFinishedSemaphore;
+    }
 
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -2341,7 +2677,7 @@ bool VulkanSurfacePresenter::submitSurfaceCommands(SurfaceState& surfaceState, u
         return false;
 
     {
-        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetPresenterQueueLock());
+        std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetQueueLock());
         submitResult = vkQueueSubmit(queue, 1, &submitInfo, surfaceState.inFlightFence);
         if (submitResult == VK_SUCCESS)
         {
@@ -2364,6 +2700,8 @@ bool VulkanSurfacePresenter::submitSurfaceCommands(SurfaceState& surfaceState, u
 
     if (surfaceState.timestampQueryPool != VK_NULL_HANDLE)
         surfaceState.timestampPending = true;
+
+    presentTimelineValueOut = signalValue;
 
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR)
     {

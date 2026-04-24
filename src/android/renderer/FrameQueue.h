@@ -65,9 +65,11 @@ struct Frame {
     GLuint frameTexture{};
     u32 width{};
     u32 height{};
+    u64 frameId{};
     EGLSyncKHR renderFence{};
     EGLSyncKHR presentFence{};
     u64 renderTimelineValue{};
+    u64 presentTimelineValue{};
     u64 queuedAtNs{};
 };
 
@@ -78,6 +80,7 @@ public:
     Frame* getRenderFrame(const FrameQueuePolicy& policy);
     Frame* getPresentFrame(const FrameQueuePolicy& policy, std::optional<std::chrono::time_point<std::chrono::steady_clock>> deadline);
     Frame* getPresentCandidate(const FrameQueuePolicy& policy, std::optional<std::chrono::time_point<std::chrono::steady_clock>> deadline);
+    void recycleRenderFrame(Frame* frame);
     void commitPresentedFrame(Frame* frame, const FrameQueuePolicy& policy);
     void deferPresentedFrame(Frame* frame, const FrameQueuePolicy& policy);
     void validateRenderFrame(Frame* frame, int requiredWidth, int requiredHeight, FrameBackend backend);
@@ -112,6 +115,7 @@ private:
     Frame* previousFrame = nullptr;
     Frame* pendingPresentFrame = nullptr;
     bool suppressPreviousFrameReuse = false;
+    u64 nextFrameId = 1;
     FrameQueueStats stats{};
 };
 

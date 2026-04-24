@@ -19,11 +19,15 @@ const uint SHADE_MODE_TOON = 2u;
 const uint SHADE_MODE_HIGHLIGHT = 3u;
 const uint SHADE_MODE_SHADOW = 4u;
 const uint SHADE_MODE_ANY = 5u;
+const uint SCENE_MODE_DENSE_NO_BOUNDARY = 0u;
+const uint SCENE_MODE_DENSE_BOUNDARY = 1u;
+const uint SCENE_MODE_SPARSE_ACTIVE = 2u;
 
-layout(constant_id = 0) const uint PIPELINE_EXPECT_WBUFFER_MODE = WBUFFER_MODE_ANY;
-layout(constant_id = 1) const uint PIPELINE_EXPECT_SHADE_MODE = SHADE_MODE_ANY;
-layout(constant_id = 2) const uint PIPELINE_EXPECT_TEXTURE_MODE = TEXTURE_MODE_ANY;
-layout(constant_id = 3) const uint PIPELINE_EXPECT_TRANSLUCENCY_MODE = TRANSLUCENCY_MODE_ANY;
+layout(constant_id = 0) const uint PIPELINE_SCENE_MODE = SCENE_MODE_DENSE_BOUNDARY;
+layout(constant_id = 1) const uint PIPELINE_EXPECT_WBUFFER_MODE = WBUFFER_MODE_ANY;
+layout(constant_id = 2) const uint PIPELINE_EXPECT_SHADE_MODE = SHADE_MODE_ANY;
+layout(constant_id = 3) const uint PIPELINE_EXPECT_TEXTURE_MODE = TEXTURE_MODE_ANY;
+layout(constant_id = 4) const uint PIPELINE_EXPECT_TRANSLUCENCY_MODE = TRANSLUCENCY_MODE_ANY;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -565,7 +569,7 @@ void main()
     const uint tileCountX = (pc.width + (tileSize - 1u)) / tileSize;
     const uint tileCountY = (pc.height + (tileSize - 1u)) / tileSize;
     const uint tileCount = max(1u, tileCountX * tileCountY);
-    const bool useActiveTileDispatch = gl_NumWorkGroups.y == 1u;
+    const bool useActiveTileDispatch = PIPELINE_SCENE_MODE == SCENE_MODE_SPARSE_ACTIVE;
 
     uint linearTile = 0u;
     uint tileX = 0u;
@@ -792,9 +796,9 @@ void main()
             vec3 interpBary = bary;
             if (!linearInterp)
             {
-                float recipW0 = tri.w0;
-                float recipW1 = tri.w1;
-                float recipW2 = tri.w2;
+                float recipW0 = 1.0 / max(tri.w0, 1.0);
+                float recipW1 = 1.0 / max(tri.w1, 1.0);
+                float recipW2 = 1.0 / max(tri.w2, 1.0);
                 vec3 weighted = vec3(bary.x * recipW0, bary.y * recipW1, bary.z * recipW2);
                 float weightedSum = weighted.x + weighted.y + weighted.z;
                 if (abs(weightedSum) > 0.000001)
@@ -936,8 +940,11 @@ void main()
             uint tileAttr = 0u;
             bool isWireframe = polyAlpha == 0u;
             bool hasBoundaryEdges = (tri.flags & (TRI_FLAG_BOUNDARY_EDGE0 | TRI_FLAG_BOUNDARY_EDGE1 | TRI_FLAG_BOUNDARY_EDGE2)) != 0u;
-            bool canEmitBoundaryAttrs = hasBoundaryEdges && needsBoundaryAttrs;
-            if (canEmitBoundaryAttrs || isWireframe)
+            bool canEmitBoundaryAttrs =
+                PIPELINE_SCENE_MODE != SCENE_MODE_DENSE_NO_BOUNDARY
+                && hasBoundaryEdges
+                && needsBoundaryAttrs;
+            if (PIPELINE_SCENE_MODE != SCENE_MODE_DENSE_NO_BOUNDARY && (canEmitBoundaryAttrs || isWireframe))
             {
                 uint polygonYTop = span.yMin;
                 uint polygonYBot = span.yMax;

@@ -19,6 +19,7 @@
 #include "GPU2D_Soft.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#include "NDS.h"
 #include "Platform.h"
 
 namespace MelonDSAndroid
@@ -178,6 +179,9 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
     // oddly that's not the case for GPU A
     if (CurUnit->Num && !CurUnit->Enabled) forceblank = true;
 
+    if (CurUnit->Num == 0 && line == 0)
+        CaptureLineUses3d.fill(0);
+
     if (line == 0 && CurUnit->CaptureCnt & (1 << 31) && !forceblank)
         CurUnit->CaptureLatch = true;
 
@@ -286,10 +290,31 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
 
     if (GPU.GPU3D.IsRendererAccelerated())
     {
+        constexpr u32 kMetaFlagRegularCaptureUses3d = 1u << 21u;
+        constexpr u32 kMetaFlagVramCaptureUses3d = 1u << 22u;
         u32 xpos = GPU.GPU3D.GetRenderXPos();
+        u32 rendererMetaFlags = 0;
+
+        if (dispmode == 2)
+        {
+            if (line < CaptureLineUses3d.size() && CaptureLineUses3d[line] != 0)
+            {
+                rendererMetaFlags |= kMetaFlagVramCaptureUses3d;
+            }
+        }
+        else if (dispmode == 1
+            && CurUnit->Num == 1
+            && line < CaptureLineUses3d.size()
+            && CaptureLineUses3d[line] != 0)
+        {
+            // Engine B can display VRAM content populated by engine A capture. Mark it so
+            // Vulkan presentation can promote this DS-sized capture back to IR-space 3D.
+            rendererMetaFlags |= kMetaFlagRegularCaptureUses3d;
+        }
 
         dst[256*3] = masterBrightness |
                      (CurUnit->DispCnt & 0x30000) |
+                     rendererMetaFlags |
                      (xpos << 24) | ((xpos & 0x100) << 15);
         return;
     }
@@ -353,6 +378,7 @@ void SoftRenderer::VBlankEnd(Unit* unitA, Unit* unitB)
             && captureMode != 1u
             && (captureUsesDirect3D || (bg0Uses3D && sourceAContributes)))
         {
+            renderer3d.BeginCaptureFrame();
             renderer3d.PrepareCaptureFrame();
         }
     }
@@ -363,15 +389,26 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
 {
     u32 captureCnt = CurUnit->CaptureCnt;
     const u32 captureMode = (captureCnt >> 29u) & 0x3u;
+    const bool captureUsesDirect3D = (captureCnt & (1u << 24u)) != 0u;
+    bool captureLineUses3d = false;
+    bool captureLineHasUseful3dAlpha = false;
+    bool captureDestinationHasNonZeroPixel = false;
+    bool debugCaptureSourceReady = false;
+    if (CurUnit->Num == 0 && line < CaptureLineUses3d.size())
+        CaptureLineUses3d[line] = 0;
     const bool captureDebugEnabled = MelonDSAndroid::areRendererDebugToolsEnabled();
-    const bool logCaptureSamples = captureDebugEnabled;
-    if (captureDebugEnabled && line == 0)
+    const bool logCaptureSamples = MelonDSAndroid::areRendererDebugBgObjLogsEnabled();
+    if (line == 0)
     {
-        LastDebugCaptureStats = {};
-        LastDebugCaptureStats.CaptureWidth = width;
-        LastDebugCaptureStats.CaptureMode = captureMode;
-        LastDebugCaptureStats.CaptureBit24 = (captureCnt & (1u << 24u)) != 0u ? 1u : 0u;
         HasLastDebugCapture3dSource = false;
+        std::memset(LastDebugCapture3dSource, 0, sizeof(LastDebugCapture3dSource));
+        if (captureDebugEnabled)
+        {
+            LastDebugCaptureStats = {};
+            LastDebugCaptureStats.CaptureWidth = width;
+            LastDebugCaptureStats.CaptureMode = captureMode;
+            LastDebugCaptureStats.CaptureBit24 = (captureCnt & (1u << 24u)) != 0u ? 1u : 0u;
+        }
     }
     if (captureDebugEnabled)
         LastDebugCaptureStats.CaptureLines++;
@@ -388,13 +425,27 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
     // TODO: handle 3D in GPU3D::CurrentRenderer->Accelerated mode!!
 
     u32* srcA;
-    if (captureCnt & (1<<24))
+    if (captureUsesDirect3D)
     {
         if (captureDebugEnabled)
             LastDebugCaptureStats.Direct3DLines++;
         if (GPU.GPU3D.IsRendererAccelerated())
             _3DLine = GPU.GPU3D.GetLine(static_cast<int>(sourceLine));
         srcA = _3DLine;
+        captureLineUses3d = srcA != nullptr;
+        if (captureDebugEnabled && srcA != nullptr)
+            debugCaptureSourceReady = true;
+        if (captureDebugEnabled && srcA != nullptr)
+        {
+            for (u32 i = 0; i < width; i++)
+            {
+                if ((srcA[i] >> 24) != 0u)
+                {
+                    captureLineHasUseful3dAlpha = true;
+                    break;
+                }
+            }
+        }
     }
     else
     {
@@ -428,6 +479,18 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
                 _3DLine = GPU.GPU3D.GetLine(static_cast<int>(sourceLine));
                 if (_3DLine)
                 {
+                    captureLineUses3d = true;
+                    if (captureDebugEnabled)
+                    {
+                        for (u32 i = 0; i < width; i++)
+                        {
+                            if ((_3DLine[i] >> 24) != 0u)
+                            {
+                                captureLineHasUseful3dAlpha = true;
+                                break;
+                            }
+                        }
+                    }
                     struct CaptureSamplePoint
                     {
                         const char* label;
@@ -442,15 +505,6 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
                         {"seamC", 150u, 81u},
                         {"goodC", 149u, 81u},
                     };
-
-                    if (captureDebugEnabled)
-                    {
-                        std::memcpy(
-                            &LastDebugCapture3dSource[static_cast<size_t>(sourceLine) * 256u],
-                            _3DLine,
-                            256u * sizeof(u32));
-                        HasLastDebugCapture3dSource = true;
-                    }
 
                     // In accelerated mode compositing is normally done on the GPU, but
                     // display capture needs source A on CPU for VRAM writes.
@@ -541,6 +595,8 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
 
                         BGOBJLine[i] = val1;
                     }
+
+                    debugCaptureSourceReady = true;
                 }
             }
         }
@@ -567,6 +623,18 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
     dstaddr &= 0xFFFF;
     srcBaddr &= 0xFFFF;
 
+    if (CurUnit->Num == 0 && line < CaptureLineUses3d.size())
+        CaptureLineUses3d[line] = captureLineUses3d ? 1 : 0;
+
+    if (captureDebugEnabled && captureLineUses3d && debugCaptureSourceReady && srcA != nullptr)
+    {
+        std::memcpy(
+            &LastDebugCapture3dSource[static_cast<size_t>(sourceLine) * 256u],
+            srcA,
+            256u * sizeof(u32));
+        HasLastDebugCapture3dSource = true;
+    }
+
     static_assert(VRAMDirtyGranularity == 512);
     GPU.VRAMDirty[dstvram][(dstaddr * 2) / VRAMDirtyGranularity] = true;
 
@@ -585,7 +653,10 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
                 u32 b = (val >> 17) & 0x1F;
                 u32 a = ((val >> 24) != 0) ? 0x8000 : 0;
 
-                dst[dstaddr] = r | (g << 5) | (b << 10) | a;
+                const u16 packed = r | (g << 5) | (b << 10) | a;
+                dst[dstaddr] = packed;
+                if (packed != 0)
+                    captureDestinationHasNonZeroPixel = true;
                 dstaddr = (dstaddr + 1) & 0xFFFF;
             }
         }
@@ -597,7 +668,10 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
             {
                 for (u32 i = 0; i < width; i++)
                 {
-                    dst[dstaddr] = srcB[srcBaddr];
+                    const u16 packed = srcB[srcBaddr];
+                    dst[dstaddr] = packed;
+                    if (packed != 0)
+                        captureDestinationHasNonZeroPixel = true;
                     srcBaddr = (srcBaddr + 1) & 0xFFFF;
                     dstaddr = (dstaddr + 1) & 0xFFFF;
                 }
@@ -652,7 +726,10 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
                     if (gD > 0x1F) gD = 0x1F;
                     if (bD > 0x1F) bD = 0x1F;
 
-                    dst[dstaddr] = rD | (gD << 5) | (bD << 10) | (aD << 15);
+                    const u16 packed = rD | (gD << 5) | (bD << 10) | (aD << 15);
+                    dst[dstaddr] = packed;
+                    if (packed != 0)
+                        captureDestinationHasNonZeroPixel = true;
                     srcBaddr = (srcBaddr + 1) & 0xFFFF;
                     dstaddr = (dstaddr + 1) & 0xFFFF;
                 }
@@ -675,12 +752,25 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
                     u32 bD = ((bA * aA * eva) + 8) >> 4;
                     u32 aD = (eva>0 ? aA : 0);
 
-                    dst[dstaddr] = rD | (gD << 5) | (bD << 10) | (aD << 15);
+                    const u16 packed = rD | (gD << 5) | (bD << 10) | (aD << 15);
+                    dst[dstaddr] = packed;
+                    if (packed != 0)
+                        captureDestinationHasNonZeroPixel = true;
                     dstaddr = (dstaddr + 1) & 0xFFFF;
                 }
             }
         }
         break;
+    }
+
+    if (captureDebugEnabled)
+    {
+        if (captureLineUses3d)
+            LastDebugCaptureStats.CaptureLineUses3dLines++;
+        if (captureLineHasUseful3dAlpha)
+            LastDebugCaptureStats.CaptureLineUsefulAlphaLines++;
+        if (!captureDestinationHasNonZeroPixel)
+            LastDebugCaptureStats.CaptureDestinationBlankLines++;
     }
 }
 
@@ -873,7 +963,11 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         backdrop |= (backdrop << 32);
 
         for (int i = 0; i < 256; i+=2)
+        {
             *(u64*)&BGOBJLine[i] = backdrop;
+            *(u64*)&BGOBJLine[256 + i] = 0;
+            *(u64*)&BGOBJLine[512 + i] = 0;
+        }
     }
 
     if (CurUnit->DispCnt & 0xE000)
@@ -2027,7 +2121,7 @@ void SoftRenderer::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight,
                 color = *(u16*)&objvram[sampleAddr];
 
                 const u32 currentLine = (GPU.VCount + 1u) & 0xFFu;
-                if (!window && CurUnit->Num == 1 && MelonDSAndroid::areRendererDebugToolsEnabled())
+                if (!window && CurUnit->Num == 1 && MelonDSAndroid::areRendererDebugBgObjLogsEnabled())
                 {
                     if (const RendererDebugSamplePoint* sample = findRendererDebugSamplePoint(static_cast<u32>(xpos), currentLine))
                     {
@@ -2271,7 +2365,7 @@ void SoftRenderer::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s
             color = *(u16*)&objvram[sampleAddr];
 
             const u32 currentLine = (GPU.VCount + 1u) & 0xFFu;
-            if (!window && CurUnit->Num == 1 && MelonDSAndroid::areRendererDebugToolsEnabled())
+            if (!window && CurUnit->Num == 1 && MelonDSAndroid::areRendererDebugBgObjLogsEnabled())
             {
                 if (const RendererDebugSamplePoint* sample = findRendererDebugSamplePoint(static_cast<u32>(xpos), currentLine))
                 {

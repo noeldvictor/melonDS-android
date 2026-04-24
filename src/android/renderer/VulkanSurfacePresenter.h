@@ -92,6 +92,7 @@ public:
     void detachSurface(int surfaceId);
 
     bool presentFrame(Frame* frame, VulkanOutput& output, const VulkanCompositionInputs& inputs, u64 timeoutNs);
+    bool waitForFrameConsumption(Frame* frame, u64 timeoutNs = UINT64_MAX);
     VulkanPresenterPacingStats takePacingStatsSnapshotAndReset();
 
 private:
@@ -128,8 +129,12 @@ private:
         VkImageLayout sampledImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkSampler sampledSampler = VK_NULL_HANDLE;
         VkImageView rendererImageView = VK_NULL_HANDLE;
+        VkImageView previousRendererImageView = VK_NULL_HANDLE;
+        VkImageView previousTopRendererImageView = VK_NULL_HANDLE;
+        VkImageView previousBottomRendererImageView = VK_NULL_HANDLE;
         VkBuffer topPackedBuffer = VK_NULL_HANDLE;
         VkBuffer bottomPackedBuffer = VK_NULL_HANDLE;
+        VkBuffer capture3dBuffer = VK_NULL_HANDLE;
     };
 
     struct SurfaceState
@@ -187,6 +192,8 @@ private:
 private:
     bool createCommonResources();
     void destroyCommonResources();
+    bool createSyncObjects();
+    void destroySyncObjects();
 
     bool createSurfaceStateResources(SurfaceState& surfaceState);
     void destroySurfaceStateResources(SurfaceState& surfaceState);
@@ -228,7 +235,7 @@ private:
         bool directPresent,
         const std::vector<DrawCall>& drawCalls
     );
-    bool submitSurfaceCommands(SurfaceState& surfaceState, u32 imageIndex, u64& presentCpuNs);
+    bool submitSurfaceCommands(SurfaceState& surfaceState, u32 imageIndex, u64& presentCpuNs, u64& presentTimelineValueOut);
 
     u32 findMemoryType(u32 typeBits, VkMemoryPropertyFlags properties) const;
 
@@ -242,6 +249,10 @@ private:
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     u32 queueFamilyIndex = 0;
+    bool useTimelineSemaphores = false;
+    VkSemaphore timelineSemaphore = VK_NULL_HANDLE;
+    u64 timelineValue = 0;
+    PFN_vkWaitSemaphoresKHR waitSemaphores = nullptr;
 
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;

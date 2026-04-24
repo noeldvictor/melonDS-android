@@ -325,6 +325,9 @@ TexcacheVulkanLoader::TextureHandle TexcacheVulkanLoader::GenerateTexture(u32 wi
         return 0;
     }
 
+    constexpr VkPipelineStageFlags kTextureShaderStages =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+
     VkImageMemoryBarrier toGeneralBarrier{};
     toGeneralBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     toGeneralBarrier.srcAccessMask = 0;
@@ -342,7 +345,7 @@ TexcacheVulkanLoader::TextureHandle TexcacheVulkanLoader::GenerateTexture(u32 wi
     vkCmdPipelineBarrier(
         State->CommandBuffer,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        kTextureShaderStages,
         0,
         0,
         nullptr,
@@ -419,6 +422,9 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
     if (vkBeginCommandBuffer(State->CommandBuffer, &beginInfo) != VK_SUCCESS)
         return;
 
+    constexpr VkPipelineStageFlags kTextureShaderStages =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+
     VkImageMemoryBarrier toTransferBarrier{};
     toTransferBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     toTransferBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -435,7 +441,7 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
     toTransferBarrier.subresourceRange.layerCount = 1;
     vkCmdPipelineBarrier(
         State->CommandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        kTextureShaderStages,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0,
         0,
@@ -484,7 +490,7 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
     vkCmdPipelineBarrier(
         State->CommandBuffer,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        kTextureShaderStages,
         0,
         0,
         nullptr,
