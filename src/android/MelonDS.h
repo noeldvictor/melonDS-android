@@ -33,6 +33,70 @@ namespace MelonDSAndroid {
         VulkanDiagnosticLegacyFinalAaMask = 1u << 2u,
     };
 
+    enum Renderer2DDebugFeatureFlag : u32 {
+        Renderer2DDebugFeatureStaticBackground = 1u << 0u,
+        Renderer2DDebugFeatureAffineBackground = 1u << 1u,
+        Renderer2DDebugFeatureAffineExtendedTiledBackground = 1u << 2u,
+        Renderer2DDebugFeatureAffineExtendedBitmap256Background = 1u << 3u,
+        Renderer2DDebugFeatureAffineExtendedDirectColorBackground = 1u << 4u,
+        Renderer2DDebugFeatureLargeScreenBackground = 1u << 5u,
+        Renderer2DDebugFeature3DBackground = 1u << 6u,
+        Renderer2DDebugFeatureObjects = 1u << 7u,
+        Renderer2DDebugFeatureRegularObject = 1u << 8u,
+        Renderer2DDebugFeatureAffineObject = 1u << 9u,
+        Renderer2DDebugFeatureTiled4BppObject = 1u << 10u,
+        Renderer2DDebugFeatureTiled8BppObject = 1u << 11u,
+        Renderer2DDebugFeatureBitmapObject = 1u << 12u,
+        Renderer2DDebugFeatureBlendedObject = 1u << 13u,
+        Renderer2DDebugFeatureWindowObject = 1u << 14u,
+        Renderer2DDebugFeatureMosaicObject = 1u << 15u,
+        Renderer2DDebugFeatureObjectUpperBand = 1u << 16u,
+        Renderer2DDebugFeatureObjectMiddleBand = 1u << 17u,
+        Renderer2DDebugFeatureObjectLowerBand = 1u << 18u,
+    };
+
+    struct Renderer2DDebugControlState {
+        int mainForcedMode;
+        int subForcedMode;
+        int topForcedCompMode;
+        int bottomForcedCompMode;
+        u32 disabledMainBgMask;
+        u32 disabledSubBgMask;
+        u32 disabledMainBgPriorityMask;
+        u32 disabledSubBgPriorityMask;
+        u32 disabledMainObjPriorityMask;
+        u32 disabledSubObjPriorityMask;
+        u32 disabledMainObjOrderMask;
+        u32 disabledSubObjOrderMask;
+        u32 featureMask;
+    };
+
+    enum Renderer3DDebugFeatureFlag : u32 {
+        Renderer3DDebugFeatureRendererOutput = 1u << 0u,
+        Renderer3DDebugFeatureTrianglePolygons = 1u << 1u,
+        Renderer3DDebugFeatureLinePolygons = 1u << 2u,
+        Renderer3DDebugFeatureOpaquePolygons = 1u << 3u,
+        Renderer3DDebugFeatureTranslucentPolygons = 1u << 4u,
+        Renderer3DDebugFeatureShadowMaskPolygons = 1u << 5u,
+        Renderer3DDebugFeatureShadowPolygons = 1u << 6u,
+        Renderer3DDebugFeatureTexturedPolygons = 1u << 7u,
+        Renderer3DDebugFeatureUntexturedPolygons = 1u << 8u,
+        Renderer3DDebugFeatureModulatePolygons = 1u << 9u,
+        Renderer3DDebugFeatureDecalPolygons = 1u << 10u,
+        Renderer3DDebugFeatureToonHighlightPolygons = 1u << 11u,
+        Renderer3DDebugFeatureWBufferPolygons = 1u << 12u,
+        Renderer3DDebugFeatureZBufferPolygons = 1u << 13u,
+        Renderer3DDebugFeatureDepthWritePolygons = 1u << 14u,
+        Renderer3DDebugFeatureFogWritePolygons = 1u << 15u,
+        Renderer3DDebugFeatureUpperBand = 1u << 16u,
+        Renderer3DDebugFeatureMiddleBand = 1u << 17u,
+        Renderer3DDebugFeatureLowerBand = 1u << 18u,
+    };
+
+    struct Renderer3DDebugControlState {
+        u32 featureMask;
+    };
+
     typedef enum {
         ROM,
         FIRMWARE
@@ -93,6 +157,35 @@ namespace MelonDSAndroid {
     extern void requestVulkanPresentationResync();
     extern bool areRendererDebugToolsEnabled();
     extern bool areRendererDebugBgObjLogsEnabled();
+    extern Renderer2DDebugControlState getRenderer2DDebugControls();
+    extern void setRenderer2DDebugControls(
+        int mainForcedMode,
+        int subForcedMode,
+        int topForcedCompMode,
+        int bottomForcedCompMode,
+        u32 disabledMainBgMask,
+        u32 disabledSubBgMask,
+        u32 disabledMainBgPriorityMask,
+        u32 disabledSubBgPriorityMask,
+        u32 disabledMainObjPriorityMask,
+        u32 disabledSubObjPriorityMask,
+        u32 disabledMainObjOrderMask,
+        u32 disabledSubObjOrderMask,
+        u32 featureMask);
+    extern Renderer3DDebugControlState getRenderer3DDebugControls();
+    extern void setRenderer3DDebugControls(u32 featureMask);
+    extern int getRenderer2DDebugForcedMode(u32 unit);
+    extern int getRenderer2DDebugForcedCompMode(bool topScreen);
+    extern bool isRenderer2DDebugBgLayerEnabled(u32 unit, u32 bgnum);
+    extern bool isRenderer2DDebugBgPriorityEnabled(u32 unit, u32 priority);
+    extern bool isRenderer2DDebugBackgroundKindEnabled(u32 featureFlag);
+    extern bool areRenderer2DDebugObjectsEnabled(u32 unit);
+    extern bool isRenderer2DDebugObjectPriorityEnabled(u32 unit, u32 priority);
+    extern bool isRenderer2DDebugObjectOrderEnabled(u32 unit, u32 orderBucket);
+    extern bool isRenderer2DDebugObjectFeatureEnabled(u32 featureFlag);
+    extern bool areRenderer2DDebugControlsActive();
+    extern bool isRenderer3DDebugFeatureEnabled(u32 featureFlag);
+    extern bool areRenderer3DDebugControlsActive();
     extern u32 getVulkanDiagnosticFlags();
     extern bool hasVulkanDiagnosticFlag(VulkanDiagnosticFlag flag);
     extern std::vector<u32> captureCurrentFrameForDebug();

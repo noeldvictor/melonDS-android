@@ -17,6 +17,8 @@
 namespace MelonDSAndroid
 {
 bool areRendererDebugToolsEnabled();
+bool areRenderer2DDebugControlsActive();
+bool isRenderer2DDebugBackgroundKindEnabled(melonDS::u32 featureFlag);
 
 namespace
 {
@@ -29,6 +31,7 @@ constexpr u64 kValidationWaitTimeoutNs = 2'000'000'000ull;
 constexpr melonDS::u32 kMetaFlagRegularCaptureUses3d = 1u << 21u;
 constexpr melonDS::u32 kMetaFlagVramCaptureUses3d = 1u << 22u;
 constexpr melonDS::u32 kPacked3dPlaceholder = 0x20000000u;
+constexpr melonDS::u32 kRenderer2DDebugFeature3DBackground = 1u << 6u;
 
 melonDS::u32 expandPackedColor6ToRgba8(melonDS::u32 packedColor)
 {
@@ -1475,16 +1478,27 @@ bool VulkanOutput::updatePreparedCapture3dSource(
     if (resource.capture3dMapped != nullptr)
         std::memset(resource.capture3dMapped, 0, static_cast<size_t>(kCapture3dBufferSize));
 
+    const bool renderer2dDebugControlsActive = areRenderer2DDebugControlsActive();
+    if (renderer2dDebugControlsActive)
+    {
+        lastValidCapture3dSourceLines.fill(0);
+        lastValidTopComp4PlaceholderLines.fill(0);
+        lastValidBottomComp4PlaceholderLines.fill(0);
+    }
+    const bool renderer2dDebug3dBackgroundEnabled =
+        !renderer2dDebugControlsActive
+        || isRenderer2DDebugBackgroundKindEnabled(kRenderer2DDebugFeature3DBackground);
     const u32* preparedCapture3dSource = softPackedSnapshot.hasCapture3dSource
         ? softPackedSnapshot.capture3dSourceDsFrame.data()
         : nullptr;
     const u32* previousPreparedCapture3dSource =
-        previousResource != nullptr && previousResource->hasPreparedCapture3dSource
+        !renderer2dDebugControlsActive && previousResource != nullptr && previousResource->hasPreparedCapture3dSource
         ? (previousResource->capture3dMapped != nullptr
             ? static_cast<const u32*>(previousResource->capture3dMapped)
             : previousResource->preparedCapture3dSource.data())
         : nullptr;
-    const u32* lastValidPreparedCapture3dSource = lastValidCapture3dSource.data();
+    const u32* lastValidPreparedCapture3dSource =
+        renderer2dDebugControlsActive ? nullptr : lastValidCapture3dSource.data();
     const bool preferTopComp4Placeholder =
         softPackedSnapshot.topScreenStats.CaptureBackedComp4Lines > 0u
         && softPackedSnapshot.bottomScreenStats.CaptureBackedComp4Lines == 0u;
@@ -1497,21 +1511,28 @@ bool VulkanOutput::updatePreparedCapture3dSource(
     u8* lastValidComp4PlaceholderLines = nullptr;
     if (preferTopComp4Placeholder)
     {
-        preferredComp4Placeholder = softPackedSnapshot.comp4TopPlaceholder.data();
+        preferredComp4Placeholder = renderer2dDebug3dBackgroundEnabled
+            ? softPackedSnapshot.comp4TopPlaceholder.data()
+            : nullptr;
         preferredComp4PlaceholderIsTemporal = true;
-        lastValidComp4Placeholder = lastValidTopComp4Placeholder.data();
-        lastValidComp4PlaceholderLines = lastValidTopComp4PlaceholderLines.data();
+        lastValidComp4Placeholder = renderer2dDebugControlsActive ? nullptr : lastValidTopComp4Placeholder.data();
+        lastValidComp4PlaceholderLines = renderer2dDebugControlsActive ? nullptr : lastValidTopComp4PlaceholderLines.data();
     }
     else if (preferBottomComp4Placeholder)
     {
-        preferredComp4Placeholder = softPackedSnapshot.comp4BottomPlaceholder.data();
+        preferredComp4Placeholder = renderer2dDebug3dBackgroundEnabled
+            ? softPackedSnapshot.comp4BottomPlaceholder.data()
+            : nullptr;
         preferredComp4PlaceholderIsTemporal = true;
-        lastValidComp4Placeholder = lastValidBottomComp4Placeholder.data();
-        lastValidComp4PlaceholderLines = lastValidBottomComp4PlaceholderLines.data();
+        lastValidComp4Placeholder = renderer2dDebugControlsActive ? nullptr : lastValidBottomComp4Placeholder.data();
+        lastValidComp4PlaceholderLines = renderer2dDebugControlsActive ? nullptr : lastValidBottomComp4PlaceholderLines.data();
     }
     const auto* captureLineUses3dMask = &softPackedSnapshot.captureLineUses3dMask;
-    const bool renderer2dCapture3dSourceHasPixels = capture3dSourceHasAnyUsefulPixel(preparedCapture3dSource);
+    const bool renderer2dCapture3dSourceHasPixels =
+        renderer2dDebug3dBackgroundEnabled && capture3dSourceHasAnyUsefulPixel(preparedCapture3dSource);
     if (!currentFrameNeedsCapture3dSource)
+        return true;
+    if (!renderer2dDebug3dBackgroundEnabled)
         return true;
 
     u32 linesFromRenderer2d = 0;
@@ -1539,7 +1560,8 @@ bool VulkanOutput::updatePreparedCapture3dSource(
             && !(preferredComp4LineIsSolidOpaqueBlack && latchedComp4LineHasPixels);
         const bool lineHasPixels = capture3dSourceLineHasAnyUsefulPixel(preparedCapture3dSource, y);
         const bool latchedLineHasPixels =
-            lastValidCapture3dSourceLines[static_cast<size_t>(y)] != 0u
+            !renderer2dDebugControlsActive
+            && lastValidCapture3dSourceLines[static_cast<size_t>(y)] != 0u
             && capture3dSourceLineHasAnyUsefulPixel(lastValidPreparedCapture3dSource, y);
         const bool previousLineHasPixels = capture3dSourceLineHasAnyUsefulPixel(previousPreparedCapture3dSource, y);
         const bool lineUses3d = captureLineUses3dMask != nullptr
@@ -1646,11 +1668,14 @@ bool VulkanOutput::updatePreparedCapture3dSource(
                 resource.preparedCapture3dSource[rowOffset + static_cast<size_t>(x)] =
                     expandPackedColor6ToRgba8(preparedCapture3dSource[rowOffset + static_cast<size_t>(x)]);
             }
-            std::memcpy(
-                lastValidCapture3dSource.data() + rowOffset,
-                preparedCapture3dSource + rowOffset,
-                static_cast<size_t>(kScreenWidth) * sizeof(u32));
-            lastValidCapture3dSourceLines[static_cast<size_t>(y)] = 1u;
+            if (!renderer2dDebugControlsActive)
+            {
+                std::memcpy(
+                    lastValidCapture3dSource.data() + rowOffset,
+                    preparedCapture3dSource + rowOffset,
+                    static_cast<size_t>(kScreenWidth) * sizeof(u32));
+                lastValidCapture3dSourceLines[static_cast<size_t>(y)] = 1u;
+            }
             resolvedLines[static_cast<size_t>(y)] = 1u;
             linesFromRenderer2d++;
             continue;
@@ -1728,11 +1753,14 @@ bool VulkanOutput::updatePreparedCapture3dSource(
 
             for (int x = 0; x < kScreenWidth; x++)
                 resource.preparedCapture3dSource[rowOffset + static_cast<size_t>(x)] = expandPackedColor6ToRgba8(line[x]);
-            std::memcpy(
-                lastValidCapture3dSource.data() + rowOffset,
-                line,
-                static_cast<size_t>(kScreenWidth) * sizeof(u32));
-            lastValidCapture3dSourceLines[static_cast<size_t>(y)] = 1u;
+            if (!renderer2dDebugControlsActive)
+            {
+                std::memcpy(
+                    lastValidCapture3dSource.data() + rowOffset,
+                    line,
+                    static_cast<size_t>(kScreenWidth) * sizeof(u32));
+                lastValidCapture3dSourceLines[static_cast<size_t>(y)] = 1u;
+            }
             resolvedLines[static_cast<size_t>(y)] = 1u;
             resource.captureFallbackLines[static_cast<size_t>(y)] = 1u;
             softPackedSnapshot.captureFallbackLines[static_cast<size_t>(y)] = 1u;

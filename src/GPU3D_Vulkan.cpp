@@ -53,6 +53,8 @@ namespace MelonDSAndroid
 {
 bool isFastForwardActive();
 bool areRendererDebugToolsEnabled();
+bool isRenderer3DDebugFeatureEnabled(melonDS::u32 featureFlag);
+bool areRenderer3DDebugControlsActive();
 melonDS::u32 getVulkanDiagnosticFlags();
 }
 
@@ -77,6 +79,154 @@ constexpr u32 kWorkActiveTileCount = 6u;
 constexpr u32 kWorkActiveGroupCount = 7u;
 constexpr u32 kWorkTileOffsetsBase = 8u;
 constexpr u32 kCpuActiveTileDispatchMaxCoveragePercent = 90u;
+constexpr u32 kRenderer3DDebugFeatureRendererOutput = 1u << 0u;
+constexpr u32 kRenderer3DDebugFeatureTrianglePolygons = 1u << 1u;
+constexpr u32 kRenderer3DDebugFeatureLinePolygons = 1u << 2u;
+constexpr u32 kRenderer3DDebugFeatureOpaquePolygons = 1u << 3u;
+constexpr u32 kRenderer3DDebugFeatureTranslucentPolygons = 1u << 4u;
+constexpr u32 kRenderer3DDebugFeatureShadowMaskPolygons = 1u << 5u;
+constexpr u32 kRenderer3DDebugFeatureShadowPolygons = 1u << 6u;
+constexpr u32 kRenderer3DDebugFeatureTexturedPolygons = 1u << 7u;
+constexpr u32 kRenderer3DDebugFeatureUntexturedPolygons = 1u << 8u;
+constexpr u32 kRenderer3DDebugFeatureModulatePolygons = 1u << 9u;
+constexpr u32 kRenderer3DDebugFeatureDecalPolygons = 1u << 10u;
+constexpr u32 kRenderer3DDebugFeatureToonHighlightPolygons = 1u << 11u;
+constexpr u32 kRenderer3DDebugFeatureWBufferPolygons = 1u << 12u;
+constexpr u32 kRenderer3DDebugFeatureZBufferPolygons = 1u << 13u;
+constexpr u32 kRenderer3DDebugFeatureDepthWritePolygons = 1u << 14u;
+constexpr u32 kRenderer3DDebugFeatureFogWritePolygons = 1u << 15u;
+constexpr u32 kRenderer3DDebugFeatureUpperBand = 1u << 16u;
+constexpr u32 kRenderer3DDebugFeatureMiddleBand = 1u << 17u;
+constexpr u32 kRenderer3DDebugFeatureLowerBand = 1u << 18u;
+
+bool Renderer3DDebugShouldDrawPolygon(
+    const AcceleratedPolygonMeta& polygonMeta,
+    bool isLine,
+    bool polygonTextured,
+    bool highlightEnabled)
+{
+    if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureRendererOutput))
+        return false;
+
+    if (isLine)
+    {
+        if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureLinePolygons))
+            return false;
+    }
+    else if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureTrianglePolygons))
+    {
+        return false;
+    }
+
+    if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask))
+    {
+        if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureShadowMaskPolygons))
+            return false;
+    }
+    else if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadow))
+    {
+        if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureShadowPolygons))
+            return false;
+    }
+    else
+    {
+        const u32 alpha5 = polygonMeta.Alpha5;
+        const bool translucent = HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagTranslucent)
+            || (alpha5 != 0u && alpha5 < 0x1Fu);
+        if (translucent)
+        {
+            if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureTranslucentPolygons))
+                return false;
+        }
+        else if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureOpaquePolygons))
+        {
+            return false;
+        }
+    }
+
+    if (polygonTextured)
+    {
+        if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureTexturedPolygons))
+            return false;
+    }
+    else if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureUntexturedPolygons))
+    {
+        return false;
+    }
+
+    const u32 blendMode = (polygonMeta.PolyAttr >> 4u) & 0x3u;
+    if (blendMode == 2u)
+    {
+        (void)highlightEnabled;
+        if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureToonHighlightPolygons))
+            return false;
+    }
+    else if (polygonTextured && (blendMode & 0x1u) != 0u)
+    {
+        if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureDecalPolygons))
+            return false;
+    }
+    else if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureModulatePolygons))
+    {
+        return false;
+    }
+
+    if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagWBuffer))
+    {
+        if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureWBufferPolygons))
+            return false;
+    }
+    else if (!MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureZBufferPolygons))
+    {
+        return false;
+    }
+
+    if ((polygonMeta.PolyAttr & (1u << 11u)) != 0u
+        && !MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureDepthWritePolygons))
+    {
+        return false;
+    }
+
+    if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagFogWrite)
+        && !MelonDSAndroid::isRenderer3DDebugFeatureEnabled(kRenderer3DDebugFeatureFogWritePolygons))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool Renderer3DDebugYBoundsEnabled(u32 packedYBounds, u32 targetHeight)
+{
+    if (!MelonDSAndroid::areRenderer3DDebugControlsActive())
+        return true;
+
+    u32 yTop = packedYBounds & 0xFFFFu;
+    u32 yBottom = (packedYBounds >> 16u) & 0xFFFFu;
+    yTop = std::min(yTop, targetHeight);
+    yBottom = std::min(yBottom, targetHeight);
+    if (yBottom <= yTop)
+        yBottom = std::min(targetHeight, yTop + 1u);
+
+    const u32 upperEnd = targetHeight / 3u;
+    const u32 middleEnd = (targetHeight * 2u) / 3u;
+    bool touchesAnyBand = false;
+    const auto allowsBand = [&](u32 bandTop, u32 bandBottom, u32 featureFlag) -> bool {
+        if (yTop >= bandBottom || yBottom <= bandTop)
+            return false;
+        touchesAnyBand = true;
+        return MelonDSAndroid::isRenderer3DDebugFeatureEnabled(featureFlag);
+    };
+
+    if (allowsBand(0u, upperEnd, kRenderer3DDebugFeatureUpperBand))
+        return true;
+    if (allowsBand(upperEnd, middleEnd, kRenderer3DDebugFeatureMiddleBand))
+        return true;
+    if (allowsBand(middleEnd, targetHeight, kRenderer3DDebugFeatureLowerBand))
+        return true;
+
+    return !touchesAnyBand;
+}
 
 void logCaptureDebugState(
     const char* stage,
@@ -10916,6 +11066,33 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
         return (polygonYTop & 0xFFFFu) | ((polygonYBot & 0xFFFFu) << 16u);
     };
 
+    const auto packSceneDrawYBounds = [&](const AcceleratedSceneDraw& sceneDraw) -> std::optional<u32> {
+        u32 polygonYTop = targetHeight;
+        u32 polygonYBot = 0u;
+        bool hasPolygonYBounds = false;
+        for (u32 vertexOffset = 0; vertexOffset < sceneDraw.VertexCount; vertexOffset++)
+        {
+            const u32 sceneVertexIndex = sceneDraw.FirstVertex + vertexOffset;
+            if (sceneVertexIndex >= SharedGraphicsScene.Vertices.size())
+                break;
+
+            const float clampedY = std::clamp(SharedGraphicsScene.Vertices[sceneVertexIndex].Y, 0.0f, static_cast<float>(targetHeight));
+            const u32 yTopLine = static_cast<u32>(std::floor(clampedY));
+            const u32 yBottomLine = std::min<u32>(targetHeight, static_cast<u32>(std::ceil(clampedY)));
+            polygonYTop = std::min(polygonYTop, yTopLine);
+            polygonYBot = std::max(polygonYBot, yBottomLine);
+            hasPolygonYBounds = true;
+        }
+
+        if (!hasPolygonYBounds)
+            return std::nullopt;
+
+        if (polygonYBot <= polygonYTop)
+            polygonYBot = std::min<u32>(targetHeight, polygonYTop + 1u);
+
+        return (polygonYTop & 0xFFFFu) | ((polygonYBot & 0xFFFFu) << 16u);
+    };
+
     for (const AcceleratedSceneDraw& sceneDraw : SharedGraphicsScene.Draws)
     {
         const Polygon* polygon = sceneDraw.SourcePolygon;
@@ -10931,8 +11108,22 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
         const u32 blendMode = (polygonMeta.PolyAttr >> 4u) & 0x3u;
         const float effectiveCoverageDepthBias =
             sceneDraw.CoverageFixState.ApplyUserFix ? coverageDepthBias : 0.0f;
+        const bool polygonTexturedByRegs = textureMapsEnabled && (((polygon->TexParam >> 26u) & 0x7u) != 0u);
 
-        bool polygonTextured = textureMapsEnabled && (((polygon->TexParam >> 26u) & 0x7u) != 0u);
+        if (!Renderer3DDebugShouldDrawPolygon(
+                polygonMeta,
+                sceneDraw.PrimitiveType == AcceleratedPrimitiveType::Lines,
+                polygonTexturedByRegs,
+                highlightEnabled))
+        {
+            continue;
+        }
+
+        const std::optional<u32> debugYBounds = packSceneDrawYBounds(sceneDraw);
+        if (debugYBounds.has_value() && !Renderer3DDebugYBoundsEnabled(*debugYBounds, targetHeight))
+            continue;
+
+        bool polygonTextured = polygonTexturedByRegs;
         TexcacheVulkanLoader::TextureHandle textureHandle = 0;
         u32 textureLayer = 0;
         u32* helper = nullptr;
@@ -11588,6 +11779,16 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
         const bool isTranslucent = polygonUsesGlTranslucentPass || (alpha5 != 0u && alpha5 < 0x1Fu);
         const u32 blendMode = (polygonMeta.PolyAttr >> 4) & 0x3u;
         const bool highlightEnabled = (gpu.GPU3D.RenderDispCnt & (1u << 1)) != 0;
+        const bool polygonTexturedByRegs = textureMapsEnabled && (((polygon->TexParam >> 26) & 0x7u) != 0u);
+        if (!Renderer3DDebugShouldDrawPolygon(
+                polygonMeta,
+                polygon->Type == 1,
+                polygonTexturedByRegs,
+                highlightEnabled))
+        {
+            continue;
+        }
+
         const AcceleratedCoverageFixState coverageFixState = ResolveAcceleratedCoverageFix(
             *polygon,
             AcceleratedCoverageFixConfig{
@@ -11634,7 +11835,7 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
             }
         }
 
-        bool polygonTextured = textureMapsEnabled && (((polygon->TexParam >> 26) & 0x7u) != 0u);
+        bool polygonTextured = polygonTexturedByRegs;
         TexcacheVulkanLoader::TextureHandle textureHandle = 0;
         u32 textureLayer = 0;
         u32* helper = nullptr;
@@ -11709,6 +11910,33 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
 
             return resolveVertexY(vertex);
         };
+
+        u32 debugYTop = targetHeight;
+        u32 debugYBottom = 0u;
+        bool hasDebugYBounds = false;
+        for (u32 vertexIndex = 0; vertexIndex < polygon->NumVertices; vertexIndex++)
+        {
+            const Vertex* vertex = polygon->Vertices[vertexIndex];
+            if (vertex == nullptr)
+                continue;
+
+            const float y = makeY(vertex, vertexIndex);
+            const float clampedY = std::clamp(y, 0.0f, static_cast<float>(targetHeight));
+            const u32 yTopLine = static_cast<u32>(std::floor(clampedY));
+            const u32 yBottomLine = std::min<u32>(targetHeight, static_cast<u32>(std::ceil(clampedY)));
+            debugYTop = std::min(debugYTop, yTopLine);
+            debugYBottom = std::max(debugYBottom, yBottomLine);
+            hasDebugYBounds = true;
+        }
+        if (hasDebugYBounds)
+        {
+            if (debugYBottom <= debugYTop)
+                debugYBottom = std::min<u32>(targetHeight, debugYTop + 1u);
+
+            const u32 debugPackedYBounds = (debugYTop & 0xFFFFu) | ((debugYBottom & 0xFFFFu) << 16u);
+            if (!Renderer3DDebugYBoundsEnabled(debugPackedYBounds, targetHeight))
+                continue;
+        }
 
         const auto makeColor = [&](const Vertex* vertex) -> u32 {
             // FinalColor is produced in the same expanded range the software/OpenGL paths

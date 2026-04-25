@@ -1043,6 +1043,27 @@ u32 MelonInstance::runFrame()
 
         frameQueue.recycleRenderFrame(candidateFrame);
     }
+    if (renderFrame == nullptr && currentRenderer == Renderer::Vulkan && vulkanOutput != nullptr)
+    {
+        // A frame can be held only by temporal previous-source refs. Drop that
+        // history once so startup does not stay stuck on the clear frame.
+        vulkanOutput->invalidateTemporalHistory();
+
+        Frame* candidateFrame = frameQueue.getRenderFrame(frameQueuePolicy);
+        if (candidateFrame != nullptr)
+        {
+            const bool readyForReuse = vulkanSurfacePresenter == nullptr
+                || vulkanSurfacePresenter->waitForFrameConsumption(candidateFrame);
+            if (readyForReuse)
+            {
+                renderFrame = candidateFrame;
+            }
+            else
+            {
+                frameQueue.recycleRenderFrame(candidateFrame);
+            }
+        }
+    }
     prepareRenderFrame(renderFrame);
     if (renderFrame != nullptr)
         frameQueue.validateRenderFrame(renderFrame, screenWidth, screenHeight * 2, frameBackend);
@@ -1499,7 +1520,8 @@ bool MelonInstance::presentVulkanFrame(
             continue;
         }
 
-        if (frameQueuePolicy.AllowDropForDeadline && !vulkanOutput->isFrameReady(frame))
+        const bool frameReady = vulkanOutput->isFrameReady(frame);
+        if (frameQueuePolicy.AllowDropForDeadline && !frameReady)
         {
             frameQueue.deferPresentedFrame(frame, deferFrameQueuePolicy);
             if (frameQueuePolicy.PreferOldestFrame)
@@ -1541,7 +1563,11 @@ bool MelonInstance::presentVulkanFrame(
                 return UINT64_MAX;
 
             if (!shouldProbeRealtimeBacklog || waitTimeoutNs == UINT64_MAX)
+            {
+                if (graphicsHardwareActive && frameReady && waitTimeoutNs != UINT64_MAX)
+                    return std::max(waitTimeoutNs, kVulkanHighResolutionRealtimePresenterBudgetFloorNs);
                 return waitTimeoutNs;
+            }
 
             return std::max(waitTimeoutNs, kVulkanHighResolutionRealtimePresenterBudgetFloorNs);
         }();
@@ -3656,6 +3682,14 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(const Frame* frame, int frontBu
     lastSoftPackedFrameSnapshot.frameId = frame->frameId;
     lastSoftPackedFrameSnapshot.frontBufferLatched = frontBuffer;
     lastSoftPackedFrameSnapshot.screenSwapLatched = screenSwap;
+    const bool renderer2dDebugControlsActive = areRenderer2DDebugControlsActive();
+    if (renderer2dDebugControlsActive)
+    {
+        lastValidTopScreenResolvedPrimaryLines.fill(0);
+        lastValidBottomScreenResolvedPrimaryLines.fill(0);
+        hasLastValidTopScreenCapture3dDsFrame = false;
+        hasLastValidBottomScreenCapture3dDsFrame = false;
+    }
 
     for (int y = 0; y < kScreenshotScreenHeight; y++)
     {
@@ -3691,6 +3725,23 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(const Frame* frame, int frontBu
         lastSoftPackedFrameSnapshot.packedBottomLineMeta[static_cast<size_t>(y)] =
             bottomPackedRaw[packedRowBase + static_cast<size_t>(kSoftPackedStride - 1u)];
     }
+
+    auto applyForcedCompMode =
+        [](std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& control, int forcedCompMode) {
+            if (forcedCompMode < 0 || forcedCompMode > 7)
+                return;
+
+            const u32 compModeBits = static_cast<u32>(forcedCompMode) << 24u;
+            for (u32& pixelControl : control)
+                pixelControl = (pixelControl & 0xF0FFFFFFu) | compModeBits;
+        };
+
+    applyForcedCompMode(
+        lastSoftPackedFrameSnapshot.packedTopControl,
+        getRenderer2DDebugForcedCompMode(true));
+    applyForcedCompMode(
+        lastSoftPackedFrameSnapshot.packedBottomControl,
+        getRenderer2DDebugForcedCompMode(false));
 
     auto latchedSnapshotLineIsZero =
         [](const std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& plane0,
@@ -3950,34 +4001,42 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(const Frame* frame, int frontBu
             return carriedLines;
         };
 
-    const int carriedTopLatchedLines = carryPreviousLatchedScreenLines(
-        previousSoftPackedFrameSnapshot,
-        true,
-        lastSoftPackedFrameSnapshot.packedTopPlane0,
-        lastSoftPackedFrameSnapshot.packedTopPlane1,
-        lastSoftPackedFrameSnapshot.packedTopControl,
-        lastSoftPackedFrameSnapshot.packedTopLineMeta);
-    const int carriedBottomLatchedLines = carryPreviousLatchedScreenLines(
-        previousSoftPackedFrameSnapshot,
-        false,
-        lastSoftPackedFrameSnapshot.packedBottomPlane0,
-        lastSoftPackedFrameSnapshot.packedBottomPlane1,
-        lastSoftPackedFrameSnapshot.packedBottomControl,
-        lastSoftPackedFrameSnapshot.packedBottomLineMeta);
-    const int carriedTopTemporalOverlayLines = carryPreviousTemporalOverlayPixels(
-        previousSoftPackedFrameSnapshot,
-        true,
-        lastSoftPackedFrameSnapshot.packedTopPlane0,
-        lastSoftPackedFrameSnapshot.packedTopPlane1,
-        lastSoftPackedFrameSnapshot.packedTopControl,
-        lastSoftPackedFrameSnapshot.packedTopLineMeta);
-    const int carriedBottomTemporalOverlayLines = carryPreviousTemporalOverlayPixels(
-        previousSoftPackedFrameSnapshot,
-        false,
-        lastSoftPackedFrameSnapshot.packedBottomPlane0,
-        lastSoftPackedFrameSnapshot.packedBottomPlane1,
-        lastSoftPackedFrameSnapshot.packedBottomControl,
-        lastSoftPackedFrameSnapshot.packedBottomLineMeta);
+    const int carriedTopLatchedLines = renderer2dDebugControlsActive
+        ? 0
+        : carryPreviousLatchedScreenLines(
+            previousSoftPackedFrameSnapshot,
+            true,
+            lastSoftPackedFrameSnapshot.packedTopPlane0,
+            lastSoftPackedFrameSnapshot.packedTopPlane1,
+            lastSoftPackedFrameSnapshot.packedTopControl,
+            lastSoftPackedFrameSnapshot.packedTopLineMeta);
+    const int carriedBottomLatchedLines = renderer2dDebugControlsActive
+        ? 0
+        : carryPreviousLatchedScreenLines(
+            previousSoftPackedFrameSnapshot,
+            false,
+            lastSoftPackedFrameSnapshot.packedBottomPlane0,
+            lastSoftPackedFrameSnapshot.packedBottomPlane1,
+            lastSoftPackedFrameSnapshot.packedBottomControl,
+            lastSoftPackedFrameSnapshot.packedBottomLineMeta);
+    const int carriedTopTemporalOverlayLines = renderer2dDebugControlsActive
+        ? 0
+        : carryPreviousTemporalOverlayPixels(
+            previousSoftPackedFrameSnapshot,
+            true,
+            lastSoftPackedFrameSnapshot.packedTopPlane0,
+            lastSoftPackedFrameSnapshot.packedTopPlane1,
+            lastSoftPackedFrameSnapshot.packedTopControl,
+            lastSoftPackedFrameSnapshot.packedTopLineMeta);
+    const int carriedBottomTemporalOverlayLines = renderer2dDebugControlsActive
+        ? 0
+        : carryPreviousTemporalOverlayPixels(
+            previousSoftPackedFrameSnapshot,
+            false,
+            lastSoftPackedFrameSnapshot.packedBottomPlane0,
+            lastSoftPackedFrameSnapshot.packedBottomPlane1,
+            lastSoftPackedFrameSnapshot.packedBottomControl,
+            lastSoftPackedFrameSnapshot.packedBottomLineMeta);
 
     lastSoftPackedFrameSnapshot.topScreenStats = collectPackedScreenStatsFromSnapshot(
         lastSoftPackedFrameSnapshot.packedTopPlane0,
@@ -4017,15 +4076,17 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(const Frame* frame, int frontBu
         lastSoftPackedFrameSnapshot.bottomScreenStats.RegularCaptureUses3dLines > 0u
         || lastSoftPackedFrameSnapshot.bottomScreenStats.VramCaptureUses3dLines > 0u;
     const auto* previousTopScreenPrimary =
-        previousSoftPackedFrameSnapshot.valid
+        !renderer2dDebugControlsActive && previousSoftPackedFrameSnapshot.valid
         ? &previousSoftPackedFrameSnapshot.packedTopPlane0
         : nullptr;
     const auto* previousBottomScreenPrimary =
-        previousSoftPackedFrameSnapshot.valid
+        !renderer2dDebugControlsActive && previousSoftPackedFrameSnapshot.valid
         ? &previousSoftPackedFrameSnapshot.packedBottomPlane0
         : nullptr;
-    const bool hasTopResolvedPrimaryCache = lineMaskHasAnyValidLine(lastValidTopScreenResolvedPrimaryLines);
-    const bool hasBottomResolvedPrimaryCache = lineMaskHasAnyValidLine(lastValidBottomScreenResolvedPrimaryLines);
+    const bool hasTopResolvedPrimaryCache =
+        !renderer2dDebugControlsActive && lineMaskHasAnyValidLine(lastValidTopScreenResolvedPrimaryLines);
+    const bool hasBottomResolvedPrimaryCache =
+        !renderer2dDebugControlsActive && lineMaskHasAnyValidLine(lastValidBottomScreenResolvedPrimaryLines);
     if (lastSoftPackedFrameSnapshot.hasCapture3dSource)
     {
         if (topScreenUsesCurrentCapture3d && !bottomScreenUsesCurrentCapture3d)
@@ -4251,37 +4312,44 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(const Frame* frame, int frontBu
             return repairedLines;
         };
 
-    const int repairedTopTemporalPrimaryLines = repairTemporalPrimaryFromResolvedCache(
-        lastSoftPackedFrameSnapshot.packedTopPlane0,
-        lastSoftPackedFrameSnapshot.packedTopPlane1,
-        lastSoftPackedFrameSnapshot.packedTopControl,
-        lastSoftPackedFrameSnapshot.packedTopLineMeta,
-        hasTopResolvedPrimaryCache ? &lastValidTopScreenResolvedPrimary : nullptr,
-        hasTopResolvedPrimaryCache ? &lastValidTopScreenResolvedPrimaryLines : nullptr);
-    const int repairedBottomTemporalPrimaryLines = repairTemporalPrimaryFromResolvedCache(
-        lastSoftPackedFrameSnapshot.packedBottomPlane0,
-        lastSoftPackedFrameSnapshot.packedBottomPlane1,
-        lastSoftPackedFrameSnapshot.packedBottomControl,
-        lastSoftPackedFrameSnapshot.packedBottomLineMeta,
-        hasBottomResolvedPrimaryCache ? &lastValidBottomScreenResolvedPrimary : nullptr,
-        hasBottomResolvedPrimaryCache ? &lastValidBottomScreenResolvedPrimaryLines : nullptr);
+    const int repairedTopTemporalPrimaryLines = renderer2dDebugControlsActive
+        ? 0
+        : repairTemporalPrimaryFromResolvedCache(
+            lastSoftPackedFrameSnapshot.packedTopPlane0,
+            lastSoftPackedFrameSnapshot.packedTopPlane1,
+            lastSoftPackedFrameSnapshot.packedTopControl,
+            lastSoftPackedFrameSnapshot.packedTopLineMeta,
+            hasTopResolvedPrimaryCache ? &lastValidTopScreenResolvedPrimary : nullptr,
+            hasTopResolvedPrimaryCache ? &lastValidTopScreenResolvedPrimaryLines : nullptr);
+    const int repairedBottomTemporalPrimaryLines = renderer2dDebugControlsActive
+        ? 0
+        : repairTemporalPrimaryFromResolvedCache(
+            lastSoftPackedFrameSnapshot.packedBottomPlane0,
+            lastSoftPackedFrameSnapshot.packedBottomPlane1,
+            lastSoftPackedFrameSnapshot.packedBottomControl,
+            lastSoftPackedFrameSnapshot.packedBottomLineMeta,
+            hasBottomResolvedPrimaryCache ? &lastValidBottomScreenResolvedPrimary : nullptr,
+            hasBottomResolvedPrimaryCache ? &lastValidBottomScreenResolvedPrimaryLines : nullptr);
 
-    updateLastValidResolvedPrimary(
-        lastSoftPackedFrameSnapshot.packedTopPlane0,
-        lastSoftPackedFrameSnapshot.packedTopPlane1,
-        lastSoftPackedFrameSnapshot.packedTopControl,
-        lastSoftPackedFrameSnapshot.packedTopLineMeta,
-        lastSoftPackedFrameSnapshot.comp4TopPlaceholder,
-        lastValidTopScreenResolvedPrimary,
-        lastValidTopScreenResolvedPrimaryLines);
-    updateLastValidResolvedPrimary(
-        lastSoftPackedFrameSnapshot.packedBottomPlane0,
-        lastSoftPackedFrameSnapshot.packedBottomPlane1,
-        lastSoftPackedFrameSnapshot.packedBottomControl,
-        lastSoftPackedFrameSnapshot.packedBottomLineMeta,
-        lastSoftPackedFrameSnapshot.comp4BottomPlaceholder,
-        lastValidBottomScreenResolvedPrimary,
-        lastValidBottomScreenResolvedPrimaryLines);
+    if (!renderer2dDebugControlsActive)
+    {
+        updateLastValidResolvedPrimary(
+            lastSoftPackedFrameSnapshot.packedTopPlane0,
+            lastSoftPackedFrameSnapshot.packedTopPlane1,
+            lastSoftPackedFrameSnapshot.packedTopControl,
+            lastSoftPackedFrameSnapshot.packedTopLineMeta,
+            lastSoftPackedFrameSnapshot.comp4TopPlaceholder,
+            lastValidTopScreenResolvedPrimary,
+            lastValidTopScreenResolvedPrimaryLines);
+        updateLastValidResolvedPrimary(
+            lastSoftPackedFrameSnapshot.packedBottomPlane0,
+            lastSoftPackedFrameSnapshot.packedBottomPlane1,
+            lastSoftPackedFrameSnapshot.packedBottomControl,
+            lastSoftPackedFrameSnapshot.packedBottomLineMeta,
+            lastSoftPackedFrameSnapshot.comp4BottomPlaceholder,
+            lastValidBottomScreenResolvedPrimary,
+            lastValidBottomScreenResolvedPrimaryLines);
+    }
 
     if (areRendererDebugBgObjLogsEnabled()
         && (carriedTopLatchedLines > 0

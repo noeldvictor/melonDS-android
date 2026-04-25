@@ -3,6 +3,7 @@
 #include <utility>
 #include <atomic>
 #include <cctype>
+#include <vector>
 #include <android/asset_manager.h>
 #include <sys/system_properties.h>
 #include <oboe/Oboe.h>
@@ -32,6 +33,10 @@
 #include "net/Net_Slirp.h"
 #include <fstream>
 
+#ifndef MELONDS_ANDROID_DEBUG_BUILD
+#define MELONDS_ANDROID_DEBUG_BUILD 0
+#endif
+
 namespace MelonDSAndroid
 {
     namespace
@@ -40,6 +45,112 @@ namespace MelonDSAndroid
         std::atomic_bool rendererDebugToolsEnabled = false;
         std::atomic_bool rendererDebugBgObjEnabled = false;
         std::atomic_uint vulkanDiagnosticFlags = 0;
+        constexpr int kRenderer2DDebugNativeMode = -1;
+        constexpr u32 kRenderer2DDebugAllFeatures =
+            Renderer2DDebugFeatureStaticBackground
+            | Renderer2DDebugFeatureAffineBackground
+            | Renderer2DDebugFeatureAffineExtendedTiledBackground
+            | Renderer2DDebugFeatureAffineExtendedBitmap256Background
+            | Renderer2DDebugFeatureAffineExtendedDirectColorBackground
+            | Renderer2DDebugFeatureLargeScreenBackground
+            | Renderer2DDebugFeature3DBackground
+            | Renderer2DDebugFeatureObjects
+            | Renderer2DDebugFeatureRegularObject
+            | Renderer2DDebugFeatureAffineObject
+            | Renderer2DDebugFeatureTiled4BppObject
+            | Renderer2DDebugFeatureTiled8BppObject
+            | Renderer2DDebugFeatureBitmapObject
+            | Renderer2DDebugFeatureBlendedObject
+            | Renderer2DDebugFeatureWindowObject
+            | Renderer2DDebugFeatureMosaicObject
+            | Renderer2DDebugFeatureObjectUpperBand
+            | Renderer2DDebugFeatureObjectMiddleBand
+            | Renderer2DDebugFeatureObjectLowerBand;
+        constexpr u32 kRenderer3DDebugAllFeatures =
+            Renderer3DDebugFeatureRendererOutput
+            | Renderer3DDebugFeatureTrianglePolygons
+            | Renderer3DDebugFeatureLinePolygons
+            | Renderer3DDebugFeatureOpaquePolygons
+            | Renderer3DDebugFeatureTranslucentPolygons
+            | Renderer3DDebugFeatureShadowMaskPolygons
+            | Renderer3DDebugFeatureShadowPolygons
+            | Renderer3DDebugFeatureTexturedPolygons
+            | Renderer3DDebugFeatureUntexturedPolygons
+            | Renderer3DDebugFeatureModulatePolygons
+            | Renderer3DDebugFeatureDecalPolygons
+            | Renderer3DDebugFeatureToonHighlightPolygons
+            | Renderer3DDebugFeatureWBufferPolygons
+            | Renderer3DDebugFeatureZBufferPolygons
+            | Renderer3DDebugFeatureDepthWritePolygons
+            | Renderer3DDebugFeatureFogWritePolygons
+            | Renderer3DDebugFeatureUpperBand
+            | Renderer3DDebugFeatureMiddleBand
+            | Renderer3DDebugFeatureLowerBand;
+        std::atomic_int renderer2dMainForcedMode = kRenderer2DDebugNativeMode;
+        std::atomic_int renderer2dSubForcedMode = kRenderer2DDebugNativeMode;
+        std::atomic_int renderer2dTopForcedCompMode = kRenderer2DDebugNativeMode;
+        std::atomic_int renderer2dBottomForcedCompMode = kRenderer2DDebugNativeMode;
+        std::atomic_uint renderer2dDisabledMainBgMask = 0;
+        std::atomic_uint renderer2dDisabledSubBgMask = 0;
+        std::atomic_uint renderer2dDisabledMainBgPriorityMask = 0;
+        std::atomic_uint renderer2dDisabledSubBgPriorityMask = 0;
+        std::atomic_uint renderer2dDisabledMainObjPriorityMask = 0;
+        std::atomic_uint renderer2dDisabledSubObjPriorityMask = 0;
+        std::atomic_uint renderer2dDisabledMainObjOrderMask = 0;
+        std::atomic_uint renderer2dDisabledSubObjOrderMask = 0;
+        std::atomic_uint renderer2dFeatureMask = kRenderer2DDebugAllFeatures;
+        std::atomic_uint renderer3dFeatureMask = kRenderer3DDebugAllFeatures;
+
+        int NormalizeRenderer2DForcedMode(int mode, bool mainEngine)
+        {
+            if (mode < 0)
+                return kRenderer2DDebugNativeMode;
+
+            const int maxMode = mainEngine ? 6 : 5;
+            return mode <= maxMode ? mode : kRenderer2DDebugNativeMode;
+        }
+
+        int NormalizeRenderer2DForcedCompMode(int compMode)
+        {
+            if (compMode < 0)
+                return kRenderer2DDebugNativeMode;
+
+            return compMode <= 7 ? compMode : kRenderer2DDebugNativeMode;
+        }
+
+        void ResetRenderer2DDebugControls()
+        {
+            renderer2dMainForcedMode.store(kRenderer2DDebugNativeMode, std::memory_order_relaxed);
+            renderer2dSubForcedMode.store(kRenderer2DDebugNativeMode, std::memory_order_relaxed);
+            renderer2dTopForcedCompMode.store(kRenderer2DDebugNativeMode, std::memory_order_relaxed);
+            renderer2dBottomForcedCompMode.store(kRenderer2DDebugNativeMode, std::memory_order_relaxed);
+            renderer2dDisabledMainBgMask.store(0, std::memory_order_relaxed);
+            renderer2dDisabledSubBgMask.store(0, std::memory_order_relaxed);
+            renderer2dDisabledMainBgPriorityMask.store(0, std::memory_order_relaxed);
+            renderer2dDisabledSubBgPriorityMask.store(0, std::memory_order_relaxed);
+            renderer2dDisabledMainObjPriorityMask.store(0, std::memory_order_relaxed);
+            renderer2dDisabledSubObjPriorityMask.store(0, std::memory_order_relaxed);
+            renderer2dDisabledMainObjOrderMask.store(0, std::memory_order_relaxed);
+            renderer2dDisabledSubObjOrderMask.store(0, std::memory_order_relaxed);
+            renderer2dFeatureMask.store(kRenderer2DDebugAllFeatures, std::memory_order_relaxed);
+        }
+
+        void ResetRenderer3DDebugControls()
+        {
+            renderer3dFeatureMask.store(kRenderer3DDebugAllFeatures, std::memory_order_relaxed);
+        }
+
+        bool RendererDebugControlsAvailable()
+        {
+            return MELONDS_ANDROID_DEBUG_BUILD != 0;
+        }
+
+        bool RendererDebugControlsEnabled()
+        {
+            return RendererDebugControlsAvailable()
+                && rendererDebugToolsEnabled.load(std::memory_order_relaxed);
+        }
+
         bool EqualsIgnoreCase(const char* lhs, const char* rhs)
         {
             if (lhs == nullptr || rhs == nullptr)
@@ -265,6 +376,8 @@ namespace MelonDSAndroid
         rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*currentConfiguration), std::memory_order_relaxed);
         rendererDebugBgObjEnabled.store(ResolveRendererDebugBgObjEnabled(*currentConfiguration), std::memory_order_relaxed);
         vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
+        ResetRenderer2DDebugControls();
+        ResetRenderer3DDebugControls();
 
         net = std::make_shared<Net>();
         net->SetDriver(std::make_unique<Net_Slirp>([](const u8* data, int len) {
@@ -277,7 +390,6 @@ namespace MelonDSAndroid
         cameraHandler = androidCameraHandler;
         eventMessenger = androidEventMessenger;
         RetroAchievements::RetroAchievementsManager::EventMessenger = androidEventMessenger;
-
         auto instanceArgs = BuildArgsFromConfiguration(*currentConfiguration, instanceId);
         if (!instanceArgs.has_value())
         {
@@ -554,6 +666,206 @@ namespace MelonDSAndroid
     {
         return rendererDebugToolsEnabled.load(std::memory_order_relaxed)
             && rendererDebugBgObjEnabled.load(std::memory_order_relaxed);
+    }
+
+    Renderer2DDebugControlState getRenderer2DDebugControls()
+    {
+        return Renderer2DDebugControlState{
+            .mainForcedMode = renderer2dMainForcedMode.load(std::memory_order_relaxed),
+            .subForcedMode = renderer2dSubForcedMode.load(std::memory_order_relaxed),
+            .topForcedCompMode = renderer2dTopForcedCompMode.load(std::memory_order_relaxed),
+            .bottomForcedCompMode = renderer2dBottomForcedCompMode.load(std::memory_order_relaxed),
+            .disabledMainBgMask = renderer2dDisabledMainBgMask.load(std::memory_order_relaxed),
+            .disabledSubBgMask = renderer2dDisabledSubBgMask.load(std::memory_order_relaxed),
+            .disabledMainBgPriorityMask = renderer2dDisabledMainBgPriorityMask.load(std::memory_order_relaxed),
+            .disabledSubBgPriorityMask = renderer2dDisabledSubBgPriorityMask.load(std::memory_order_relaxed),
+            .disabledMainObjPriorityMask = renderer2dDisabledMainObjPriorityMask.load(std::memory_order_relaxed),
+            .disabledSubObjPriorityMask = renderer2dDisabledSubObjPriorityMask.load(std::memory_order_relaxed),
+            .disabledMainObjOrderMask = renderer2dDisabledMainObjOrderMask.load(std::memory_order_relaxed),
+            .disabledSubObjOrderMask = renderer2dDisabledSubObjOrderMask.load(std::memory_order_relaxed),
+            .featureMask = renderer2dFeatureMask.load(std::memory_order_relaxed) & kRenderer2DDebugAllFeatures,
+        };
+    }
+
+    void setRenderer2DDebugControls(
+        int mainForcedMode,
+        int subForcedMode,
+        int topForcedCompMode,
+        int bottomForcedCompMode,
+        u32 disabledMainBgMask,
+        u32 disabledSubBgMask,
+        u32 disabledMainBgPriorityMask,
+        u32 disabledSubBgPriorityMask,
+        u32 disabledMainObjPriorityMask,
+        u32 disabledSubObjPriorityMask,
+        u32 disabledMainObjOrderMask,
+        u32 disabledSubObjOrderMask,
+        u32 featureMask)
+    {
+        if (!RendererDebugControlsAvailable())
+        {
+            ResetRenderer2DDebugControls();
+            return;
+        }
+
+        renderer2dMainForcedMode.store(NormalizeRenderer2DForcedMode(mainForcedMode, true), std::memory_order_relaxed);
+        renderer2dSubForcedMode.store(NormalizeRenderer2DForcedMode(subForcedMode, false), std::memory_order_relaxed);
+        renderer2dTopForcedCompMode.store(NormalizeRenderer2DForcedCompMode(topForcedCompMode), std::memory_order_relaxed);
+        renderer2dBottomForcedCompMode.store(NormalizeRenderer2DForcedCompMode(bottomForcedCompMode), std::memory_order_relaxed);
+        renderer2dDisabledMainBgMask.store(disabledMainBgMask & 0xFu, std::memory_order_relaxed);
+        renderer2dDisabledSubBgMask.store(disabledSubBgMask & 0xFu, std::memory_order_relaxed);
+        renderer2dDisabledMainBgPriorityMask.store(disabledMainBgPriorityMask & 0xFu, std::memory_order_relaxed);
+        renderer2dDisabledSubBgPriorityMask.store(disabledSubBgPriorityMask & 0xFu, std::memory_order_relaxed);
+        renderer2dDisabledMainObjPriorityMask.store(disabledMainObjPriorityMask & 0xFu, std::memory_order_relaxed);
+        renderer2dDisabledSubObjPriorityMask.store(disabledSubObjPriorityMask & 0xFu, std::memory_order_relaxed);
+        renderer2dDisabledMainObjOrderMask.store(disabledMainObjOrderMask & 0xFu, std::memory_order_relaxed);
+        renderer2dDisabledSubObjOrderMask.store(disabledSubObjOrderMask & 0xFu, std::memory_order_relaxed);
+        renderer2dFeatureMask.store(featureMask & kRenderer2DDebugAllFeatures, std::memory_order_relaxed);
+        requestVulkanPresentationResync();
+    }
+
+    Renderer3DDebugControlState getRenderer3DDebugControls()
+    {
+        return Renderer3DDebugControlState{
+            .featureMask = renderer3dFeatureMask.load(std::memory_order_relaxed) & kRenderer3DDebugAllFeatures,
+        };
+    }
+
+    void setRenderer3DDebugControls(u32 featureMask)
+    {
+        if (!RendererDebugControlsAvailable())
+        {
+            ResetRenderer3DDebugControls();
+            return;
+        }
+
+        renderer3dFeatureMask.store(featureMask & kRenderer3DDebugAllFeatures, std::memory_order_relaxed);
+        requestVulkanPresentationResync();
+    }
+
+    int getRenderer2DDebugForcedMode(u32 unit)
+    {
+        if (!RendererDebugControlsEnabled())
+            return kRenderer2DDebugNativeMode;
+
+        return unit == 0
+            ? renderer2dMainForcedMode.load(std::memory_order_relaxed)
+            : renderer2dSubForcedMode.load(std::memory_order_relaxed);
+    }
+
+    int getRenderer2DDebugForcedCompMode(bool topScreen)
+    {
+        if (!RendererDebugControlsEnabled())
+            return kRenderer2DDebugNativeMode;
+
+        return topScreen
+            ? renderer2dTopForcedCompMode.load(std::memory_order_relaxed)
+            : renderer2dBottomForcedCompMode.load(std::memory_order_relaxed);
+    }
+
+    bool isRenderer2DDebugBgLayerEnabled(u32 unit, u32 bgnum)
+    {
+        if (!RendererDebugControlsEnabled() || bgnum >= 4)
+            return true;
+
+        const u32 disabledMask = unit == 0
+            ? renderer2dDisabledMainBgMask.load(std::memory_order_relaxed)
+            : renderer2dDisabledSubBgMask.load(std::memory_order_relaxed);
+        return (disabledMask & (1u << bgnum)) == 0u;
+    }
+
+    bool isRenderer2DDebugBgPriorityEnabled(u32 unit, u32 priority)
+    {
+        if (!RendererDebugControlsEnabled() || priority >= 4)
+            return true;
+
+        const u32 disabledMask = unit == 0
+            ? renderer2dDisabledMainBgPriorityMask.load(std::memory_order_relaxed)
+            : renderer2dDisabledSubBgPriorityMask.load(std::memory_order_relaxed);
+        return (disabledMask & (1u << priority)) == 0u;
+    }
+
+    bool isRenderer2DDebugBackgroundKindEnabled(u32 featureFlag)
+    {
+        if (!RendererDebugControlsEnabled())
+            return true;
+
+        return (renderer2dFeatureMask.load(std::memory_order_relaxed) & featureFlag) != 0u;
+    }
+
+    bool areRenderer2DDebugObjectsEnabled(u32 unit)
+    {
+        (void)unit;
+        if (!RendererDebugControlsEnabled())
+            return true;
+
+        return (renderer2dFeatureMask.load(std::memory_order_relaxed) & Renderer2DDebugFeatureObjects) != 0u;
+    }
+
+    bool isRenderer2DDebugObjectPriorityEnabled(u32 unit, u32 priority)
+    {
+        if (!RendererDebugControlsEnabled() || priority >= 4)
+            return true;
+
+        const u32 disabledMask = unit == 0
+            ? renderer2dDisabledMainObjPriorityMask.load(std::memory_order_relaxed)
+            : renderer2dDisabledSubObjPriorityMask.load(std::memory_order_relaxed);
+        return (disabledMask & (1u << priority)) == 0u;
+    }
+
+    bool isRenderer2DDebugObjectOrderEnabled(u32 unit, u32 orderBucket)
+    {
+        if (!RendererDebugControlsEnabled() || orderBucket >= 4)
+            return true;
+
+        const u32 disabledMask = unit == 0
+            ? renderer2dDisabledMainObjOrderMask.load(std::memory_order_relaxed)
+            : renderer2dDisabledSubObjOrderMask.load(std::memory_order_relaxed);
+        return (disabledMask & (1u << orderBucket)) == 0u;
+    }
+
+    bool isRenderer2DDebugObjectFeatureEnabled(u32 featureFlag)
+    {
+        if (!RendererDebugControlsEnabled())
+            return true;
+
+        return (renderer2dFeatureMask.load(std::memory_order_relaxed) & featureFlag) != 0u;
+    }
+
+    bool areRenderer2DDebugControlsActive()
+    {
+        if (!RendererDebugControlsEnabled())
+            return false;
+
+        return renderer2dMainForcedMode.load(std::memory_order_relaxed) != kRenderer2DDebugNativeMode
+            || renderer2dSubForcedMode.load(std::memory_order_relaxed) != kRenderer2DDebugNativeMode
+            || renderer2dTopForcedCompMode.load(std::memory_order_relaxed) != kRenderer2DDebugNativeMode
+            || renderer2dBottomForcedCompMode.load(std::memory_order_relaxed) != kRenderer2DDebugNativeMode
+            || renderer2dDisabledMainBgMask.load(std::memory_order_relaxed) != 0u
+            || renderer2dDisabledSubBgMask.load(std::memory_order_relaxed) != 0u
+            || renderer2dDisabledMainBgPriorityMask.load(std::memory_order_relaxed) != 0u
+            || renderer2dDisabledSubBgPriorityMask.load(std::memory_order_relaxed) != 0u
+            || renderer2dDisabledMainObjPriorityMask.load(std::memory_order_relaxed) != 0u
+            || renderer2dDisabledSubObjPriorityMask.load(std::memory_order_relaxed) != 0u
+            || renderer2dDisabledMainObjOrderMask.load(std::memory_order_relaxed) != 0u
+            || renderer2dDisabledSubObjOrderMask.load(std::memory_order_relaxed) != 0u
+            || (renderer2dFeatureMask.load(std::memory_order_relaxed) & kRenderer2DDebugAllFeatures) != kRenderer2DDebugAllFeatures;
+    }
+
+    bool isRenderer3DDebugFeatureEnabled(u32 featureFlag)
+    {
+        if (!RendererDebugControlsEnabled())
+            return true;
+
+        return (renderer3dFeatureMask.load(std::memory_order_relaxed) & featureFlag) != 0u;
+    }
+
+    bool areRenderer3DDebugControlsActive()
+    {
+        if (!RendererDebugControlsEnabled())
+            return false;
+
+        return (renderer3dFeatureMask.load(std::memory_order_relaxed) & kRenderer3DDebugAllFeatures) != kRenderer3DDebugAllFeatures;
     }
 
     u32 getVulkanDiagnosticFlags()

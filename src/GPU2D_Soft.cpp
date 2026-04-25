@@ -26,6 +26,14 @@ namespace MelonDSAndroid
 {
 bool areRendererDebugToolsEnabled();
 bool areRendererDebugBgObjLogsEnabled();
+int getRenderer2DDebugForcedMode(melonDS::u32 unit);
+bool isRenderer2DDebugBgLayerEnabled(melonDS::u32 unit, melonDS::u32 bgnum);
+bool isRenderer2DDebugBgPriorityEnabled(melonDS::u32 unit, melonDS::u32 priority);
+bool isRenderer2DDebugBackgroundKindEnabled(melonDS::u32 featureFlag);
+bool areRenderer2DDebugObjectsEnabled(melonDS::u32 unit);
+bool isRenderer2DDebugObjectPriorityEnabled(melonDS::u32 unit, melonDS::u32 priority);
+bool isRenderer2DDebugObjectOrderEnabled(melonDS::u32 unit, melonDS::u32 orderBucket);
+bool isRenderer2DDebugObjectFeatureEnabled(melonDS::u32 featureFlag);
 }
 
 namespace
@@ -61,6 +69,144 @@ namespace melonDS
 {
 namespace GPU2D
 {
+namespace
+{
+constexpr u32 kRenderer2DDebugFeatureStaticBackground = 1u << 0u;
+constexpr u32 kRenderer2DDebugFeatureAffineBackground = 1u << 1u;
+constexpr u32 kRenderer2DDebugFeatureAffineExtendedTiledBackground = 1u << 2u;
+constexpr u32 kRenderer2DDebugFeatureAffineExtendedBitmap256Background = 1u << 3u;
+constexpr u32 kRenderer2DDebugFeatureAffineExtendedDirectColorBackground = 1u << 4u;
+constexpr u32 kRenderer2DDebugFeatureLargeScreenBackground = 1u << 5u;
+constexpr u32 kRenderer2DDebugFeature3DBackground = 1u << 6u;
+constexpr u32 kRenderer2DDebugFeatureRegularObject = 1u << 8u;
+constexpr u32 kRenderer2DDebugFeatureAffineObject = 1u << 9u;
+constexpr u32 kRenderer2DDebugFeatureTiled4BppObject = 1u << 10u;
+constexpr u32 kRenderer2DDebugFeatureTiled8BppObject = 1u << 11u;
+constexpr u32 kRenderer2DDebugFeatureBitmapObject = 1u << 12u;
+constexpr u32 kRenderer2DDebugFeatureBlendedObject = 1u << 13u;
+constexpr u32 kRenderer2DDebugFeatureWindowObject = 1u << 14u;
+constexpr u32 kRenderer2DDebugFeatureMosaicObject = 1u << 15u;
+constexpr u32 kRenderer2DDebugFeatureObjectUpperBand = 1u << 16u;
+constexpr u32 kRenderer2DDebugFeatureObjectMiddleBand = 1u << 17u;
+constexpr u32 kRenderer2DDebugFeatureObjectLowerBand = 1u << 18u;
+
+bool Renderer2DDebugShouldDrawLayer(u32 unit, u32 bgnum)
+{
+    return MelonDSAndroid::isRenderer2DDebugBgLayerEnabled(unit, bgnum);
+}
+
+bool Renderer2DDebugShouldDrawFeature(u32 featureFlag)
+{
+    return MelonDSAndroid::isRenderer2DDebugBackgroundKindEnabled(featureFlag);
+}
+
+bool Renderer2DDebugShouldDrawTextBg(u32 unit, u32 bgnum, u16 bgcnt)
+{
+    return Renderer2DDebugShouldDrawLayer(unit, bgnum)
+        && MelonDSAndroid::isRenderer2DDebugBgPriorityEnabled(unit, bgcnt & 0x3u)
+        && Renderer2DDebugShouldDrawFeature(kRenderer2DDebugFeatureStaticBackground);
+}
+
+bool Renderer2DDebugShouldDrawAffineBg(u32 unit, u32 bgnum, u16 bgcnt)
+{
+    return Renderer2DDebugShouldDrawLayer(unit, bgnum)
+        && MelonDSAndroid::isRenderer2DDebugBgPriorityEnabled(unit, bgcnt & 0x3u)
+        && Renderer2DDebugShouldDrawFeature(kRenderer2DDebugFeatureAffineBackground);
+}
+
+bool Renderer2DDebugShouldDrawExtendedBg(u32 unit, u32 bgnum, u16 bgcnt)
+{
+    if (!Renderer2DDebugShouldDrawLayer(unit, bgnum))
+        return false;
+    if (!MelonDSAndroid::isRenderer2DDebugBgPriorityEnabled(unit, bgcnt & 0x3u))
+        return false;
+
+    if ((bgcnt & 0x0080u) == 0u)
+        return Renderer2DDebugShouldDrawFeature(kRenderer2DDebugFeatureAffineExtendedTiledBackground);
+
+    if ((bgcnt & 0x0004u) != 0u)
+        return Renderer2DDebugShouldDrawFeature(kRenderer2DDebugFeatureAffineExtendedDirectColorBackground);
+
+    return Renderer2DDebugShouldDrawFeature(kRenderer2DDebugFeatureAffineExtendedBitmap256Background);
+}
+
+bool Renderer2DDebugShouldDrawLargeBg(u32 unit, u16 bgcnt)
+{
+    return Renderer2DDebugShouldDrawLayer(unit, 2)
+        && MelonDSAndroid::isRenderer2DDebugBgPriorityEnabled(unit, bgcnt & 0x3u)
+        && Renderer2DDebugShouldDrawFeature(kRenderer2DDebugFeatureLargeScreenBackground);
+}
+
+bool Renderer2DDebugShouldDraw3DBg(u32 unit, u16 bgcnt)
+{
+    return Renderer2DDebugShouldDrawLayer(unit, 0)
+        && MelonDSAndroid::isRenderer2DDebugBgPriorityEnabled(unit, bgcnt & 0x3u)
+        && Renderer2DDebugShouldDrawFeature(kRenderer2DDebugFeature3DBackground);
+}
+
+bool Renderer2DDebugShouldInterleaveObjects(u32 unit, u32 priority)
+{
+    return MelonDSAndroid::areRenderer2DDebugObjectsEnabled(unit)
+        && MelonDSAndroid::isRenderer2DDebugObjectPriorityEnabled(unit, priority);
+}
+
+bool Renderer2DDebugShouldDrawObjectLine(u32 line)
+{
+    if (line < 64u)
+        return MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureObjectUpperBand);
+    if (line < 128u)
+        return MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureObjectMiddleBand);
+    return MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureObjectLowerBand);
+}
+
+bool Renderer2DDebugShouldDrawObject(u32 unit, u32 sprnum, const u16* attrib)
+{
+    if (!MelonDSAndroid::areRenderer2DDebugObjectsEnabled(unit))
+        return false;
+
+    if (!MelonDSAndroid::isRenderer2DDebugObjectOrderEnabled(unit, sprnum / 32u))
+        return false;
+
+    const u32 priority = (attrib[2] >> 10u) & 0x3u;
+    if (!MelonDSAndroid::isRenderer2DDebugObjectPriorityEnabled(unit, priority))
+        return false;
+
+    const u32 objectMode = (attrib[0] >> 10u) & 0x3u;
+    if (objectMode == 2u)
+        return MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureWindowObject);
+
+    if ((attrib[0] & 0x0100u) != 0u)
+    {
+        if (!MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureAffineObject))
+            return false;
+    }
+    else if (!MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureRegularObject))
+    {
+        return false;
+    }
+
+    if ((attrib[0] & 0x1000u) != 0u
+        && !MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureMosaicObject))
+    {
+        return false;
+    }
+
+    if (objectMode == 1u
+        && !MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureBlendedObject))
+    {
+        return false;
+    }
+
+    if (objectMode == 3u)
+        return MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(kRenderer2DDebugFeatureBitmapObject);
+
+    const u32 tiledFeature = (attrib[0] & 0x2000u) != 0u
+        ? kRenderer2DDebugFeatureTiled8BppObject
+        : kRenderer2DDebugFeatureTiled4BppObject;
+    return MelonDSAndroid::isRenderer2DDebugObjectFeatureEnabled(tiledFeature);
+}
+}
+
 SoftRenderer::SoftRenderer(melonDS::GPU& gpu)
     : Renderer2D(), GPU(gpu)
 {
@@ -777,6 +923,8 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
 #define DoDrawBG(type, line, num) \
     do \
     { \
+        if (!Renderer2DDebugShouldDraw##type##Bg(CurUnit->Num, num, bgCnt[num])) \
+            break; \
         if ((bgCnt[num] & 0x0040) && (CurUnit->BGMosaicSize[0] > 0)) \
         { \
             if (GPU.GPU3D.IsRendererAccelerated()) DrawBG_##type<true, DrawPixel_Accel>(line, num); \
@@ -792,6 +940,8 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
 #define DoDrawBG_Large(line) \
     do \
     { \
+        if (!Renderer2DDebugShouldDrawLargeBg(CurUnit->Num, bgCnt[2])) \
+            break; \
         if ((bgCnt[2] & 0x0040) && (CurUnit->BGMosaicSize[0] > 0)) \
         { \
             if (GPU.GPU3D.IsRendererAccelerated()) DrawBG_Large<true, DrawPixel_Accel>(line); \
@@ -805,7 +955,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
     } while (false)
 
 #define DoInterleaveSprites(prio) \
-    if (GPU.GPU3D.IsRendererAccelerated()) InterleaveSprites<DrawPixel_Accel>(prio); else InterleaveSprites<DrawPixel_Normal>(prio);
+    if (Renderer2DDebugShouldInterleaveObjects(CurUnit->Num, ((prio) >> 16) & 0x3u)) { if (GPU.GPU3D.IsRendererAccelerated()) InterleaveSprites<DrawPixel_Accel>(prio); else InterleaveSprites<DrawPixel_Normal>(prio); }
 
 template<u32 bgmode>
 void SoftRenderer::DrawScanlineBGMode(u32 line)
@@ -850,9 +1000,14 @@ void SoftRenderer::DrawScanlineBGMode(u32 line)
             if (dispCnt & 0x0100)
             {
                 if (!CurUnit->Num && (dispCnt & 0x8))
-                    DrawBG_3D();
+                {
+                    if (Renderer2DDebugShouldDraw3DBg(CurUnit->Num, bgCnt[0]))
+                        DrawBG_3D();
+                }
                 else
+                {
                     DoDrawBG(Text, line, 0);
+                }
             }
         }
         if ((dispCnt & 0x1000) && NumSprites[CurUnit->Num])
@@ -881,7 +1036,10 @@ void SoftRenderer::DrawScanlineBGMode6(u32 line)
             if (dispCnt & 0x0100)
             {
                 if ((!CurUnit->Num) && (dispCnt & 0x8))
-                    DrawBG_3D();
+                {
+                    if (Renderer2DDebugShouldDraw3DBg(CurUnit->Num, bgCnt[0]))
+                        DrawBG_3D();
+                }
             }
         }
         if ((dispCnt & 0x1000) && NumSprites[CurUnit->Num])
@@ -911,9 +1069,14 @@ void SoftRenderer::DrawScanlineBGMode7(u32 line)
             if (dispCnt & 0x0100)
             {
                 if (!CurUnit->Num && (dispCnt & 0x8))
-                    DrawBG_3D();
+                {
+                    if (Renderer2DDebugShouldDraw3DBg(CurUnit->Num, bgCnt[0]))
+                        DrawBG_3D();
+                }
                 else
+                {
                     DoDrawBG(Text, line, 0);
+                }
             }
         }
         if ((dispCnt & 0x1000) && NumSprites[CurUnit->Num])
@@ -978,7 +1141,12 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
     ApplySpriteMosaicX();
     CurBGXMosaicTable = MosaicTable[CurUnit->BGMosaicSize[0]].data();
 
-    switch (CurUnit->DispCnt & 0x7)
+    u32 bgMode = CurUnit->DispCnt & 0x7;
+    const int forcedBgMode = MelonDSAndroid::getRenderer2DDebugForcedMode(CurUnit->Num);
+    if (forcedBgMode >= 0 && forcedBgMode <= 6)
+        bgMode = static_cast<u32>(forcedBgMode);
+
+    switch (bgMode)
     {
     case 0: DrawScanlineBGMode<0>(line); break;
     case 1: DrawScanlineBGMode<1>(line); break;
@@ -1194,6 +1362,9 @@ void SoftRenderer::DrawPixel_Accel(u32* dst, u16 color, u32 flag)
 
 void SoftRenderer::DrawBG_3D()
 {
+    if (!Renderer2DDebugShouldDraw3DBg(CurUnit->Num, CurUnit->BGCnt[0]))
+        return;
+
     int i = 0;
 
     if (GPU.GPU3D.IsRendererAccelerated())
@@ -1926,6 +2097,8 @@ void SoftRenderer::DrawSprites(u32 line, Unit* unit)
     NumSprites[CurUnit->Num] = 0;
     memset(OBJLine[CurUnit->Num], 0, 256*4);
     memset(OBJWindow[CurUnit->Num], 0, 256);
+    if (!MelonDSAndroid::areRenderer2DDebugObjectsEnabled(CurUnit->Num)) return;
+    if (!Renderer2DDebugShouldDrawObjectLine(line)) return;
     if (!(CurUnit->DispCnt & 0x1000)) return;
 
     u16* oam = (u16*)&GPU.OAM[CurUnit->Num ? 0x400 : 0];
@@ -1947,11 +2120,16 @@ void SoftRenderer::DrawSprites(u32 line, Unit* unit)
 
     for (int bgnum = 0x0C00; bgnum >= 0x0000; bgnum -= 0x0400)
     {
+        if (!MelonDSAndroid::isRenderer2DDebugObjectPriorityEnabled(CurUnit->Num, static_cast<u32>(bgnum) >> 10u))
+            continue;
+
         for (int sprnum = 127; sprnum >= 0; sprnum--)
         {
             u16* attrib = &oam[sprnum*4];
 
             if ((attrib[2] & 0x0C00) != bgnum)
+                continue;
+            if (!Renderer2DDebugShouldDrawObject(CurUnit->Num, static_cast<u32>(sprnum), attrib))
                 continue;
 
             bool iswin = (((attrib[0] >> 10) & 0x3) == 2);

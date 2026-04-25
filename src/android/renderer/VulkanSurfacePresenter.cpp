@@ -15,7 +15,7 @@
 namespace MelonDSAndroid
 {
 bool isFastForwardActive();
-bool areRendererDebugToolsEnabled();
+bool areRendererDebugBgObjLogsEnabled();
 
 namespace
 {
@@ -26,13 +26,11 @@ constexpr u32 kDrawModeBackground = 0u;
 constexpr u32 kDrawModeCompositeFrame = 1u;
 constexpr u32 kDrawModeTopScreen = 2u;
 constexpr u32 kDrawModeBottomScreen = 3u;
-constexpr std::array<VkFormat, 9> kPreferredSurfaceFormats = {
+constexpr std::array<VkFormat, 7> kPreferredSurfaceFormats = {
     VK_FORMAT_R8G8B8A8_UNORM,
     VK_FORMAT_B8G8R8A8_UNORM,
     VK_FORMAT_R8G8B8A8_SRGB,
     VK_FORMAT_B8G8R8A8_SRGB,
-    VK_FORMAT_A8B8G8R8_UNORM_PACK32,
-    VK_FORMAT_A8B8G8R8_SRGB_PACK32,
     VK_FORMAT_R5G6B5_UNORM_PACK16,
     VK_FORMAT_A1R5G5B5_UNORM_PACK16,
     VK_FORMAT_R5G5B5A1_UNORM_PACK16,
@@ -81,8 +79,6 @@ bool isPreferredAndroidSurfaceFormat(VkFormat format)
         case VK_FORMAT_B8G8R8A8_UNORM:
         case VK_FORMAT_R8G8B8A8_SRGB:
         case VK_FORMAT_B8G8R8A8_SRGB:
-        case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
-        case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
         case VK_FORMAT_R5G6B5_UNORM_PACK16:
         case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
         case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
@@ -90,6 +86,15 @@ bool isPreferredAndroidSurfaceFormat(VkFormat format)
         default:
             return false;
     }
+}
+
+bool isProblematicAndroidSurfaceFormat(VkFormat format)
+{
+    // Some Android gralloc stacks, including Adreno 650-class devices, report
+    // A8B8G8R8 formats but fail allocation later with "No map for format 0x38".
+    // Prefer the widely supported RGBA/BGRA/565 paths for presentation surfaces.
+    return format == VK_FORMAT_A8B8G8R8_UNORM_PACK32
+        || format == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
 }
 
 VkSurfaceFormatKHR chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats)
@@ -180,19 +185,28 @@ std::vector<VkSurfaceFormatKHR> rankSurfaceFormats(const std::vector<VkSurfaceFo
         return ranked;
     }
 
+    std::vector<VkSurfaceFormatKHR> supportedFormats;
+    supportedFormats.reserve(formats.size());
+    for (const VkSurfaceFormatKHR& format : formats)
+    {
+        if (!isProblematicAndroidSurfaceFormat(format.format))
+            supportedFormats.push_back(format);
+    }
+    const std::vector<VkSurfaceFormatKHR>& candidateFormats = supportedFormats.empty() ? formats : supportedFormats;
+
     std::vector<VkSurfaceFormatKHR> ranked;
-    ranked.reserve(formats.size());
-    std::vector<bool> consumed(formats.size(), false);
+    ranked.reserve(candidateFormats.size());
+    std::vector<bool> consumed(candidateFormats.size(), false);
 
     auto consumeMatching = [&](auto&& predicate) {
-        for (size_t i = 0; i < formats.size(); i++)
+        for (size_t i = 0; i < candidateFormats.size(); i++)
         {
             if (consumed[i])
                 continue;
 
-            if (predicate(formats[i]))
+            if (predicate(candidateFormats[i]))
             {
-                ranked.push_back(formats[i]);
+                ranked.push_back(candidateFormats[i]);
                 consumed[i] = true;
             }
         }
@@ -211,12 +225,6 @@ std::vector<VkSurfaceFormatKHR> rankSurfaceFormats(const std::vector<VkSurfaceFo
         return format.format == VK_FORMAT_B8G8R8A8_SRGB && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     });
     consumeMatching([](const VkSurfaceFormatKHR& format) {
-        return format.format == VK_FORMAT_A8B8G8R8_UNORM_PACK32 && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    });
-    consumeMatching([](const VkSurfaceFormatKHR& format) {
-        return format.format == VK_FORMAT_A8B8G8R8_SRGB_PACK32 && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    });
-    consumeMatching([](const VkSurfaceFormatKHR& format) {
         return format.format == VK_FORMAT_R5G6B5_UNORM_PACK16 && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     });
     consumeMatching([](const VkSurfaceFormatKHR& format) {
@@ -224,8 +232,8 @@ std::vector<VkSurfaceFormatKHR> rankSurfaceFormats(const std::vector<VkSurfaceFo
     });
     consumeMatching([](const VkSurfaceFormatKHR&) { return true; });
 
-    if (ranked.empty() && !formats.empty())
-        ranked.push_back(formats.front());
+    if (ranked.empty() && !candidateFormats.empty())
+        ranked.push_back(candidateFormats.front());
 
     return ranked;
 }
@@ -1330,7 +1338,7 @@ bool VulkanSurfacePresenter::ensureSwapchain(SurfaceState& surfaceState)
         || surfaceState.cachedPresentMode != presentMode
         || surfaceState.extent.width != extent.width
         || surfaceState.extent.height != extent.height;
-    if (swapchainSelectionChanged)
+    if (swapchainSelectionChanged && MelonDSAndroid::areRendererDebugBgObjLogsEnabled())
     {
         melonDS::Platform::Log(
             melonDS::Platform::LogLevel::Info,
@@ -1661,7 +1669,7 @@ void VulkanSurfacePresenter::consumeSurfaceGpuTiming(SurfaceState& surfaceState)
 
 void VulkanSurfacePresenter::logPerformanceIfNeeded()
 {
-    if (!areRendererDebugToolsEnabled())
+    if (!areRendererDebugBgObjLogsEnabled())
         return;
 
     if (!frameWallCpuWindow.Ready())
@@ -2351,7 +2359,7 @@ bool VulkanSurfacePresenter::updateVertexBuffer(
     if (!vertices.empty())
         std::memcpy(surfaceState.mappedVertexMemory, vertices.data(), vertices.size() * sizeof(SurfaceVertex));
 
-    if (MelonDSAndroid::areRendererDebugToolsEnabled())
+    if (MelonDSAndroid::areRendererDebugBgObjLogsEnabled())
     {
         const auto logDrawVertices = [&](const DrawCall& drawCall) {
             if (drawCall.vertexCount < 6 || drawCall.firstVertex + 5 >= vertices.size())
@@ -2585,7 +2593,7 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
         pushConstants.previousTopSourceValid = inputs.previousTopSourceValid ? 1u : 0u;
         pushConstants.previousBottomSourceValid = inputs.previousBottomSourceValid ? 1u : 0u;
         pushConstants.captureSourceValid = inputs.capture3dSourceValid ? 1u : 0u;
-        if (MelonDSAndroid::areRendererDebugToolsEnabled())
+        if (MelonDSAndroid::areRendererDebugBgObjLogsEnabled())
         {
             melonDS::Platform::Log(
                 melonDS::Platform::LogLevel::Info,
