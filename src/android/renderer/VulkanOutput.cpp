@@ -854,10 +854,6 @@ bool VulkanOutput::createFrameResource(Frame* frame, u32 width, u32 height)
     resource->renderer3dSnapshotMemory = VK_NULL_HANDLE;
     resource->snapshotWidth = 0;
     resource->snapshotHeight = 0;
-    resource->previousRendererSourceImage = VK_NULL_HANDLE;
-    resource->previousRendererSourceImageView = VK_NULL_HANDLE;
-    resource->previousSourceFrame = nullptr;
-    resource->previousSourcePending = false;
     resource->previousTopRendererSourceImage = VK_NULL_HANDLE;
     resource->previousTopRendererSourceImageView = VK_NULL_HANDLE;
     resource->previousTopSourceFrame = nullptr;
@@ -879,7 +875,6 @@ bool VulkanOutput::createFrameResource(Frame* frame, u32 width, u32 height)
     resource->descriptorSetReady = false;
     resource->timestampPending = false;
     resource->cachedRendererImageView = VK_NULL_HANDLE;
-    resource->cachedPreviousRendererImageView = VK_NULL_HANDLE;
     resource->cachedPreviousTopRendererImageView = VK_NULL_HANDLE;
     resource->cachedPreviousBottomRendererImageView = VK_NULL_HANDLE;
     resource->preparedCapture3dSource.fill(0);
@@ -1369,11 +1364,6 @@ bool VulkanOutput::prepareFrameForPresentation(
         currentSourceHeight = renderer3D.GetColorTargetHeight();
     }
 
-    resource.previousRendererSourceImage = currentSourceImage;
-    resource.previousRendererSourceImageView = currentSourceImageView;
-    resource.previousRendererSourceValid = false;
-    resource.previousSourceFrame = nullptr;
-    resource.previousSourcePending = false;
     resource.previousTopRendererSourceImage = currentSourceImage;
     resource.previousTopRendererSourceImageView = currentSourceImageView;
     resource.previousTopRendererSourceValid = false;
@@ -1424,31 +1414,6 @@ bool VulkanOutput::prepareFrameForPresentation(
     latchPreviousLcdSource(lastBottomRendererSourceFrame, false);
 
     const bool live3dOwnerIsTop = resource.screenSwap;
-    Frame* previousSameLcd3dSourceFrame = live3dOwnerIsTop
-        ? lastBottomRendererSourceFrame
-        : lastTopRendererSourceFrame;
-    if (previousSameLcd3dSourceFrame != nullptr && previousSameLcd3dSourceFrame != frame)
-    {
-        const auto previousIt = resources.find(previousSameLcd3dSourceFrame);
-        if (previousIt != resources.end())
-        {
-            const FrameResource& previousResource = previousIt->second;
-            const bool previousSnapshotCompatible = previousResource.hasRenderer3dSnapshot
-                && previousResource.renderer3dSnapshot != VK_NULL_HANDLE
-                && previousResource.renderer3dSnapshotView != VK_NULL_HANDLE
-                && previousResource.snapshotWidth == currentSourceWidth
-                && previousResource.snapshotHeight == currentSourceHeight;
-            if (previousSnapshotCompatible)
-            {
-                resource.previousRendererSourceImage = previousResource.renderer3dSnapshot;
-                resource.previousRendererSourceImageView = previousResource.renderer3dSnapshotView;
-                resource.previousRendererSourceValid = true;
-                resource.previousSourceFrame = previousSameLcd3dSourceFrame;
-                resource.previousSourcePending = true;
-            }
-        }
-    }
-
     if (resource.hasRenderer3dSnapshot
         && resource.renderer3dSnapshot != VK_NULL_HANDLE
         && resource.renderer3dSnapshotView != VK_NULL_HANDLE)
@@ -1828,8 +1793,6 @@ bool VulkanOutput::captureRenderer3dSnapshot(Frame* frame, const melonDS::Vulkan
     resource.snapshotFromInitializedTarget = true;
     resource.snapshotFromGraphicsBackend =
         renderer3D.GetActiveBackendMode() == melonDS::VulkanRenderer3D::BackendMode::GraphicsHardware;
-    resource.previousSourceFrame = nullptr;
-    resource.previousSourcePending = false;
     resource.previousTopSourceFrame = nullptr;
     resource.previousTopSourcePending = false;
     resource.previousBottomSourceFrame = nullptr;
@@ -1897,13 +1860,6 @@ bool VulkanOutput::buildCompositionInputs(
         outInputs.rendererWidth = renderer3D.GetColorTargetWidth();
         outInputs.rendererHeight = renderer3D.GetColorTargetHeight();
     }
-    outInputs.previousSourceValid = resource.previousRendererSourceValid;
-    outInputs.previousSourceImage = outInputs.previousSourceValid && resource.previousRendererSourceImage != VK_NULL_HANDLE
-        ? resource.previousRendererSourceImage
-        : outInputs.sourceImage;
-    outInputs.previousSourceImageView = outInputs.previousSourceValid && resource.previousRendererSourceImageView != VK_NULL_HANDLE
-        ? resource.previousRendererSourceImageView
-        : outInputs.sourceImageView;
     outInputs.previousTopSourceValid = resource.previousTopRendererSourceValid;
     outInputs.previousTopSourceImage = outInputs.previousTopSourceValid && resource.previousTopRendererSourceImage != VK_NULL_HANDLE
         ? resource.previousTopRendererSourceImage
@@ -1932,8 +1888,6 @@ bool VulkanOutput::buildCompositionInputs(
     outInputs.validationMode = validationMode;
     return outInputs.sourceImage != VK_NULL_HANDLE
         && outInputs.sourceImageView != VK_NULL_HANDLE
-        && outInputs.previousSourceImage != VK_NULL_HANDLE
-        && outInputs.previousSourceImageView != VK_NULL_HANDLE
         && outInputs.previousTopSourceImage != VK_NULL_HANDLE
         && outInputs.previousTopSourceImageView != VK_NULL_HANDLE
         && outInputs.previousBottomSourceImage != VK_NULL_HANDLE
@@ -2395,7 +2349,6 @@ bool VulkanOutput::dispatchCompositor(
 
     if (!resource.descriptorSetReady
         || resource.cachedRendererImageView != inputs.sourceImageView
-        || resource.cachedPreviousRendererImageView != inputs.previousSourceImageView
         || resource.cachedPreviousTopRendererImageView != inputs.previousTopSourceImageView
         || resource.cachedPreviousBottomRendererImageView != inputs.previousBottomSourceImageView)
     {
@@ -2411,7 +2364,6 @@ bool VulkanOutput::dispatchCompositor(
         vkUpdateDescriptorSets(device, static_cast<u32>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
         resource.descriptorSetReady = true;
         resource.cachedRendererImageView = inputs.sourceImageView;
-        resource.cachedPreviousRendererImageView = inputs.previousSourceImageView;
         resource.cachedPreviousTopRendererImageView = inputs.previousTopSourceImageView;
         resource.cachedPreviousBottomRendererImageView = inputs.previousBottomSourceImageView;
     }
@@ -2488,7 +2440,6 @@ bool VulkanOutput::dispatchCompositor(
         return false;
 
     resource.hasContent = true;
-    resource.previousSourcePending = false;
     resource.previousTopSourcePending = false;
     resource.previousBottomSourcePending = false;
     return true;
@@ -2849,8 +2800,6 @@ bool VulkanOutput::isFrameReferencedAsPendingPreviousSource(const Frame* frame) 
         if (resourceFrame == frame)
             continue;
 
-        if (resource.previousSourcePending && resource.previousSourceFrame == frame)
-            return true;
         if (resource.previousTopSourcePending && resource.previousTopSourceFrame == frame)
             return true;
         if (resource.previousBottomSourcePending && resource.previousBottomSourceFrame == frame)

@@ -129,7 +129,6 @@ private:
         VkImageLayout sampledImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkSampler sampledSampler = VK_NULL_HANDLE;
         VkImageView rendererImageView = VK_NULL_HANDLE;
-        VkImageView previousRendererImageView = VK_NULL_HANDLE;
         VkImageView previousTopRendererImageView = VK_NULL_HANDLE;
         VkImageView previousBottomRendererImageView = VK_NULL_HANDLE;
         VkBuffer topPackedBuffer = VK_NULL_HANDLE;

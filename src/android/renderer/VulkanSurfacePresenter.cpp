@@ -758,10 +758,9 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         && !inputs.validationMode
         && !hasDualScreenSurface
         && hasRequiredDirectHandles
-        // The direct presenter path samples live/capture/previous 3D inside the
-        // fragment shader. For frames that depend on DS-sized capture or temporal
-        // previous-source recovery, keep using the offscreen compositor so packed
-        // ownership and exact-frame 3D stay aligned on both screens.
+        // The direct presenter path is kept for GL-style current-only frames.
+        // Frames that need capture or physical-LCD previous source recovery use
+        // the offscreen compositor so exact-frame 3D stays aligned on both screens.
         && !inputs.capture3dSourceValid
         && !inputs.previousTopSourceValid
         && !inputs.previousBottomSourceValid;
@@ -2011,7 +2010,6 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         || screenCache.sampledImageLayout != screenImageInfo.imageLayout
         || screenCache.sampledSampler != screenImageInfo.sampler
         || screenCache.rendererImageView != inputs.sourceImageView
-        || screenCache.previousRendererImageView != inputs.previousSourceImageView
         || screenCache.previousTopRendererImageView != inputs.previousTopSourceImageView
         || screenCache.previousBottomRendererImageView != inputs.previousBottomSourceImageView
         || screenCache.topPackedBuffer != inputs.topPackedBuffer
@@ -2079,7 +2077,6 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         screenCache.sampledImageLayout = screenImageInfo.imageLayout;
         screenCache.sampledSampler = screenImageInfo.sampler;
         screenCache.rendererImageView = inputs.sourceImageView;
-        screenCache.previousRendererImageView = inputs.previousSourceImageView;
         screenCache.previousTopRendererImageView = inputs.previousTopSourceImageView;
         screenCache.previousBottomRendererImageView = inputs.previousBottomSourceImageView;
         screenCache.topPackedBuffer = inputs.topPackedBuffer;
@@ -2095,7 +2092,6 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
             || backgroundCache.sampledImageLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
             || backgroundCache.sampledSampler != linearSampler
             || backgroundCache.rendererImageView != inputs.sourceImageView
-            || backgroundCache.previousRendererImageView != inputs.previousSourceImageView
             || backgroundCache.previousTopRendererImageView != inputs.previousTopSourceImageView
             || backgroundCache.previousBottomRendererImageView != inputs.previousBottomSourceImageView
             || backgroundCache.topPackedBuffer != inputs.topPackedBuffer
@@ -2173,7 +2169,6 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
         backgroundCache.sampledImageLayout = backgroundImageInfo.imageLayout;
         backgroundCache.sampledSampler = backgroundImageInfo.sampler;
         backgroundCache.rendererImageView = inputs.sourceImageView;
-        backgroundCache.previousRendererImageView = inputs.previousSourceImageView;
         backgroundCache.previousTopRendererImageView = inputs.previousTopSourceImageView;
         backgroundCache.previousBottomRendererImageView = inputs.previousBottomSourceImageView;
         backgroundCache.topPackedBuffer = inputs.topPackedBuffer;

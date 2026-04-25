@@ -221,7 +221,6 @@ Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale) 
     bool regularCaptureUses3d = (masterBrightness & kMetaFlagRegularCaptureUses3d) != 0u; \
     bool vramCaptureUses3d = (masterBrightness & kMetaFlagVramCaptureUses3d) != 0u; \
     bool forceLive3dCompMode7 = (masterBrightness & kMetaFlagForceLive3dCompMode7) != 0u; \
-    bool frameLineUsesCapture3d = regularCaptureUses3d || vramCaptureUses3d; \
     bool screenOwnsLive3D = SCREEN_IS_TOP ? (pc.screenSwap != 0u) : (pc.screenSwap == 0u); \
     Rgba6 pixel = unpackColor6(READ_PACKED_FN(dsY, sourceX)); \
     if (displayMode == 1) \
@@ -232,22 +231,18 @@ Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale) 
         int compMode = val3.a & 0xF; \
         bool both3dPlaceholders = isPacked3dPlaceholder(val1) && isPacked3dPlaceholder(val2); \
         bool captureBackedComp4 = compMode == 4 && both3dPlaceholders; \
-        bool allowTemporalCompMode7 = compMode == 7 && forceLive3dCompMode7; \
-        bool compModeSamples3D = compMode <= 4 || allowTemporalCompMode7; \
-        bool screenUsesLive3D = screenOwnsLive3D && compModeSamples3D; \
-        bool screenUsesPrevious3D = !screenOwnsLive3D && compModeSamples3D; \
+        bool temporalCompMode7Uses3D = compMode == 7 && (regularCaptureUses3d || forceLive3dCompMode7); \
+        bool compModeSamples3D = compMode <= 4 || temporalCompMode7Uses3D; \
         bool screenHasPrevious3D = SCREEN_IS_TOP ? (pc.previousTopSourceValid != 0u) : (pc.previousBottomSourceValid != 0u); \
-        bool screenCanUsePrevious3D = screenHasPrevious3D \
-            && (screenUsesPrevious3D || screenUsesLive3D); \
         int shiftedScaledX = scaledX + (xOffset * int(safeScale)); \
         Rgba6 pixel3D; \
         pixel3D.r = 0; \
         pixel3D.g = 0; \
         pixel3D.b = 0; \
         pixel3D.a = 0; \
-        if (screenUsesLive3D) \
+        if (compModeSamples3D && screenOwnsLive3D) \
             pixel3D = sample3DColorAtScaledPixel(shiftedScaledX, scaledY); \
-        if ((pixel3D.a & 0x1F) == 0 && screenCanUsePrevious3D) \
+        else if (compModeSamples3D && screenHasPrevious3D) \
             pixel3D = SCREEN_IS_TOP \
                 ? samplePreviousTop3DColorAtScaledPixel(shiftedScaledX, scaledY) \
                 : samplePreviousBottom3DColorAtScaledPixel(shiftedScaledX, scaledY); \
@@ -333,7 +328,7 @@ Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale) 
         } \
         else if (compMode == 7) \
         { \
-            if (allowTemporalCompMode7 && (pixel3D.a & 0x1F) > 0) \
+            if (temporalCompMode7Uses3D && (pixel3D.a & 0x1F) > 0) \
                 val1 = pixel3D; \
         } \
         pixel = val1; \

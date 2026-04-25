@@ -105,8 +105,6 @@ struct VulkanCompositionInputs
 {
     VkImage sourceImage{VK_NULL_HANDLE};
     VkImageView sourceImageView{VK_NULL_HANDLE};
-    VkImage previousSourceImage{VK_NULL_HANDLE};
-    VkImageView previousSourceImageView{VK_NULL_HANDLE};
     VkImage previousTopSourceImage{VK_NULL_HANDLE};
     VkImageView previousTopSourceImageView{VK_NULL_HANDLE};
     VkImage previousBottomSourceImage{VK_NULL_HANDLE};
@@ -121,7 +119,6 @@ struct VulkanCompositionInputs
     u32 scale{};
     u32 rendererWidth{};
     u32 rendererHeight{};
-    bool previousSourceValid{};
     bool previousTopSourceValid{};
     bool previousBottomSourceValid{};
     bool capture3dSourceValid{};
@@ -239,11 +236,6 @@ private:
         VkDeviceMemory renderer3dSnapshotMemory{VK_NULL_HANDLE};
         u32 snapshotWidth{};
         u32 snapshotHeight{};
-        VkImage previousRendererSourceImage{VK_NULL_HANDLE};
-        VkImageView previousRendererSourceImageView{VK_NULL_HANDLE};
-        bool previousRendererSourceValid{};
-        Frame* previousSourceFrame{};
-        bool previousSourcePending{};
         VkImage previousTopRendererSourceImage{VK_NULL_HANDLE};
         VkImageView previousTopRendererSourceImageView{VK_NULL_HANDLE};
         bool previousTopRendererSourceValid{};
@@ -279,7 +271,6 @@ private:
         bool descriptorSetReady{};
         bool timestampPending{};
         VkImageView cachedRendererImageView{VK_NULL_HANDLE};
-        VkImageView cachedPreviousRendererImageView{VK_NULL_HANDLE};
         VkImageView cachedPreviousTopRendererImageView{VK_NULL_HANDLE};
         VkImageView cachedPreviousBottomRendererImageView{VK_NULL_HANDLE};
         std::array<u32, 256 * 192> preparedCapture3dSource{};
