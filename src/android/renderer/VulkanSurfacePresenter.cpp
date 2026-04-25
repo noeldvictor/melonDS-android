@@ -26,6 +26,8 @@ constexpr u32 kDrawModeBackground = 0u;
 constexpr u32 kDrawModeCompositeFrame = 1u;
 constexpr u32 kDrawModeTopScreen = 2u;
 constexpr u32 kDrawModeBottomScreen = 3u;
+constexpr u32 kDrawModeFilteredCompositeTop = 4u;
+constexpr u32 kDrawModeFilteredCompositeBottom = 5u;
 constexpr std::array<VkFormat, 7> kPreferredSurfaceFormats = {
     VK_FORMAT_R8G8B8A8_UNORM,
     VK_FORMAT_B8G8R8A8_UNORM,
@@ -48,6 +50,8 @@ struct PresenterPushConstants
     u32 previousTopSourceValid;
     u32 previousBottomSourceValid;
     u32 captureSourceValid;
+    float viewportWidth;
+    float viewportHeight;
 };
 
 bool presenterRectsEqual(const VulkanPresenterRect& left, const VulkanPresenterRect& right)
@@ -739,8 +743,8 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         && inputs.sourceImageView != VK_NULL_HANDLE
         && inputs.topPackedBuffer != VK_NULL_HANDLE
         && inputs.bottomPackedBuffer != VK_NULL_HANDLE;
-    const bool hasDualScreenSurface = std::any_of(
-        surfaces.begin(),
+	    const bool hasDualScreenSurface = std::any_of(
+	        surfaces.begin(),
         surfaces.end(),
         [](const auto& entry) {
             const SurfaceState& surfaceState = entry.second;
@@ -751,12 +755,21 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
                 return rect.enabled && rect.width > 0 && rect.height > 0;
             };
 
-            return rectEnabled(surfaceState.config.topScreen)
-                && rectEnabled(surfaceState.config.bottomScreen);
+	            return rectEnabled(surfaceState.config.topScreen)
+	                && rectEnabled(surfaceState.config.bottomScreen);
+	        });
+    const bool postProcessFilterRequested = std::any_of(
+        surfaces.begin(),
+        surfaces.end(),
+        [](const auto& entry) {
+            const SurfaceState& surfaceState = entry.second;
+            return surfaceState.configured
+                && IsVulkanPostProcessFilter(surfaceState.config.filtering);
         });
-    const bool directPresentRequested = !inputs.needsReadback
-        && !inputs.validationMode
-        && !hasDualScreenSurface
+	    const bool directPresentRequested = !inputs.needsReadback
+	        && !inputs.validationMode
+        && !postProcessFilterRequested
+	        && !hasDualScreenSurface
         && hasRequiredDirectHandles
         // The direct presenter path is kept for GL-style current-only frames.
         // Frames that need capture or physical-LCD previous source recovery use
@@ -1969,14 +1982,16 @@ bool VulkanSurfacePresenter::updateDescriptorSets(
     SurfaceState& surfaceState,
     VkImageView frameImageView,
     const VulkanCompositionInputs& inputs,
-    VulkanPresenterFilter filtering,
+    VulkanFilterMode filtering,
     bool directPresent)
 {
     (void)directPresent;
 
     DescriptorSetCacheState& screenCache = surfaceState.screenDescriptorCache;
     VkDescriptorImageInfo screenImageInfo{};
-    screenImageInfo.sampler = filtering == VulkanPresenterFilter::Linear ? linearSampler : nearestSampler;
+    screenImageInfo.sampler = (filtering == VulkanFilterMode::Linear || filtering == VulkanFilterMode::Quilez)
+        ? linearSampler
+        : nearestSampler;
     screenImageInfo.imageView = frameImageView;
     screenImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
@@ -2220,6 +2235,8 @@ bool VulkanSurfacePresenter::updateVertexBuffer(
             .firstVertex = firstVertex,
             .vertexCount = 6,
             .drawMode = drawMode,
+            .viewportWidth = 0.0f,
+            .viewportHeight = 0.0f,
         });
     };
 
@@ -2314,7 +2331,9 @@ bool VulkanSurfacePresenter::updateVertexBuffer(
         const float uvBottom = directPresent ? 1.0f : (topScreen ? (0.5f - (1.0f / 386.0f)) : 1.0f);
         const u32 drawMode = directPresent
             ? (topScreen ? kDrawModeTopScreen : kDrawModeBottomScreen)
-            : kDrawModeCompositeFrame;
+            : (IsVulkanPostProcessFilter(config.filtering)
+                ? (topScreen ? kDrawModeFilteredCompositeTop : kDrawModeFilteredCompositeBottom)
+                : kDrawModeCompositeFrame);
         const float topVertexUv = directPresent ? uvBottom : uvTop;
         const float bottomVertexUv = directPresent ? uvTop : uvBottom;
 
@@ -2331,6 +2350,8 @@ bool VulkanSurfacePresenter::updateVertexBuffer(
             .firstVertex = firstVertex,
             .vertexCount = 6,
             .drawMode = drawMode,
+            .viewportWidth = static_cast<float>(rect.width),
+            .viewportHeight = static_cast<float>(rect.height),
         });
     };
 
@@ -2584,10 +2605,12 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
         pushConstants.rendererHeight = inputs.rendererHeight;
         pushConstants.packedStride = inputs.packedStride;
         pushConstants.screenSwap = inputs.screenSwap;
-        pushConstants.filtering = surfaceState.config.filtering == VulkanPresenterFilter::Linear ? 1u : 0u;
+        pushConstants.filtering = static_cast<u32>(surfaceState.config.filtering);
         pushConstants.previousTopSourceValid = inputs.previousTopSourceValid ? 1u : 0u;
         pushConstants.previousBottomSourceValid = inputs.previousBottomSourceValid ? 1u : 0u;
         pushConstants.captureSourceValid = inputs.capture3dSourceValid ? 1u : 0u;
+        pushConstants.viewportWidth = drawCall.viewportWidth;
+        pushConstants.viewportHeight = drawCall.viewportHeight;
         if (MelonDSAndroid::areRendererDebugBgObjLogsEnabled())
         {
             melonDS::Platform::Log(

@@ -31,6 +31,7 @@ layout(push_constant) uniform PushConsts
     uint rendererHeight;
     uint packedStride;
     uint screenSwap;
+    uint filtering;
     uint previousTopSourceValid;
     uint previousBottomSourceValid;
     uint captureSourceValid;
@@ -39,6 +40,8 @@ layout(push_constant) uniform PushConsts
 const uint kMetaFlagRegularCaptureUses3d = 1u << 21u;
 const uint kMetaFlagVramCaptureUses3d = 1u << 22u;
 const uint kMetaFlagForceLive3dCompMode7 = 1u << 18u;
+const uint kFilterLinear = 1u;
+const uint kFilterSharp2D = 2u;
 
 struct Rgba6
 {
@@ -60,6 +63,28 @@ bool hasPackedVisibleColor(Rgba6 color)
 {
     return !isPacked3dPlaceholder(color)
         && ((color.r | color.g | color.b) != 0);
+}
+
+int clampColor6(int value);
+
+vec3 color6ToVec3(Rgba6 color)
+{
+    return vec3(float(color.r), float(color.g), float(color.b));
+}
+
+Rgba6 vec3ToColor6(vec3 color, int alpha)
+{
+    Rgba6 result;
+    result.r = clampColor6(int(floor(color.r + 0.5)));
+    result.g = clampColor6(int(floor(color.g + 0.5)));
+    result.b = clampColor6(int(floor(color.b + 0.5)));
+    result.a = alpha;
+    return result;
+}
+
+bool packedTapIsUnsafeFor2DFilter(Rgba6 color)
+{
+    return isPacked3dPlaceholder(color);
 }
 
 Rgba6 makeScreenWhite()
@@ -209,6 +234,47 @@ uint readBottomPacked(int y, int x)
     return bottomPacked[offset];
 }
 
+#define DEFINE_SAMPLE_FILTERED_PACKED_LAYER(FUNC_NAME, READ_PACKED_FN) \
+Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale, int layerOffset) \
+{ \
+    Rgba6 nearest = unpackColor6(READ_PACKED_FN(dsY, layerOffset + sourceX)); \
+    if ((pc.filtering != kFilterLinear && pc.filtering != kFilterSharp2D) || safeScale <= 1u) \
+        return nearest; \
+    float dsXFloat = (float(scaledX) + 0.5) / float(safeScale) - 0.5; \
+    float dsYFloat = (float(scaledY) + 0.5) / float(safeScale) - 0.5; \
+    int x0 = int(floor(clamp(dsXFloat, 0.0, 255.0))); \
+    int y0 = int(floor(clamp(dsYFloat, 0.0, 191.0))); \
+    int x1 = min(x0 + 1, 255); \
+    int y1 = min(y0 + 1, 191); \
+    float tx = clamp(dsXFloat - float(x0), 0.0, 1.0); \
+    float ty = clamp(dsYFloat - float(y0), 0.0, 1.0); \
+    Rgba6 c00 = unpackColor6(READ_PACKED_FN(y0, layerOffset + x0)); \
+    Rgba6 c10 = unpackColor6(READ_PACKED_FN(y0, layerOffset + x1)); \
+    Rgba6 c01 = unpackColor6(READ_PACKED_FN(y1, layerOffset + x0)); \
+    Rgba6 c11 = unpackColor6(READ_PACKED_FN(y1, layerOffset + x1)); \
+    if (packedTapIsUnsafeFor2DFilter(c00) \
+        || packedTapIsUnsafeFor2DFilter(c10) \
+        || packedTapIsUnsafeFor2DFilter(c01) \
+        || packedTapIsUnsafeFor2DFilter(c11)) \
+        return nearest; \
+    vec3 v00 = color6ToVec3(c00); \
+    vec3 v10 = color6ToVec3(c10); \
+    vec3 v01 = color6ToVec3(c01); \
+    vec3 v11 = color6ToVec3(c11); \
+    vec3 blended = mix(mix(v00, v10, tx), mix(v01, v11, tx), ty); \
+    if (pc.filtering == kFilterLinear) \
+        return vec3ToColor6(blended, nearest.a); \
+    vec3 sharpened = mix(blended, color6ToVec3(nearest), 0.45); \
+    vec3 minColor = min(min(v00, v10), min(v01, v11)); \
+    vec3 maxColor = max(max(v00, v10), max(v01, v11)); \
+    return vec3ToColor6(clamp(sharpened, minColor, maxColor), nearest.a); \
+}
+
+DEFINE_SAMPLE_FILTERED_PACKED_LAYER(sampleTopFilteredPackedLayer, readTopPacked)
+DEFINE_SAMPLE_FILTERED_PACKED_LAYER(sampleBottomFilteredPackedLayer, readBottomPacked)
+
+#undef DEFINE_SAMPLE_FILTERED_PACKED_LAYER
+
 #define DEFINE_COMPOSE_SCREEN_PIXEL(FUNC_NAME, READ_PACKED_FN, SCREEN_IS_TOP) \
 Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale) \
 { \
@@ -222,12 +288,16 @@ Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale) 
     bool vramCaptureUses3d = (masterBrightness & kMetaFlagVramCaptureUses3d) != 0u; \
     bool forceLive3dCompMode7 = (masterBrightness & kMetaFlagForceLive3dCompMode7) != 0u; \
     bool screenOwnsLive3D = SCREEN_IS_TOP ? (pc.screenSwap != 0u) : (pc.screenSwap == 0u); \
-    Rgba6 pixel = unpackColor6(READ_PACKED_FN(dsY, sourceX)); \
-    if (displayMode == 1) \
-    { \
-        Rgba6 val1 = pixel; \
-        Rgba6 val2 = unpackColor6(READ_PACKED_FN(dsY, 256 + sourceX)); \
-        Rgba6 val3 = unpackColor6(READ_PACKED_FN(dsY, 512 + sourceX)); \
+	    Rgba6 pixel = SCREEN_IS_TOP \
+            ? sampleTopFilteredPackedLayer(sourceX, dsY, scaledX, scaledY, safeScale, 0) \
+            : sampleBottomFilteredPackedLayer(sourceX, dsY, scaledX, scaledY, safeScale, 0); \
+	    if (displayMode == 1) \
+	    { \
+	        Rgba6 val1 = pixel; \
+	        Rgba6 val2 = SCREEN_IS_TOP \
+                ? sampleTopFilteredPackedLayer(sourceX, dsY, scaledX, scaledY, safeScale, 256) \
+                : sampleBottomFilteredPackedLayer(sourceX, dsY, scaledX, scaledY, safeScale, 256); \
+	        Rgba6 val3 = unpackColor6(READ_PACKED_FN(dsY, 512 + sourceX)); \
         int compMode = val3.a & 0xF; \
         bool both3dPlaceholders = isPacked3dPlaceholder(val1) && isPacked3dPlaceholder(val2); \
         bool captureBackedComp4 = compMode == 4 && both3dPlaceholders; \

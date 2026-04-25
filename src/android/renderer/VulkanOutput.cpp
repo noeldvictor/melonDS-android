@@ -1828,6 +1828,7 @@ bool VulkanOutput::buildCompositionInputs(
     const Frame* frame,
     const melonDS::VulkanRenderer3D& renderer3D,
     int scale,
+    VulkanFilterMode filtering,
     bool needsReadback,
     bool multiSurface,
     bool validationMode,
@@ -1882,6 +1883,7 @@ bool VulkanOutput::buildCompositionInputs(
     outInputs.packedStride = kAcceleratedStride;
     outInputs.screenSwap = resource.screenSwap ? 1u : 0u;
     outInputs.scale = static_cast<u32>(scale);
+    outInputs.filtering = filtering;
     outInputs.capture3dSourceValid = resource.hasPreparedCapture3dSource && resource.capture3dBuffer != VK_NULL_HANDLE;
     outInputs.needsReadback = needsReadback;
     outInputs.multiSurface = multiSurface;
@@ -2388,6 +2390,7 @@ bool VulkanOutput::dispatchCompositor(
     pushConstants.rendererHeight = inputs.rendererHeight;
     pushConstants.packedStride = inputs.packedStride;
     pushConstants.screenSwap = inputs.screenSwap;
+    pushConstants.filtering = static_cast<u32>(inputs.filtering);
     pushConstants.previousTopSourceValid = inputs.previousTopSourceValid ? 1u : 0u;
     pushConstants.previousBottomSourceValid = inputs.previousBottomSourceValid ? 1u : 0u;
     pushConstants.captureSourceValid = inputs.capture3dSourceValid ? 1u : 0u;
@@ -2462,7 +2465,7 @@ bool VulkanOutput::validateCompositorSubmission(Frame* frame, const melonDS::Vul
     resource.hasPreparedInputs = true;
 
     VulkanCompositionInputs inputs{};
-    if (!buildCompositionInputs(frame, renderer3D, scale, false, false, true, inputs))
+    if (!buildCompositionInputs(frame, renderer3D, scale, VulkanFilterMode::Nearest, false, false, true, inputs))
         return false;
 
     if (!dispatchCompositor(frame, resource, inputs))

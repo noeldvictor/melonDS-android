@@ -8,6 +8,7 @@
 #include <vulkan/vulkan.h>
 
 #include "renderer/FrameQueue.h"
+#include "renderer/VulkanFilterMode.h"
 #include "types.h"
 #include "VulkanPerfStats.h"
 
@@ -119,6 +120,7 @@ struct VulkanCompositionInputs
     u32 scale{};
     u32 rendererWidth{};
     u32 rendererHeight{};
+    VulkanFilterMode filtering{VulkanFilterMode::Nearest};
     bool previousTopSourceValid{};
     bool previousBottomSourceValid{};
     bool capture3dSourceValid{};
@@ -155,6 +157,7 @@ public:
         const Frame* frame,
         const melonDS::VulkanRenderer3D& renderer3D,
         int scale,
+        VulkanFilterMode filtering,
         bool needsReadback,
         bool multiSurface,
         bool validationMode,
@@ -202,6 +205,7 @@ private:
         u32 rendererHeight;
         u32 packedStride;
         u32 screenSwap;
+        u32 filtering;
         u32 previousTopSourceValid;
         u32 previousBottomSourceValid;
         u32 captureSourceValid;

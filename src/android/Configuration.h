@@ -3,6 +3,7 @@
 
 #include <memory>
 #include "renderer/Renderer.h"
+#include "renderer/VulkanFilterMode.h"
 
 namespace MelonDSAndroid
 {
@@ -27,10 +28,10 @@ struct OpenGlRenderSettings : public RenderSettings
     bool conservativeCoverageEnabled;
     float conservativeCoveragePx;
     float conservativeCoverageDepthBias;
-    bool conservativeCoverageApplyRepeat;
-    bool conservativeCoverageApplyClamp;
-    bool debug3dClearMagenta;
-};
+	    bool conservativeCoverageApplyRepeat;
+	    bool conservativeCoverageApplyClamp;
+		bool debug3dClearMagenta;
+	};
 
 struct ComputeRenderSettings : public RenderSettings
 {
@@ -49,10 +50,11 @@ struct VulkanRenderSettings : public RenderSettings
     bool conservativeCoverageEnabled;
     float conservativeCoveragePx;
     float conservativeCoverageDepthBias;
-    bool conservativeCoverageApplyRepeat;
-    bool conservativeCoverageApplyClamp;
-    bool debug3dClearMagenta;
-};
+	    bool conservativeCoverageApplyRepeat;
+	    bool conservativeCoverageApplyClamp;
+	    bool debug3dClearMagenta;
+	    VulkanFilterMode videoFiltering = VulkanFilterMode::Nearest;
+	};
 
 struct AudioSettings
 {

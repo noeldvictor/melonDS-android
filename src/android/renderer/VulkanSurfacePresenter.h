@@ -9,6 +9,7 @@
 
 #include "VulkanPerfStats.h"
 #include "renderer/FrameQueue.h"
+#include "renderer/VulkanFilterMode.h"
 #include "types.h"
 
 namespace MelonDSAndroid
@@ -21,12 +22,6 @@ struct VulkanPresenterRect
     int y = 0;
     int width = 0;
     int height = 0;
-};
-
-enum class VulkanPresenterFilter : u32
-{
-    Nearest = 0,
-    Linear = 1,
 };
 
 enum class VulkanPresenterBackgroundMode : u32
@@ -48,7 +43,7 @@ struct VulkanSurfaceConfig
     bool topOnTop = false;
     bool bottomOnTop = false;
     VulkanPresenterBackgroundMode backgroundMode = VulkanPresenterBackgroundMode::Stretch;
-    VulkanPresenterFilter filtering = VulkanPresenterFilter::Nearest;
+    VulkanFilterMode filtering = VulkanFilterMode::Nearest;
 };
 
 struct VulkanBackgroundImage
@@ -111,6 +106,8 @@ private:
         u32 firstVertex = 0;
         u32 vertexCount = 0;
         u32 drawMode = 0;
+        float viewportWidth = 0.0f;
+        float viewportHeight = 0.0f;
     };
 
     struct BackgroundResource
@@ -216,7 +213,7 @@ private:
         SurfaceState& surfaceState,
         VkImageView frameImageView,
         const VulkanCompositionInputs& inputs,
-        VulkanPresenterFilter filtering,
+        VulkanFilterMode filtering,
         bool directPresent
     );
     bool updateVertexBuffer(

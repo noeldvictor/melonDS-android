@@ -1457,8 +1457,9 @@ bool MelonInstance::presentVulkanFrame(
     if (currentRenderer != Renderer::Vulkan || !vulkanOutput || !vulkanSurfacePresenter)
         return false;
 
-    auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
-    const int renderScale = std::max(renderer3D.GetScaleFactor(), 1);
+	    auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
+	    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+	    const int renderScale = std::max(renderer3D.GetScaleFactor(), 1);
     const bool graphicsHardwareActive =
         renderer3D.GetActiveBackendMode() == VulkanRenderer3D::BackendMode::GraphicsHardware;
     const bool fastForwardActive = isFastForwardActive();
@@ -1545,9 +1546,10 @@ bool MelonInstance::presentVulkanFrame(
         VulkanCompositionInputs compositionInputs{};
         if (!vulkanOutput->buildCompositionInputs(
                 frame,
-                renderer3D,
-                renderScale,
-                false,
+	                renderer3D,
+	                renderScale,
+	                vulkanRenderSettings.videoFiltering,
+	                false,
                 false,
                 false,
                 compositionInputs))
@@ -3495,11 +3497,13 @@ bool MelonInstance::updateVulkanScreenshot(Frame* frame, int scale, bool clearOn
 
     vulkanReadbackFrame.resize(readbackPixels);
     auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
+    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*currentConfiguration->renderSettings);
     VulkanCompositionInputs compositionInputs{};
     if (!vulkanOutput->buildCompositionInputs(
             frame,
             renderer3D,
             scale,
+            vulkanRenderSettings.videoFiltering,
             true,
             false,
             false,
