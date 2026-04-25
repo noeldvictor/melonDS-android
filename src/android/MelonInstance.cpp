@@ -4280,6 +4280,12 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(const Frame* frame, int frontBu
                 if (displayMode != 1u)
                     continue;
 
+                const bool temporalCompMode7Uses3d =
+                    (meta & (kSoftPackedMetaFlagRegularCaptureUses3d
+                        | kSoftPackedMetaFlagForceLive3dCompMode7)) != 0u;
+                if (!temporalCompMode7Uses3d)
+                    continue;
+
                 bool lineHasCompMode7 = false;
                 const size_t rowBase = static_cast<size_t>(y) * static_cast<size_t>(kScreenshotScreenWidth);
                 for (int x = 0; x < kScreenshotScreenWidth; x++)
