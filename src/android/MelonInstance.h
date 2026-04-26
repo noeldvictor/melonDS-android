@@ -41,7 +41,7 @@ public:
     void loadGbaAnalogInput();
     void loadGbaRumblePak();
     bool bootFirmware();
-    bool precompileVulkanPipelines();
+    bool precompileVulkanPipelines(const VulkanSurfaceConfig& retroArchConfig);
     void start();
     void reset();
     melonDS::u32 runFrame();

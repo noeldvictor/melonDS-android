@@ -44,6 +44,7 @@ const int kVulkanCompileStageInitRenderer = 1;
 const int kVulkanCompileStageBuildPipelines = 2;
 const int kVulkanCompileStageInitOutput = 3;
 const int kVulkanCompileStageWarmupSubmission = 4;
+const int kVulkanCompileStageRetroArchFilter = 5;
 const u64 kVulkanHighResolutionRealtimePresenterBudgetFloorNs = 4'000'000ull;
 const u32 kDenseBurstCaptureScreenFrame = 1u << 0;
 const u32 kDenseBurstCapturePackedTopPrimary = 1u << 1;
@@ -674,6 +675,7 @@ MelonInstance::MelonInstance(int instanceId, std::shared_ptr<EmulatorConfigurati
 
 MelonInstance::~MelonInstance()
 {
+    VulkanSurfacePresenter::clearPrewarmedRetroArchFilters();
     vulkanOutput = nullptr;
     net->UnregisterInstance(instanceId);
     delete nds;
@@ -840,15 +842,28 @@ bool MelonInstance::bootFirmware()
     return true;
 }
 
-bool MelonInstance::precompileVulkanPipelines()
+bool MelonInstance::precompileVulkanPipelines(const VulkanSurfaceConfig& retroArchConfig)
 {
     if (currentConfiguration->renderer != Renderer::Vulkan)
         return true;
 
-    constexpr int kTotalCompileStages = 4;
+    const bool shouldPrewarmRetroArch =
+        retroArchConfig.filtering == VulkanFilterMode::RetroArch
+        && retroArchConfig.retroShaderEnabled
+        && !retroArchConfig.retroShaderPresetPath.empty();
+    Platform::Log(
+        Platform::LogLevel::Info,
+        "Vulkan precompile: retroFiltering=%d retroEnabled=%d preset=%s source=%d passes=%u prewarm=%d",
+        static_cast<int>(retroArchConfig.filtering),
+        retroArchConfig.retroShaderEnabled ? 1 : 0,
+        retroArchConfig.retroShaderPresetPath.c_str(),
+        static_cast<int>(retroArchConfig.retroShaderSourceResolution),
+        retroArchConfig.retroShaderPassCount,
+        shouldPrewarmRetroArch ? 1 : 0);
+    const int totalCompileStages = shouldPrewarmRetroArch ? 5 : 4;
     auto emitProgress = [&](int stageId, int current) {
         if (eventMessenger != nullptr)
-            eventMessenger->onVulkanCompileProgress(stageId, current, kTotalCompileStages);
+            eventMessenger->onVulkanCompileProgress(stageId, current, totalCompileStages);
     };
 
     auto failPrecompile = [&](const char* reason) -> bool {
@@ -892,13 +907,30 @@ bool MelonInstance::precompileVulkanPipelines()
     if (!vulkanOutput->validateRuntimePath(validationWidth, validationHeight, renderer3D, vulkanScale))
         return failPrecompile("output warm-up");
 
+    if (shouldPrewarmRetroArch)
+    {
+        const u32 outputScreenWidth = static_cast<u32>(256 * vulkanScale);
+        const u32 outputScreenHeight = static_cast<u32>(192 * vulkanScale);
+        emitProgress(kVulkanCompileStageRetroArchFilter, 4);
+        if (!VulkanSurfacePresenter::prewarmRetroArchFilter(
+                retroArchConfig,
+                outputScreenWidth,
+                outputScreenHeight))
+        {
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "Vulkan precompile: RetroArch preset could not be prepared; runtime will fall back cleanly"
+            );
+        }
+    }
+
     renderer3D.InvalidatePresentationState(true);
     clearPreparedVulkanDebugSnapshot();
     vulkanReadbackFrame.clear();
     lastCompletedVulkanFrame = nullptr;
     lastCompletedVulkanScale = 1;
 
-    emitProgress(kVulkanCompileStageWarmupSubmission, 4);
+    emitProgress(shouldPrewarmRetroArch ? kVulkanCompileStageRetroArchFilter : kVulkanCompileStageWarmupSubmission, totalCompileStages);
     return true;
 }
 
@@ -1287,6 +1319,7 @@ void MelonInstance::handleVulkanRuntimeFailure(const char* reason)
 void MelonInstance::stop()
 {
     retroAchievementsManager = nullptr;
+    VulkanSurfacePresenter::clearPrewarmedRetroArchFilters();
     vulkanOutput = nullptr;
     vulkanSurfacePresenter = nullptr;
     vulkanReadbackFrame.clear();
@@ -3307,6 +3340,7 @@ void MelonInstance::updateRenderer()
         }
         else if (vulkanOutput)
         {
+            VulkanSurfacePresenter::clearPrewarmedRetroArchFilters();
             vulkanOutput = nullptr;
             vulkanSurfacePresenter = nullptr;
         }

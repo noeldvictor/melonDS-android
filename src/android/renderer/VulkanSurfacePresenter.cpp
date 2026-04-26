@@ -28,6 +28,9 @@ constexpr u32 kDrawModeTopScreen = 2u;
 constexpr u32 kDrawModeBottomScreen = 3u;
 constexpr u32 kDrawModeFilteredCompositeTop = 4u;
 constexpr u32 kDrawModeFilteredCompositeBottom = 5u;
+constexpr u32 kNativeScreenWidth = 256u;
+constexpr u32 kNativeScreenHeight = 192u;
+constexpr size_t kPrewarmedRetroArchSurfaceCount = 2u;
 constexpr std::array<VkFormat, 7> kPreferredSurfaceFormats = {
     VK_FORMAT_R8G8B8A8_UNORM,
     VK_FORMAT_B8G8R8A8_UNORM,
@@ -54,6 +57,15 @@ struct PresenterPushConstants
     float viewportHeight;
 };
 
+struct PrewarmedRetroArchChains
+{
+    VulkanRetroArchFilterChain topChain;
+    VulkanRetroArchFilterChain bottomChain;
+};
+
+std::mutex gPrewarmedRetroArchMutex;
+std::unordered_map<std::string, std::vector<PrewarmedRetroArchChains>> gPrewarmedRetroArchChains;
+
 bool presenterRectsEqual(const VulkanPresenterRect& left, const VulkanPresenterRect& right)
 {
     return left.enabled == right.enabled
@@ -72,7 +84,83 @@ bool surfaceConfigsEqual(const VulkanSurfaceConfig& left, const VulkanSurfaceCon
         && left.topOnTop == right.topOnTop
         && left.bottomOnTop == right.bottomOnTop
         && left.backgroundMode == right.backgroundMode
-        && left.filtering == right.filtering;
+        && left.filtering == right.filtering
+        && left.retroShaderEnabled == right.retroShaderEnabled
+        && left.retroShaderPresetPath == right.retroShaderPresetPath
+        && left.retroShaderSourceResolution == right.retroShaderSourceResolution
+        && left.retroShaderPassCount == right.retroShaderPassCount
+        && left.retroShaderParameterOverrides == right.retroShaderParameterOverrides
+        && left.retroShaderClearHistory == right.retroShaderClearHistory;
+}
+
+bool retroArchConfigEqual(const VulkanSurfaceConfig& left, const VulkanSurfaceConfig& right)
+{
+    return left.filtering == right.filtering
+        && left.retroShaderEnabled == right.retroShaderEnabled
+        && left.retroShaderPresetPath == right.retroShaderPresetPath
+        && left.retroShaderSourceResolution == right.retroShaderSourceResolution
+        && left.retroShaderPassCount == right.retroShaderPassCount
+        && left.retroShaderParameterOverrides == right.retroShaderParameterOverrides
+        && left.retroShaderClearHistory == right.retroShaderClearHistory;
+}
+
+std::string makeRetroArchConfigKey(
+    const VulkanSurfaceConfig& config,
+    u32 sourceScreenWidth,
+    u32 sourceScreenHeight,
+    u32 outputScreenWidth,
+    u32 outputScreenHeight)
+{
+    std::string configKey = config.retroShaderPresetPath
+        + "|"
+        + std::to_string(sourceScreenWidth)
+        + "x"
+        + std::to_string(sourceScreenHeight)
+        + ">"
+        + std::to_string(outputScreenWidth)
+        + "x"
+        + std::to_string(outputScreenHeight);
+    for (const auto& [name, value] : config.retroShaderParameterOverrides)
+    {
+        configKey += "|";
+        configKey += name;
+        configKey += "=";
+        configKey += std::to_string(value);
+    }
+    return configKey;
+}
+
+bool takePrewarmedRetroArchChains(
+    const std::string& configKey,
+    VulkanRetroArchFilterChain& topChain,
+    VulkanRetroArchFilterChain& bottomChain)
+{
+    std::scoped_lock lock(gPrewarmedRetroArchMutex);
+    auto cached = gPrewarmedRetroArchChains.find(configKey);
+    if (cached == gPrewarmedRetroArchChains.end() || cached->second.empty())
+    {
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "VulkanPresenter[RetroArch]: prewarmed chains missing key=%s cached=%zu",
+            configKey.c_str(),
+            gPrewarmedRetroArchChains.size());
+        return false;
+    }
+
+    PrewarmedRetroArchChains chains = std::move(cached->second.back());
+    cached->second.pop_back();
+    const size_t remaining = cached->second.size();
+    if (cached->second.empty())
+        gPrewarmedRetroArchChains.erase(cached);
+
+    topChain = std::move(chains.topChain);
+    bottomChain = std::move(chains.bottomChain);
+    melonDS::Platform::Log(
+        melonDS::Platform::LogLevel::Info,
+        "VulkanPresenter[RetroArch]: consumed prewarmed chains key=%s remaining=%zu",
+        configKey.c_str(),
+        remaining);
+    return true;
 }
 
 bool isPreferredAndroidSurfaceFormat(VkFormat format)
@@ -341,6 +429,8 @@ void VulkanSurfacePresenter::shutdown()
         vkQueueWaitIdle(queue);
     }
 
+    clearPrewarmedRetroArchFilters();
+
     while (!surfaces.empty())
     {
         detachSurface(surfaces.begin()->first);
@@ -369,6 +459,108 @@ void VulkanSurfacePresenter::shutdown()
     resetQueryPool = nullptr;
     timestampPeriodNs = 0.0f;
     timestampQueriesSupported = false;
+}
+
+bool VulkanSurfacePresenter::prewarmRetroArchFilter(
+    const VulkanSurfaceConfig& config,
+    u32 outputScreenWidth,
+    u32 outputScreenHeight)
+{
+    if (config.filtering != VulkanFilterMode::RetroArch
+        || !config.retroShaderEnabled
+        || config.retroShaderPresetPath.empty())
+    {
+        return true;
+    }
+
+    if (outputScreenWidth == 0 || outputScreenHeight == 0)
+        return false;
+
+    const bool nativeSourcePreset = config.retroShaderSourceResolution == RetroArchSourceResolution::Native;
+    const u32 sourceScreenWidth = nativeSourcePreset ? kNativeScreenWidth : outputScreenWidth;
+    const u32 sourceScreenHeight = nativeSourcePreset ? kNativeScreenHeight : outputScreenHeight;
+    const std::string configKey = makeRetroArchConfigKey(
+        config,
+        sourceScreenWidth,
+        sourceScreenHeight,
+        outputScreenWidth,
+        outputScreenHeight);
+
+    melonDS::Platform::Log(
+        melonDS::Platform::LogLevel::Info,
+        "VulkanPresenter[RetroArch]: prewarm start key=%s",
+        configKey.c_str());
+
+    {
+        std::scoped_lock lock(gPrewarmedRetroArchMutex);
+        auto cached = gPrewarmedRetroArchChains.find(configKey);
+        if (cached != gPrewarmedRetroArchChains.end()
+            && cached->second.size() >= kPrewarmedRetroArchSurfaceCount)
+        {
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Info,
+                "VulkanPresenter[RetroArch]: prewarm already cached key=%s count=%zu",
+                configKey.c_str(),
+                cached->second.size());
+            return true;
+        }
+    }
+
+    std::vector<PrewarmedRetroArchChains> chainSets;
+    chainSets.reserve(kPrewarmedRetroArchSurfaceCount);
+    for (size_t chainSetIndex = 0; chainSetIndex < kPrewarmedRetroArchSurfaceCount; chainSetIndex++)
+    {
+        PrewarmedRetroArchChains chains{};
+        if (!chains.topChain.configure(
+                config.retroShaderPresetPath,
+                sourceScreenWidth,
+                sourceScreenHeight,
+                outputScreenWidth,
+                outputScreenHeight,
+                config.retroShaderParameterOverrides)
+            || !chains.bottomChain.configure(
+                config.retroShaderPresetPath,
+                sourceScreenWidth,
+                sourceScreenHeight,
+                outputScreenWidth,
+                outputScreenHeight,
+                config.retroShaderParameterOverrides))
+        {
+            chains.topChain.shutdown();
+            chains.bottomChain.shutdown();
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Warn,
+                "VulkanPresenter[RetroArch]: prewarm failed key=%s chainSet=%zu",
+                configKey.c_str(),
+                chainSetIndex);
+            return false;
+        }
+        chainSets.emplace_back(std::move(chains));
+    }
+
+    {
+        std::scoped_lock lock(gPrewarmedRetroArchMutex);
+        gPrewarmedRetroArchChains.clear();
+        gPrewarmedRetroArchChains.emplace(configKey, std::move(chainSets));
+    }
+
+    melonDS::Platform::Log(
+        melonDS::Platform::LogLevel::Info,
+        "VulkanPresenter[RetroArch]: prewarmed preset=%s source=%ux%u output=%ux%u params=%zu chainSets=%zu",
+        config.retroShaderPresetPath.c_str(),
+        sourceScreenWidth,
+        sourceScreenHeight,
+        outputScreenWidth,
+        outputScreenHeight,
+        config.retroShaderParameterOverrides.size(),
+        kPrewarmedRetroArchSurfaceCount);
+    return true;
+}
+
+void VulkanSurfacePresenter::clearPrewarmedRetroArchFilters()
+{
+    std::scoped_lock lock(gPrewarmedRetroArchMutex);
+    gPrewarmedRetroArchChains.clear();
 }
 
 bool VulkanSurfacePresenter::createSyncObjects()
@@ -700,6 +892,11 @@ bool VulkanSurfacePresenter::configureSurface(int surfaceId, const VulkanSurface
     if (waitForSurfaceIdle(surfaceState) != VK_SUCCESS)
         return false;
 
+    const bool retroArchConfigChanged =
+        surfaceState.configured && !retroArchConfigEqual(surfaceState.config, config);
+    if (retroArchConfigChanged)
+        destroyRetroArchResources(surfaceState);
+
     surfaceState.config = config;
     surfaceState.configured = true;
     surfaceState.vertexBufferDirty = true;
@@ -822,8 +1019,8 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
             continue;
 
         const bool directPresent = directPresentRequested;
-        const VkImage sampledImage = directPresent ? inputs.sourceImage : frameImage;
-        const VkImageView sampledImageView = directPresent ? inputs.sourceImageView : frameImageView;
+        VkImage sampledImage = directPresent ? inputs.sourceImage : frameImage;
+        VkImageView sampledImageView = directPresent ? inputs.sourceImageView : frameImageView;
 
         if (!ensureSwapchain(surfaceState))
             continue;
@@ -849,6 +1046,22 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         }
         if (waitResult != VK_SUCCESS)
             continue;
+
+        if (surfaceState.config.filtering == VulkanFilterMode::RetroArch && !directPresent)
+        {
+            VkImage retroImage = VK_NULL_HANDLE;
+            VkImageView retroImageView = VK_NULL_HANDLE;
+            if (runRetroArchFilter(surfaceState, sampledImage, sampledImageView, frame->width, frame->height, retroImage, retroImageView))
+            {
+                sampledImage = retroImage;
+                sampledImageView = retroImageView;
+            }
+            else
+            {
+                sampledImage = frameImage;
+                sampledImageView = frameImageView;
+            }
+        }
 
         const u64 descriptorStartNs = PerfNowNs();
         if (!updateDescriptorSets(surfaceState, sampledImageView, inputs, surfaceState.config.filtering, directPresent))
@@ -1093,6 +1306,7 @@ bool VulkanSurfacePresenter::createSurfaceStateResources(SurfaceState& surfaceSt
 
 void VulkanSurfacePresenter::destroySurfaceStateResources(SurfaceState& surfaceState)
 {
+    destroyRetroArchResources(surfaceState);
     destroyBackgroundTexture(surfaceState);
     destroySwapchain(surfaceState);
     destroyInFlightFence(surfaceState);
@@ -1763,6 +1977,421 @@ void VulkanSurfacePresenter::destroyBackgroundTexture(SurfaceState& surfaceState
     surfaceState.backgroundDescriptorCache.ready = false;
 }
 
+bool VulkanSurfacePresenter::createRetroArchImage(RetroArchImageResource& resource, u32 width, u32 height)
+{
+    destroyRetroArchImage(resource);
+    if (width == 0 || height == 0)
+        return false;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.extent = {width, height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+        | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+        | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (vkCreateImage(device, &imageInfo, nullptr, &resource.image) != VK_SUCCESS)
+        return false;
+
+    VkMemoryRequirements memoryRequirements{};
+    vkGetImageMemoryRequirements(device, resource.image, &memoryRequirements);
+
+    VkMemoryAllocateInfo memoryInfo{};
+    memoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memoryInfo.allocationSize = memoryRequirements.size;
+    memoryInfo.memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memoryInfo.memoryTypeIndex == UINT32_MAX
+        || vkAllocateMemory(device, &memoryInfo, nullptr, &resource.memory) != VK_SUCCESS
+        || vkBindImageMemory(device, resource.image, resource.memory, 0) != VK_SUCCESS)
+    {
+        destroyRetroArchImage(resource);
+        return false;
+    }
+
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = resource.image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(device, &viewInfo, nullptr, &resource.imageView) != VK_SUCCESS)
+    {
+        destroyRetroArchImage(resource);
+        return false;
+    }
+
+    resource.width = width;
+    resource.height = height;
+    resource.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    return true;
+}
+
+void VulkanSurfacePresenter::destroyRetroArchImage(RetroArchImageResource& resource)
+{
+    if (resource.imageView != VK_NULL_HANDLE)
+        vkDestroyImageView(device, resource.imageView, nullptr);
+    if (resource.image != VK_NULL_HANDLE)
+        vkDestroyImage(device, resource.image, nullptr);
+    if (resource.memory != VK_NULL_HANDLE)
+        vkFreeMemory(device, resource.memory, nullptr);
+    resource = {};
+}
+
+bool VulkanSurfacePresenter::ensureRetroArchResources(
+    SurfaceState& surfaceState,
+    u32 sourceScreenWidth,
+    u32 sourceScreenHeight,
+    u32 outputScreenWidth,
+    u32 outputScreenHeight,
+    u32 atlasWidth,
+    u32 atlasHeight)
+{
+    RetroArchResources& retro = surfaceState.retroArch;
+    const bool sizeMatches =
+        retro.topInput.width == sourceScreenWidth && retro.topInput.height == sourceScreenHeight
+        && retro.bottomInput.width == sourceScreenWidth && retro.bottomInput.height == sourceScreenHeight
+        && retro.topOutput.width == outputScreenWidth && retro.topOutput.height == outputScreenHeight
+        && retro.bottomOutput.width == outputScreenWidth && retro.bottomOutput.height == outputScreenHeight
+        && retro.atlasOutput.width == atlasWidth && retro.atlasOutput.height == atlasHeight;
+
+    if (retro.initialized && sizeMatches)
+        return true;
+
+    destroyRetroArchResources(surfaceState);
+
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = queueFamilyIndex;
+    if (vkCreateCommandPool(device, &poolInfo, nullptr, &retro.commandPool) != VK_SUCCESS)
+        return false;
+
+    VkCommandBufferAllocateInfo commandBufferInfo{};
+    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    commandBufferInfo.commandPool = retro.commandPool;
+    commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    commandBufferInfo.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &commandBufferInfo, &retro.commandBuffer) != VK_SUCCESS)
+        return false;
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateFence(device, &fenceInfo, nullptr, &retro.fence) != VK_SUCCESS)
+        return false;
+
+    if (!createRetroArchImage(retro.topInput, sourceScreenWidth, sourceScreenHeight)
+        || !createRetroArchImage(retro.bottomInput, sourceScreenWidth, sourceScreenHeight)
+        || !createRetroArchImage(retro.topOutput, outputScreenWidth, outputScreenHeight)
+        || !createRetroArchImage(retro.bottomOutput, outputScreenWidth, outputScreenHeight)
+        || !createRetroArchImage(retro.atlasOutput, atlasWidth, atlasHeight))
+    {
+        destroyRetroArchResources(surfaceState);
+        return false;
+    }
+
+    retro.initialized = true;
+    return true;
+}
+
+void VulkanSurfacePresenter::destroyRetroArchResources(SurfaceState& surfaceState)
+{
+    RetroArchResources& retro = surfaceState.retroArch;
+    retro.topChain.shutdown();
+    retro.bottomChain.shutdown();
+    destroyRetroArchImage(retro.topInput);
+    destroyRetroArchImage(retro.bottomInput);
+    destroyRetroArchImage(retro.topOutput);
+    destroyRetroArchImage(retro.bottomOutput);
+    destroyRetroArchImage(retro.atlasOutput);
+
+    if (retro.commandBuffer != VK_NULL_HANDLE && retro.commandPool != VK_NULL_HANDLE)
+        vkFreeCommandBuffers(device, retro.commandPool, 1, &retro.commandBuffer);
+    if (retro.fence != VK_NULL_HANDLE)
+        vkDestroyFence(device, retro.fence, nullptr);
+    if (retro.commandPool != VK_NULL_HANDLE)
+        vkDestroyCommandPool(device, retro.commandPool, nullptr);
+    retro = {};
+}
+
+bool VulkanSurfacePresenter::runRetroArchFilter(
+    SurfaceState& surfaceState,
+    VkImage sourceAtlasImage,
+    VkImageView sourceAtlasImageView,
+    u32 atlasWidth,
+    u32 atlasHeight,
+    VkImage& outputImage,
+    VkImageView& outputImageView)
+{
+    (void)sourceAtlasImageView;
+    outputImage = VK_NULL_HANDLE;
+    outputImageView = VK_NULL_HANDLE;
+
+    if (sourceAtlasImage == VK_NULL_HANDLE
+        || atlasWidth == 0
+        || atlasHeight == 0
+        || !surfaceState.config.retroShaderEnabled
+        || surfaceState.config.retroShaderPresetPath.empty())
+    {
+        return false;
+    }
+
+    const u32 outputScreenWidth = kNativeScreenWidth * std::max(1u, atlasWidth / kNativeScreenWidth);
+    const u32 outputScreenHeight = kNativeScreenHeight * std::max(1u, outputScreenWidth / kNativeScreenWidth);
+    const bool nativeSourcePreset = surfaceState.config.retroShaderSourceResolution == RetroArchSourceResolution::Native;
+    const u32 sourceScreenWidth = nativeSourcePreset ? kNativeScreenWidth : outputScreenWidth;
+    const u32 sourceScreenHeight = nativeSourcePreset ? kNativeScreenHeight : outputScreenHeight;
+    if (outputScreenWidth == 0
+        || outputScreenHeight == 0
+        || outputScreenWidth > atlasWidth
+        || outputScreenHeight > atlasHeight)
+        return false;
+
+    if (!ensureRetroArchResources(
+            surfaceState,
+            sourceScreenWidth,
+            sourceScreenHeight,
+            outputScreenWidth,
+            outputScreenHeight,
+            atlasWidth,
+            atlasHeight))
+        return false;
+
+    RetroArchResources& retro = surfaceState.retroArch;
+    std::string configKey = makeRetroArchConfigKey(
+        surfaceState.config,
+        sourceScreenWidth,
+        sourceScreenHeight,
+        outputScreenWidth,
+        outputScreenHeight);
+    if (retro.failedConfigKey == configKey)
+        return false;
+
+    const bool chainConfigMatches =
+        retro.topChain.getPresetPath() == surfaceState.config.retroShaderPresetPath
+        && retro.topChain.getSourceWidth() == sourceScreenWidth
+        && retro.topChain.getSourceHeight() == sourceScreenHeight
+        && retro.topChain.getOutputWidth() == outputScreenWidth
+        && retro.topChain.getOutputHeight() == outputScreenHeight
+        && retro.topChain.getParameterOverrides() == surfaceState.config.retroShaderParameterOverrides
+        && retro.bottomChain.getPresetPath() == surfaceState.config.retroShaderPresetPath
+        && retro.bottomChain.getSourceWidth() == sourceScreenWidth
+        && retro.bottomChain.getSourceHeight() == sourceScreenHeight
+        && retro.bottomChain.getOutputWidth() == outputScreenWidth
+        && retro.bottomChain.getOutputHeight() == outputScreenHeight
+        && retro.bottomChain.getParameterOverrides() == surfaceState.config.retroShaderParameterOverrides;
+    if (!chainConfigMatches)
+    {
+        retro.topChain.shutdown();
+        retro.bottomChain.shutdown();
+    }
+
+    const bool consumedPrewarmedChains = !chainConfigMatches
+        && takePrewarmedRetroArchChains(configKey, retro.topChain, retro.bottomChain);
+    if (!consumedPrewarmedChains
+        && (!retro.topChain.configure(
+                surfaceState.config.retroShaderPresetPath,
+                sourceScreenWidth,
+                sourceScreenHeight,
+                outputScreenWidth,
+                outputScreenHeight,
+                surfaceState.config.retroShaderParameterOverrides)
+            || !retro.bottomChain.configure(
+                surfaceState.config.retroShaderPresetPath,
+                sourceScreenWidth,
+                sourceScreenHeight,
+                outputScreenWidth,
+                outputScreenHeight,
+                surfaceState.config.retroShaderParameterOverrides)))
+    {
+        retro.topChain.shutdown();
+        retro.bottomChain.shutdown();
+        retro.failedConfigKey = std::move(configKey);
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "VulkanPresenter[RetroArch]: preset failed to compile/load; presenting unfiltered until config changes"
+        );
+        return false;
+    }
+    retro.failedConfigKey.clear();
+
+    auto submitAndWait = [&]() -> bool {
+        if (vkEndCommandBuffer(retro.commandBuffer) != VK_SUCCESS)
+            return false;
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &retro.commandBuffer;
+        {
+            std::scoped_lock queueLock(melonDS::VulkanContext::Get().GetQueueLock());
+            if (vkQueueSubmit(queue, 1, &submitInfo, retro.fence) != VK_SUCCESS)
+                return false;
+        }
+        const VkResult waitResult = vkWaitForFences(device, 1, &retro.fence, VK_TRUE, UINT64_MAX);
+        return waitResult == VK_SUCCESS;
+    };
+
+    auto begin = [&]() -> bool {
+        vkResetFences(device, 1, &retro.fence);
+        if (vkResetCommandBuffer(retro.commandBuffer, 0) != VK_SUCCESS)
+            return false;
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        return vkBeginCommandBuffer(retro.commandBuffer, &beginInfo) == VK_SUCCESS;
+    };
+
+    auto imageBarrier = [&](RetroArchImageResource& resource, VkImageLayout newLayout, VkAccessFlags dstAccess, VkPipelineStageFlags dstStage) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = dstAccess;
+        barrier.oldLayout = resource.layout;
+        barrier.newLayout = newLayout;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = resource.image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(
+            retro.commandBuffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            dstStage,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &barrier);
+        resource.layout = newLayout;
+    };
+
+    const u32 bottomOffsetY = atlasHeight - outputScreenHeight;
+
+    auto sourceAtlasBarrier = [&](VkImageLayout oldLayout, VkImageLayout newLayout, VkAccessFlags srcAccess, VkAccessFlags dstAccess, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = srcAccess;
+        barrier.dstAccessMask = dstAccess;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = sourceAtlasImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(retro.commandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    };
+
+    auto copyScreenInput = [&](RetroArchImageResource& dst, u32 srcY) {
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[0] = {0, static_cast<int32_t>(srcY), 0};
+        blit.srcOffsets[1] = {static_cast<int32_t>(outputScreenWidth), static_cast<int32_t>(srcY + outputScreenHeight), 1};
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.layerCount = 1;
+        blit.dstOffsets[0] = {0, 0, 0};
+        blit.dstOffsets[1] = {static_cast<int32_t>(sourceScreenWidth), static_cast<int32_t>(sourceScreenHeight), 1};
+        vkCmdBlitImage(
+            retro.commandBuffer,
+            sourceAtlasImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            dst.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &blit,
+            VK_FILTER_LINEAR);
+    };
+
+    retro.frameCount++;
+    const bool clearHistory = surfaceState.config.retroShaderClearHistory || retro.frameCount <= 1;
+
+    if (!begin())
+        return false;
+
+    sourceAtlasBarrier(
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    imageBarrier(retro.topInput, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    imageBarrier(retro.bottomInput, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    copyScreenInput(retro.topInput, 0);
+    copyScreenInput(retro.bottomInput, bottomOffsetY);
+
+    sourceAtlasBarrier(
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_ACCESS_TRANSFER_READ_BIT,
+        VK_ACCESS_MEMORY_READ_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+
+    imageBarrier(retro.topInput, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    imageBarrier(retro.bottomInput, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    imageBarrier(retro.topOutput, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    imageBarrier(retro.bottomOutput, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+    if (!retro.topChain.recordFrame(retro.commandBuffer, retro.topInput.image, retro.topOutput.image, retro.frameCount, clearHistory, 16)
+        || !retro.bottomChain.recordFrame(retro.commandBuffer, retro.bottomInput.image, retro.bottomOutput.image, retro.frameCount, clearHistory, 16))
+        return false;
+
+    imageBarrier(retro.atlasOutput, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    imageBarrier(retro.topOutput, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    imageBarrier(retro.bottomOutput, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    auto copyFilteredScreen = [&](RetroArchImageResource& src, u32 dstY) {
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.layerCount = 1;
+        blit.srcOffsets[0] = {0, 0, 0};
+        blit.srcOffsets[1] = {static_cast<int32_t>(outputScreenWidth), static_cast<int32_t>(outputScreenHeight), 1};
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.layerCount = 1;
+        blit.dstOffsets[0] = {0, static_cast<int32_t>(dstY), 0};
+        blit.dstOffsets[1] = {static_cast<int32_t>(outputScreenWidth), static_cast<int32_t>(dstY + outputScreenHeight), 1};
+        vkCmdBlitImage(
+            retro.commandBuffer,
+            src.image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            retro.atlasOutput.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &blit,
+            VK_FILTER_NEAREST);
+    };
+    copyFilteredScreen(retro.topOutput, 0);
+    copyFilteredScreen(retro.bottomOutput, bottomOffsetY);
+    imageBarrier(retro.atlasOutput, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    imageBarrier(retro.topOutput, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    imageBarrier(retro.bottomOutput, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+    if (!submitAndWait())
+        return false;
+
+    outputImage = retro.atlasOutput.image;
+    outputImageView = retro.atlasOutput.imageView;
+    return true;
+}
+
 bool VulkanSurfacePresenter::createTextureFromPixels(BackgroundResource& resource, const VulkanBackgroundImage& backgroundImage)
 {
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
@@ -2331,7 +2960,7 @@ bool VulkanSurfacePresenter::updateVertexBuffer(
         const float uvBottom = directPresent ? 1.0f : (topScreen ? (0.5f - (1.0f / 386.0f)) : 1.0f);
         const u32 drawMode = directPresent
             ? (topScreen ? kDrawModeTopScreen : kDrawModeBottomScreen)
-            : (IsVulkanPostProcessFilter(config.filtering)
+            : (config.filtering != VulkanFilterMode::RetroArch && IsVulkanPostProcessFilter(config.filtering)
                 ? (topScreen ? kDrawModeFilteredCompositeTop : kDrawModeFilteredCompositeBottom)
                 : kDrawModeCompositeFrame);
         const float topVertexUv = directPresent ? uvBottom : uvTop;

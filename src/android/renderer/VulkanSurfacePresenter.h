@@ -2,6 +2,9 @@
 #define VULKANSURFACEPRESENTER_H
 
 #include <android/native_window.h>
+#include <memory>
+#include <string>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -9,6 +12,7 @@
 
 #include "VulkanPerfStats.h"
 #include "renderer/FrameQueue.h"
+#include "renderer/VulkanRetroArchFilterChain.h"
 #include "renderer/VulkanFilterMode.h"
 #include "types.h"
 
@@ -34,6 +38,12 @@ enum class VulkanPresenterBackgroundMode : u32
     FitRight = 5,
 };
 
+enum class RetroArchSourceResolution : u32
+{
+    VulkanIr = 0,
+    Native = 1,
+};
+
 struct VulkanSurfaceConfig
 {
     VulkanPresenterRect topScreen;
@@ -44,6 +54,12 @@ struct VulkanSurfaceConfig
     bool bottomOnTop = false;
     VulkanPresenterBackgroundMode backgroundMode = VulkanPresenterBackgroundMode::Stretch;
     VulkanFilterMode filtering = VulkanFilterMode::Nearest;
+    bool retroShaderEnabled = false;
+    std::string retroShaderPresetPath;
+    RetroArchSourceResolution retroShaderSourceResolution = RetroArchSourceResolution::VulkanIr;
+    u32 retroShaderPassCount = 0;
+    std::vector<std::pair<std::string, float>> retroShaderParameterOverrides;
+    bool retroShaderClearHistory = false;
 };
 
 struct VulkanBackgroundImage
@@ -89,6 +105,11 @@ public:
     bool presentFrame(Frame* frame, VulkanOutput& output, const VulkanCompositionInputs& inputs, u64 timeoutNs);
     bool waitForFrameConsumption(Frame* frame, u64 timeoutNs = UINT64_MAX);
     VulkanPresenterPacingStats takePacingStatsSnapshotAndReset();
+    static bool prewarmRetroArchFilter(
+        const VulkanSurfaceConfig& config,
+        u32 outputScreenWidth,
+        u32 outputScreenHeight);
+    static void clearPrewarmedRetroArchFilters();
 
 private:
     struct SurfaceVertex
@@ -115,8 +136,36 @@ private:
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView imageView = VK_NULL_HANDLE;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
         u32 width = 0;
         u32 height = 0;
+    };
+
+    struct RetroArchImageResource
+    {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView imageView = VK_NULL_HANDLE;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        u32 width = 0;
+        u32 height = 0;
+    };
+
+    struct RetroArchResources
+    {
+        RetroArchImageResource topInput;
+        RetroArchImageResource bottomInput;
+        RetroArchImageResource topOutput;
+        RetroArchImageResource bottomOutput;
+        RetroArchImageResource atlasOutput;
+        VkCommandPool commandPool = VK_NULL_HANDLE;
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VulkanRetroArchFilterChain topChain;
+        VulkanRetroArchFilterChain bottomChain;
+        std::string failedConfigKey;
+        u64 frameCount = 0;
+        bool initialized = false;
     };
 
     struct DescriptorSetCacheState
@@ -183,6 +232,7 @@ private:
         bool timestampPending = false;
 
         BackgroundResource background{};
+        RetroArchResources retroArch{};
     };
 
 private:
@@ -232,6 +282,25 @@ private:
         const std::vector<DrawCall>& drawCalls
     );
     bool submitSurfaceCommands(SurfaceState& surfaceState, u32 imageIndex, u64& presentCpuNs, u64& presentTimelineValueOut);
+    bool ensureRetroArchResources(
+        SurfaceState& surfaceState,
+        u32 sourceScreenWidth,
+        u32 sourceScreenHeight,
+        u32 outputScreenWidth,
+        u32 outputScreenHeight,
+        u32 atlasWidth,
+        u32 atlasHeight);
+    void destroyRetroArchResources(SurfaceState& surfaceState);
+    bool createRetroArchImage(RetroArchImageResource& resource, u32 width, u32 height);
+    void destroyRetroArchImage(RetroArchImageResource& resource);
+    bool runRetroArchFilter(
+        SurfaceState& surfaceState,
+        VkImage sourceAtlasImage,
+        VkImageView sourceAtlasImageView,
+        u32 atlasWidth,
+        u32 atlasHeight,
+        VkImage& outputImage,
+        VkImageView& outputImageView);
 
     u32 findMemoryType(u32 typeBits, VkMemoryPropertyFlags properties) const;
 

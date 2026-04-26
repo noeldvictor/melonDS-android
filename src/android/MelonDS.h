@@ -137,7 +137,7 @@ namespace MelonDSAndroid {
      */
     extern int loadRom(std::string romPath, std::string sramPath, RomGbaSlotConfig* gbaSlotConfig);
     extern int bootFirmware();
-    extern bool precompileVulkanPipelines();
+    extern bool precompileVulkanPipelines(const VulkanSurfaceConfig& retroArchConfig);
     extern void touchScreen(u16 x, u16 y);
     extern void releaseScreen();
     extern void pressKey(u32 key);

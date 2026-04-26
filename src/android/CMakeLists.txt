@@ -18,6 +18,7 @@ set(ANDROID_SOURCES
         renderer/ScreenshotRenderer.cpp
         renderer/FrameQueue.cpp
         renderer/VulkanOutput.cpp
+        renderer/VulkanRetroArchFilterChain.cpp
         renderer/VulkanSurfacePresenter.cpp
         retroachievements/RetroAchievementsManager.cpp
 
@@ -43,3 +44,6 @@ target_include_directories(${PROJECT_NAME} PUBLIC ./)
 target_include_directories(${PROJECT_NAME} PUBLIC ../)
 target_include_directories(${PROJECT_NAME} PUBLIC ../frontend)
 target_link_libraries(melonDS-lib ${android-lib} ${vulkan-lib} core net-utils oboe faad rcheevos EGL GLESv3)
+if (TARGET librashader)
+    target_link_libraries(melonDS-lib librashader)
+endif()

@@ -536,12 +536,12 @@ namespace MelonDSAndroid
             return ROMManager::FIRMWARE_NOT_BOOTABLE;
     }
 
-    bool precompileVulkanPipelines()
+    bool precompileVulkanPipelines(const VulkanSurfaceConfig& retroArchConfig)
     {
         if (!instance)
             return false;
 
-        return instance->precompileVulkanPipelines();
+        return instance->precompileVulkanPipelines(retroArchConfig);
     }
 
     void touchScreen(u16 x, u16 y)
