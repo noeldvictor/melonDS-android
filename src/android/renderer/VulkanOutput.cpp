@@ -554,6 +554,8 @@ u32 VulkanOutput::findMemoryType(u32 typeBits, VkMemoryPropertyFlags properties)
 
 bool VulkanOutput::createFrameResource(Frame* frame, u32 width, u32 height)
 {
+    std::scoped_lock commandLock(commandPoolLock);
+
     VkImageCreateInfo imageCreateInfo{};
     imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -916,6 +918,8 @@ bool VulkanOutput::createFrameResource(Frame* frame, u32 width, u32 height)
 
 void VulkanOutput::destroyFrameResource(Frame* frame)
 {
+    std::scoped_lock commandLock(commandPoolLock);
+
     auto iterator = resources.find(frame);
     if (iterator == resources.end())
         return;
@@ -1764,6 +1768,8 @@ bool VulkanOutput::updatePreparedCapture3dSource(
 
 bool VulkanOutput::captureRenderer3dSnapshot(Frame* frame, const melonDS::VulkanRenderer3D& renderer3D)
 {
+    std::scoped_lock commandLock(commandPoolLock);
+
     if (frame != nullptr)
         frame->renderTimelineValue = 0;
 
@@ -1997,6 +2003,8 @@ bool VulkanOutput::ensureRenderer3dSnapshot(FrameResource& resource, u32 width, 
 
 bool VulkanOutput::recordDirectPresentationPrep(Frame* frame, FrameResource& resource, const melonDS::VulkanRenderer3D& renderer3D)
 {
+    std::scoped_lock commandLock(commandPoolLock);
+
     if (!beginFrameCommand(resource))
         return false;
 
@@ -2184,6 +2192,8 @@ bool VulkanOutput::dispatchCompositor(
     FrameResource& resource,
     const VulkanCompositionInputs& inputs)
 {
+    std::scoped_lock commandLock(commandPoolLock);
+
     if (!beginFrameCommand(resource))
         return false;
 
@@ -2486,6 +2496,8 @@ bool VulkanOutput::validateCompositorSubmission(Frame* frame, const melonDS::Vul
 
 bool VulkanOutput::validateFrameSubmission(Frame* frame, u64 waitTimeoutNs)
 {
+    std::scoped_lock commandLock(commandPoolLock);
+
     if (!initialized || frame == nullptr)
         return false;
 
@@ -2878,6 +2890,8 @@ bool VulkanOutput::readResourceImagePixels(
     size_t destinationPixelCount,
     u64 waitTimeoutNs)
 {
+    std::scoped_lock commandLock(commandPoolLock);
+
     if (!initialized || frame == nullptr || destinationPixels == nullptr || image == VK_NULL_HANDLE || width == 0 || height == 0)
         return false;
 

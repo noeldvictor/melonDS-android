@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <mutex>
 #include <unordered_map>
 #include <vulkan/vulkan.h>
 
@@ -347,6 +348,7 @@ private:
     VkPipeline compositorPipeline{VK_NULL_HANDLE};
 
     std::unordered_map<Frame*, FrameResource> resources;
+    std::mutex commandPoolLock;
     Frame* lastPreparedFrame{nullptr};
     Frame* lastTopRendererSourceFrame{nullptr};
     Frame* lastBottomRendererSourceFrame{nullptr};
