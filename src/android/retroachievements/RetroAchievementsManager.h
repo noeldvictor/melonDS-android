@@ -63,6 +63,7 @@ private:
     static std::string EscapeJson(const std::string& value);
     static void ParseMeasuredProgress(const char* measuredProgress, unsigned int* value, unsigned int* target);
     static int ParseIntegerOrDefault(const char* value, int fallbackValue);
+    static int ParseLeaderboardScoreByFormat(int format, const char* formatted, int fallbackValue);
 
     static std::string GetLeaderboardFormattedValue(int leaderboardId, int value);
 

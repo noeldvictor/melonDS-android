@@ -9,6 +9,9 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
+#include <cerrno>
+#include <limits>
 #include <jni.h>
 #include <sstream>
 #include <thread>
@@ -35,7 +38,9 @@ constexpr u32 RA_DS_LOGICAL_MAIN_RAM_END = 0x00FFFFFF;
 constexpr u32 RA_DS_NATIVE_MAIN_RAM_BASE = 0x02000000;
 constexpr u32 RA_DS_NATIVE_MAIN_RAM_END = 0x02FFFFFF;
 constexpr u32 RA_DS_SHARED_WRAM_BASE = 0x03000000;
-constexpr u32 RA_DS_SHARED_WRAM_END = 0x03FFFFFF;
+constexpr u32 RA_DS_SHARED_WRAM_END = 0x037FFFFF;
+constexpr u32 RA_DS_ARM7_WRAM_BASE = 0x03800000;
+constexpr u32 RA_DS_ARM7_WRAM_END = 0x03FFFFFF;
 constexpr u32 RA_DS_LOGICAL_DTCM_BASE = 0x01000000;
 constexpr u32 RA_DS_NATIVE_DTCM_PSEUDO_BASE = 0x0E000000;
 constexpr u32 RA_DS_DTCM_PSEUDO_SIZE = 0x4000;
@@ -382,6 +387,19 @@ uint32_t ReadMemoryRange(const NDS* nds, uint32_t address, uint8_t* buffer, uint
             nds->SWRAM_ARM9.Mask,
             RA_DS_SHARED_WRAM_BASE,
             RA_DS_SHARED_WRAM_END,
+            address,
+            buffer,
+            numBytes
+        );
+    }
+
+    if (address >= RA_DS_ARM7_WRAM_BASE && address <= RA_DS_ARM7_WRAM_END && nds->ARM7WRAM)
+    {
+        return ReadFromMirroredRegion(
+            nds->ARM7WRAM,
+            nds->ARM7WRAMSize - 1,
+            RA_DS_ARM7_WRAM_BASE,
+            RA_DS_ARM7_WRAM_END,
             address,
             buffer,
             numBytes
@@ -1166,7 +1184,22 @@ void RetroAchievementsManager::CheevosEventHandler(const rc_runtime_event_t* run
 {
     auto eventMessenger = RetroAchievementsManager::EventMessenger.lock();
     if (!eventMessenger)
+    {
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "[RAClient] runtime_event_dropped path=legacy reason=no_messenger type=%d id=%u\n",
+            runtime_event ? (int) runtime_event->type : -1,
+            runtime_event ? runtime_event->id : 0u
+        );
         return;
+    }
+
+    melonDS::Platform::Log(
+        melonDS::Platform::LogLevel::Info,
+        "[RAClient] runtime_event_received path=legacy type=%d id=%u\n",
+        (int) runtime_event->type,
+        runtime_event->id
+    );
 
     switch (runtime_event->type)
     {
@@ -1216,15 +1249,50 @@ void RetroAchievementsManager::CheevosEventHandler(const rc_runtime_event_t* run
 void RetroAchievementsManager::RcClientEventHandler(const rc_client_event_t* event, rc_client_t* client)
 {
     if (!event || !client)
+    {
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "[RAClient] runtime_event_dropped path=rc_client reason=null_event_or_client\n"
+        );
         return;
+    }
 
     auto* manager = static_cast<RetroAchievementsManager*>(rc_client_get_userdata(client));
     if (!manager)
+    {
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "[RAClient] runtime_event_dropped path=rc_client reason=no_manager type=%d\n",
+            (int) event->type
+        );
         return;
+    }
 
     auto eventMessenger = RetroAchievementsManager::EventMessenger.lock();
     if (!eventMessenger)
+    {
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "[RAClient] runtime_event_dropped path=rc_client reason=no_messenger type=%d\n",
+            (int) event->type
+        );
         return;
+    }
+
+    {
+        uint32_t entityId = 0;
+        if (event->achievement) entityId = event->achievement->id;
+        else if (event->leaderboard) entityId = event->leaderboard->id;
+        else if (event->leaderboard_tracker) entityId = event->leaderboard_tracker->id;
+        else if (event->leaderboard_scoreboard) entityId = event->leaderboard_scoreboard->leaderboard_id;
+        else if (event->subset) entityId = event->subset->id;
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Info,
+            "[RAClient] runtime_event_received path=rc_client type=%d id=%u\n",
+            (int) event->type,
+            entityId
+        );
+    }
 
     switch (event->type)
     {
@@ -1247,9 +1315,12 @@ void RetroAchievementsManager::RcClientEventHandler(const rc_client_event_t* eve
                 unsigned int value = 0;
                 unsigned int target = 0;
                 ParseMeasuredProgress(event->achievement->measured_progress, &value, &target);
-                if (value > 0)
-                    eventMessenger->onAchievementProgressUpdated(event->achievement->id, value, target, event->achievement->measured_progress);
+                eventMessenger->onAchievementProgressUpdated(event->achievement->id, value, target, event->achievement->measured_progress ? event->achievement->measured_progress : "");
             }
+            break;
+        case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_HIDE:
+            if (event->achievement)
+                eventMessenger->onAchievementProgressHidden(event->achievement->id);
             break;
         case RC_CLIENT_EVENT_LEADERBOARD_STARTED:
             if (event->leaderboard)
@@ -1260,23 +1331,78 @@ void RetroAchievementsManager::RcClientEventHandler(const rc_client_event_t* eve
             if (event->leaderboard_tracker)
                 eventMessenger->onLeaderboardAttemptUpdated(event->leaderboard_tracker->id, event->leaderboard_tracker->display);
             break;
+        case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_HIDE:
+            if (event->leaderboard_tracker)
+                eventMessenger->onLeaderboardTrackerHidden(event->leaderboard_tracker->id);
+            break;
         case RC_CLIENT_EVENT_LEADERBOARD_FAILED:
             if (event->leaderboard)
                 eventMessenger->onLeaderboardAttemptCanceled(event->leaderboard->id);
             break;
         case RC_CLIENT_EVENT_LEADERBOARD_SUBMITTED:
+        {
+            const int defaultInvalidScore = std::numeric_limits<int>::min();
+            int leaderboardId = 0;
+            int leaderboardFormat = RC_FORMAT_VALUE;
+            bool hasLeaderboardFormat = false;
+            const char* submittedScore = "";
+            const char* bestScore = "";
+
             if (event->leaderboard)
             {
-                int submittedValue = 0;
-                std::string formattedValue;
-                if (event->leaderboard_scoreboard)
-                {
-                    submittedValue = ParseIntegerOrDefault(event->leaderboard_scoreboard->submitted_score, 0);
-                    formattedValue = event->leaderboard_scoreboard->submitted_score;
-                }
-                eventMessenger->onLeaderboardAttemptCompleted(event->leaderboard->id, submittedValue, formattedValue);
+                leaderboardId = event->leaderboard->id;
+                leaderboardFormat = event->leaderboard->format;
+                hasLeaderboardFormat = true;
             }
+            else if (event->leaderboard_scoreboard)
+            {
+                leaderboardId = event->leaderboard_scoreboard->leaderboard_id;
+            }
+
+            if (!hasLeaderboardFormat && leaderboardId != 0 && client)
+            {
+                const rc_client_leaderboard_t* leaderboardInfo = rc_client_get_leaderboard_info(client, leaderboardId);
+                if (leaderboardInfo)
+                {
+                    leaderboardFormat = leaderboardInfo->format;
+                    hasLeaderboardFormat = true;
+                }
+            }
+
+            if (event->leaderboard_scoreboard)
+            {
+                if (event->leaderboard_scoreboard->submitted_score[0] != '\0')
+                    submittedScore = event->leaderboard_scoreboard->submitted_score;
+                else if (event->leaderboard_scoreboard->best_score[0] != '\0')
+                    submittedScore = event->leaderboard_scoreboard->best_score;
+
+                bestScore = event->leaderboard_scoreboard->best_score;
+            }
+
+            int submittedValue = ParseLeaderboardScoreByFormat(leaderboardFormat, submittedScore, defaultInvalidScore);
+            if (submittedValue == defaultInvalidScore && bestScore[0] != '\0' && bestScore != submittedScore)
+            {
+                submittedValue = ParseLeaderboardScoreByFormat(leaderboardFormat, bestScore, defaultInvalidScore);
+            }
+
+            if (submittedValue == defaultInvalidScore)
+            {
+                melonDS::Platform::Log(
+                    melonDS::Platform::LogLevel::Warn,
+                    "[RAClient] leaderboard_score_parse_failed lb_id=%d format=%d submitted='%s' best='%s'\n",
+                    leaderboardId,
+                    hasLeaderboardFormat ? leaderboardFormat : -1,
+                    submittedScore ? submittedScore : "",
+                    bestScore ? bestScore : ""
+                );
+                submittedValue = 0;
+            }
+
+            const char* formattedValue = submittedScore[0] != '\0' ? submittedScore : "0";
+            if (leaderboardId != 0)
+                eventMessenger->onLeaderboardAttemptCompleted(leaderboardId, submittedValue, formattedValue);
             break;
+        }
         case RC_CLIENT_EVENT_GAME_COMPLETED:
             if (event->subset)
                 eventMessenger->onAchievementGameCompleted(event->subset->id);
@@ -1309,11 +1435,14 @@ void RetroAchievementsManager::RcClientEventHandler(const rc_client_event_t* eve
 
 uint32_t RetroAchievementsManager::RcClientReadMemory(uint32_t address, uint8_t* buffer, uint32_t numBytes, rc_client_t* client)
 {
-    if (!client)
+    if (!client || !buffer || numBytes == 0)
         return 0;
 
     auto* manager = static_cast<RetroAchievementsManager*>(rc_client_get_userdata(client));
-    if (!manager)
+    if (!manager || !manager->nds)
+        return 0;
+
+    if (address > std::numeric_limits<uint32_t>::max() - numBytes)
         return 0;
 
     return ReadMemoryRange(manager->nds, address, buffer, numBytes);
@@ -1397,7 +1526,6 @@ bool RetroAchievementsManager::TryActivateRcClientRuntimeLocked()
     rc_client_enable_logging(rcClientRuntime, RC_CLIENT_LOG_LEVEL_WARN, &RcClientLogCallback);
 #endif
     rc_client_set_allow_background_memory_reads(rcClientRuntime, 1);
-    rc_client_set_spectator_mode_enabled(rcClientRuntime, 1);
 
     const auto& config = *runtimeBridgeConfig;
     melonDS::Platform::Log(
@@ -1413,6 +1541,13 @@ bool RetroAchievementsManager::TryActivateRcClientRuntimeLocked()
     rc_client_set_hardcore_enabled(rcClientRuntime, config.hardcoreEnabled ? 1 : 0);
     rc_client_set_unofficial_enabled(rcClientRuntime, config.unofficialEnabled ? 1 : 0);
     rc_client_set_encore_mode_enabled(rcClientRuntime, config.encoreEnabled ? 1 : 0);
+    melonDS::Platform::Log(
+        melonDS::Platform::LogLevel::Info,
+        "[RAClient] runtime_flags_applied hardcore=%d unofficial=%d encore=%d\n",
+        config.hardcoreEnabled ? 1 : 0,
+        config.unofficialEnabled ? 1 : 0,
+        config.encoreEnabled ? 1 : 0
+    );
 
     RcClientWaitResult loginWaitResult;
     bool loginSucceeded = false;
@@ -1706,12 +1841,181 @@ int RetroAchievementsManager::ParseIntegerOrDefault(const char* value, int fallb
     if (!value || value[0] == '\0')
         return fallbackValue;
 
+    const size_t valueLength = strlen(value);
+    std::string normalizedValue;
+    normalizedValue.reserve(valueLength);
+
+    for (size_t index = 0; index < valueLength; ++index)
+    {
+        const char currentCharacter = value[index];
+        if (std::isdigit(static_cast<unsigned char>(currentCharacter)))
+            normalizedValue.push_back(currentCharacter);
+        else if ((currentCharacter == '+' || currentCharacter == '-') && normalizedValue.empty())
+            normalizedValue.push_back(currentCharacter);
+        else if (currentCharacter == ',' || currentCharacter == '.' || currentCharacter == '_' || currentCharacter == '\'' || std::isspace(static_cast<unsigned char>(currentCharacter)))
+            continue;
+        else
+            return fallbackValue;
+    }
+
+    if (normalizedValue.empty() || normalizedValue == "+" || normalizedValue == "-")
+        return fallbackValue;
+
     char* end = nullptr;
-    long parsedValue = strtol(value, &end, 10);
-    if (end == value || (end && *end != '\0'))
+    errno = 0;
+    long long parsedValue = std::strtoll(normalizedValue.c_str(), &end, 10);
+    if (end == normalizedValue.c_str() || (end && *end != '\0') || errno == ERANGE)
+        return fallbackValue;
+
+    if (parsedValue > std::numeric_limits<int>::max() || parsedValue < std::numeric_limits<int>::min())
         return fallbackValue;
 
     return (int) parsedValue;
+}
+
+int RetroAchievementsManager::ParseLeaderboardScoreByFormat(int format, const char* formatted, int fallbackValue)
+{
+    if (!formatted || formatted[0] == '\0')
+        return fallbackValue;
+
+    switch (format)
+    {
+        case RC_FORMAT_VALUE:
+        case RC_FORMAT_SCORE:
+        case RC_FORMAT_UNSIGNED_VALUE:
+        case RC_FORMAT_UNFORMATTED:
+        case RC_FORMAT_TENS:
+        case RC_FORMAT_HUNDREDS:
+        case RC_FORMAT_THOUSANDS:
+            return ParseIntegerOrDefault(formatted, fallbackValue);
+
+        case RC_FORMAT_FRAMES:
+        case RC_FORMAT_CENTISECS:
+        {
+            int hours = 0, minutes = 0, seconds = 0, centiseconds = 0;
+            bool parsed = false;
+            if (sscanf(formatted, "%dh%d:%d.%d", &hours, &minutes, &seconds, &centiseconds) == 4)
+                parsed = true;
+            else if (sscanf(formatted, "%d:%d:%d.%d", &hours, &minutes, &seconds, &centiseconds) == 4)
+                parsed = true;
+            else if (sscanf(formatted, "%d:%d.%d", &minutes, &seconds, &centiseconds) == 3)
+            {
+                hours = 0;
+                parsed = true;
+            }
+
+            if (!parsed)
+                return fallbackValue;
+
+            long long totalCentiseconds = (long long) hours * 360000 + (long long) minutes * 6000 + (long long) seconds * 100 + centiseconds;
+            long long resultValue = totalCentiseconds;
+            if (format == RC_FORMAT_FRAMES)
+                resultValue = totalCentiseconds * 6 / 10;
+
+            if (resultValue > std::numeric_limits<int>::max() || resultValue < 0)
+                return fallbackValue;
+            return (int) resultValue;
+        }
+
+        case RC_FORMAT_SECONDS:
+        {
+            int hours = 0, minutes = 0, seconds = 0;
+            if (sscanf(formatted, "%dh%d:%d", &hours, &minutes, &seconds) == 3 ||
+                sscanf(formatted, "%d:%d:%d", &hours, &minutes, &seconds) == 3)
+            {
+                long long total = (long long) hours * 3600 + (long long) minutes * 60 + seconds;
+                if (total > std::numeric_limits<int>::max() || total < 0)
+                    return fallbackValue;
+                return (int) total;
+            }
+            if (sscanf(formatted, "%d:%d", &minutes, &seconds) == 2)
+            {
+                long long total = (long long) minutes * 60 + seconds;
+                if (total > std::numeric_limits<int>::max() || total < 0)
+                    return fallbackValue;
+                return (int) total;
+            }
+            return fallbackValue;
+        }
+
+        case RC_FORMAT_MINUTES:
+        {
+            int hours = 0, minutes = 0;
+            if (sscanf(formatted, "%dh%d", &hours, &minutes) == 2 ||
+                sscanf(formatted, "%d:%d", &hours, &minutes) == 2)
+            {
+                long long total = (long long) hours * 60 + minutes;
+                if (total > std::numeric_limits<int>::max() || total < 0)
+                    return fallbackValue;
+                return (int) total;
+            }
+            return ParseIntegerOrDefault(formatted, fallbackValue);
+        }
+
+        case RC_FORMAT_SECONDS_AS_MINUTES:
+        {
+            int hours = 0, minutes = 0;
+            if (sscanf(formatted, "%dh%d", &hours, &minutes) == 2 ||
+                sscanf(formatted, "%d:%d", &hours, &minutes) == 2)
+            {
+                long long totalMinutes = (long long) hours * 60 + minutes;
+                long long total = totalMinutes * 60;
+                if (total > std::numeric_limits<int>::max() || total < 0)
+                    return fallbackValue;
+                return (int) total;
+            }
+            return fallbackValue;
+        }
+
+        case RC_FORMAT_FLOAT1:
+        case RC_FORMAT_FIXED1:
+        {
+            double parsedDouble = 0.0;
+            if (sscanf(formatted, "%lf", &parsedDouble) == 1)
+                return (int) (parsedDouble * 10.0);
+            return fallbackValue;
+        }
+        case RC_FORMAT_FLOAT2:
+        case RC_FORMAT_FIXED2:
+        {
+            double parsedDouble = 0.0;
+            if (sscanf(formatted, "%lf", &parsedDouble) == 1)
+                return (int) (parsedDouble * 100.0);
+            return fallbackValue;
+        }
+        case RC_FORMAT_FLOAT3:
+        case RC_FORMAT_FIXED3:
+        {
+            double parsedDouble = 0.0;
+            if (sscanf(formatted, "%lf", &parsedDouble) == 1)
+                return (int) (parsedDouble * 1000.0);
+            return fallbackValue;
+        }
+        case RC_FORMAT_FLOAT4:
+        {
+            double parsedDouble = 0.0;
+            if (sscanf(formatted, "%lf", &parsedDouble) == 1)
+                return (int) (parsedDouble * 10000.0);
+            return fallbackValue;
+        }
+        case RC_FORMAT_FLOAT5:
+        {
+            double parsedDouble = 0.0;
+            if (sscanf(formatted, "%lf", &parsedDouble) == 1)
+                return (int) (parsedDouble * 100000.0);
+            return fallbackValue;
+        }
+        case RC_FORMAT_FLOAT6:
+        {
+            double parsedDouble = 0.0;
+            if (sscanf(formatted, "%lf", &parsedDouble) == 1)
+                return (int) (parsedDouble * 1000000.0);
+            return fallbackValue;
+        }
+
+        default:
+            return ParseIntegerOrDefault(formatted, fallbackValue);
+    }
 }
 
 std::string RetroAchievementsManager::GetLeaderboardFormattedValue(int leaderboardId, int value)
