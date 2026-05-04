@@ -427,7 +427,7 @@ namespace MelonDSAndroid
             currentConfiguration,
             std::move(args),
             net,
-            ScreenshotRenderer(screenshotBufferPointer),
+            std::make_unique<ScreenshotRenderer>(screenshotBufferPointer),
             currentConfiguration->consoleType
         );
 
@@ -1304,6 +1304,14 @@ namespace MelonDSAndroid
             return RewindWindow{};
 
         return instance->getRewindWindow();
+    }
+
+    bool takeScreenshot()
+    {
+        if (instance)
+            return instance->takeScreenshot();
+
+        return false;
     }
 
     void stop()

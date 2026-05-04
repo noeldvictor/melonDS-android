@@ -28,7 +28,7 @@ class MelonInstance
 {
 
 public:
-    MelonInstance(int instanceId, std::shared_ptr<EmulatorConfiguration> configuration, std::unique_ptr<melonDS::NDSArgs> args, std::shared_ptr<Net> net, ScreenshotRenderer screenshotRenderer, int consoleType);
+    MelonInstance(int instanceId, std::shared_ptr<EmulatorConfiguration> configuration, std::unique_ptr<melonDS::NDSArgs> args, std::shared_ptr<Net> net, std::unique_ptr<ScreenshotRenderer> screenshotRenderer, int consoleType);
     ~MelonInstance();
 
     int getInstanceId() { return instanceId; };
@@ -54,6 +54,7 @@ public:
     void setSlot2AnalogInput(float x, float y);
     int readAudioOutput(s16* buffer, int length);
     void setAudioOutputSkew(double skew);
+    bool takeScreenshot();
     void loadCheats(std::list<Cheat> cheats);
     int sendNetPacket(u8* data, int length);
     int receiveNetPacket(u8* data);
@@ -241,7 +242,7 @@ private:
     std::atomic_bool openGlDebugSnapshotRequested = false;
     mutable std::mutex denseScreenBurstCaptureMutex;
     DenseScreenBurstCapture denseScreenBurstCapture;
-    ScreenshotRenderer screenshotRenderer;
+    std::unique_ptr<ScreenshotRenderer> screenshotRenderer;
     RewindManager rewindManager;
     Renderer currentRenderer;
     bool isRenderConfigurationDirty;

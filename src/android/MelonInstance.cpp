@@ -832,13 +832,13 @@ bool CopyCompositedFrameToScreenshot(
     return true;
 }
 
-MelonInstance::MelonInstance(int instanceId, std::shared_ptr<EmulatorConfiguration> configuration, std::unique_ptr<melonDS::NDSArgs> args, std::shared_ptr<Net> net, ScreenshotRenderer screenshotRenderer, int consoleType) :
+MelonInstance::MelonInstance(int instanceId, std::shared_ptr<EmulatorConfiguration> configuration, std::unique_ptr<melonDS::NDSArgs> args, std::shared_ptr<Net> net, std::unique_ptr<ScreenshotRenderer> screenshotRenderer, int consoleType) :
     instanceId(instanceId),
     currentConfiguration(configuration),
     net(net),
     lastCompletedVulkanFrame(nullptr),
     lastCompletedVulkanScale(1),
-    screenshotRenderer(screenshotRenderer),
+    screenshotRenderer(std::move(screenshotRenderer)),
     consoleType(consoleType),
     rewindManager(configuration->rewindEnabled, configuration->rewindLengthSeconds, configuration->rewindCaptureSpacingSeconds, kRewindBufferSize, kRewindScreenshotSize),
     vulkanRuntimeConfigLogged(false),
@@ -1168,7 +1168,7 @@ void MelonInstance::start()
     vulkanRuntimeFailureHandled = false;
     vulkanPrepareFailureCount = 0;
     if (currentConfiguration->renderer != Renderer::Vulkan)
-        screenshotRenderer.init();
+        screenshotRenderer->init();
 }
 
 void MelonInstance::reset()
@@ -1503,7 +1503,7 @@ u32 MelonInstance::runFrame()
     {
         lastCompletedVulkanFrame = nullptr;
         lastCompletedVulkanScale = 1;
-        screenshotRenderer.renderScreenshot(&nds->GPU, currentRenderer, renderFrame);
+        screenshotRenderer->renderScreenshot(&nds->GPU, currentRenderer, renderFrame);
     }
 
     const int nextFrame = frame + 1;
@@ -1554,6 +1554,14 @@ u32 MelonInstance::runFrame()
         firmwareSave->CheckFlush();
 
     frame = nextFrame;
+    if (screenshotRenderer->isScreenshotPending()) [[unlikely]]
+    {
+        if (currentRenderer == Renderer::Vulkan)
+            (void)updateVulkanScreenshot(hasValidFrame ? renderFrame : lastCompletedVulkanFrame, hasValidFrame ? std::max(vulkanRenderScale, 1) : lastCompletedVulkanScale, true);
+        else
+            screenshotRenderer->renderScreenshot(&nds->GPU, currentRenderer, renderFrame);
+    }
+
     if (shouldCaptureRewindState)
     {
         auto nextRewindState = rewindManager.GetNextRewindSaveState(frame);
@@ -1601,7 +1609,7 @@ void MelonInstance::stop()
     lastCompletedVulkanFrame = nullptr;
     lastCompletedVulkanScale = 1;
     frameQueue.clear();
-    screenshotRenderer.cleanup();
+    screenshotRenderer->cleanup();
     vulkanRuntimeFailureHandled = false;
     vulkanPrepareFailureCount = 0;
 }
@@ -1658,6 +1666,11 @@ int MelonInstance::readAudioOutput(s16* buffer, int length)
 void MelonInstance::setAudioOutputSkew(double skew)
 {
     nds->SPU.SetOutputSkew(skew);
+}
+
+bool MelonInstance::takeScreenshot()
+{
+    return screenshotRenderer->takeScreenshot();
 }
 
 void MelonInstance::loadCheats(std::list<Cheat> cheats)
@@ -1976,7 +1989,7 @@ std::vector<u32> MelonInstance::captureCurrentFrameForDebug()
         (void)updateVulkanScreenshot(lastCompletedVulkanFrame, lastCompletedVulkanScale, true);
     }
 
-    const u32* screenshot = screenshotRenderer.getScreenshot();
+    const u32* screenshot = screenshotRenderer->getScreenshot();
     if (screenshot == nullptr)
         return {};
 
@@ -2134,7 +2147,7 @@ std::vector<u32> MelonInstance::captureCurrentPackedPrimaryForDebug(bool topScre
             && lastCompletedVulkanFrame != nullptr
             && updateVulkanScreenshot(lastCompletedVulkanFrame, lastCompletedVulkanScale, true))
         {
-            const u32* screenshot = screenshotRenderer.getScreenshot();
+            const u32* screenshot = screenshotRenderer->getScreenshot();
             if (screenshot != nullptr)
             {
                 std::vector<u32> pixels(static_cast<size_t>(kScreenshotScreenWidth) * static_cast<size_t>(kScreenshotScreenHeight));
@@ -2739,7 +2752,7 @@ std::vector<u32> MelonInstance::captureLiveScreenFrameForDebug(Frame* frameOverr
             return {};
     }
 
-    const u32* screenshot = screenshotRenderer.getScreenshot();
+    const u32* screenshot = screenshotRenderer->getScreenshot();
     if (screenshot == nullptr)
         return {};
 
@@ -3300,7 +3313,7 @@ bool MelonInstance::ensurePreparedVulkanDebugSnapshot(Frame* frame, VulkanRender
 
     if (updateVulkanScreenshot(frame, lastCompletedVulkanScale, true))
     {
-        const u32* screenshot = screenshotRenderer.getScreenshot();
+        const u32* screenshot = screenshotRenderer->getScreenshot();
         if (screenshot != nullptr)
         {
             preparedVulkanDebugSnapshot.screenFrame.assign(
@@ -3881,7 +3894,7 @@ bool MelonInstance::updateVulkanScreenshot(Frame* frame, int scale, bool clearOn
     const size_t screenshotPixelCount = static_cast<size_t>(kScreenshotScreenWidth) * static_cast<size_t>(kScreenshotScreenHeight) * 2;
     auto clearScreenshot = [&]() {
         if (clearOnFailure)
-            std::fill_n(screenshotRenderer.getScreenshot(), screenshotPixelCount, 0u);
+            std::fill_n(screenshotRenderer->getScreenshot(), screenshotPixelCount, 0u);
     };
 
     if (currentRenderer != Renderer::Vulkan || vulkanOutput == nullptr || frame == nullptr || scale < 1)
@@ -3923,7 +3936,7 @@ bool MelonInstance::updateVulkanScreenshot(Frame* frame, int scale, bool clearOn
         static_cast<int>(frame->width),
         static_cast<int>(frame->height),
         scale,
-        screenshotRenderer.getScreenshot(),
+        screenshotRenderer->getScreenshot(),
         screenshotPixelCount
     );
     if (!copied)
@@ -4148,7 +4161,7 @@ void MelonInstance::saveRewindState(RewindSaveState* rewindSaveState)
     if (saveState(savestate, false))
     {
         rewindSaveState->bufferContentSize = savestate->Length();
-        memcpy(rewindSaveState->screenshot, screenshotRenderer.getScreenshot(), rewindSaveState->screenshotSize);
+        memcpy(rewindSaveState->screenshot, screenshotRenderer->getScreenshot(), rewindSaveState->screenshotSize);
     }
 
     delete savestate;
