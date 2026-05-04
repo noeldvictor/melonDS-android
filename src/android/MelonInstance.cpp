@@ -3596,8 +3596,13 @@ bool MelonInstance::loadState(Savestate* state)
         return false;
 
     const bool loaded = nds->DoSavestate(state);
-    if (loaded && currentRenderer == Renderer::Vulkan)
-        requestVulkanPresentationResync();
+    if (loaded)
+    {
+        setBatteryLevels();
+        setDateTime();
+        if (currentRenderer == Renderer::Vulkan)
+            requestVulkanPresentationResync();
+    }
     return loaded;
 }
 
