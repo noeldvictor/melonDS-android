@@ -53,6 +53,11 @@ struct PresenterPushConstants
     u32 previousTopSourceValid;
     u32 previousBottomSourceValid;
     u32 captureSourceValid;
+    u32 liveSourceScreenSwap;
+    u32 class4VramStructuredPair;
+    u32 class4NoAboveVramStructuredPair;
+    u32 class4PreservePackedVramValid;
+    u32 class4PreservePackedVramScreenSwap;
     float viewportWidth;
     float viewportHeight;
 };
@@ -963,14 +968,11 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
             return surfaceState.configured
                 && IsVulkanPostProcessFilter(surfaceState.config.filtering);
         });
-	    const bool directPresentRequested = !inputs.needsReadback
-	        && !inputs.validationMode
+    const bool directPresentRequested = !inputs.needsReadback
+        && !inputs.validationMode
         && !postProcessFilterRequested
-	        && !hasDualScreenSurface
+        && !hasDualScreenSurface
         && hasRequiredDirectHandles
-        // The direct presenter path is kept for GL-style current-only frames.
-        // Frames that need capture or physical-LCD previous source recovery use
-        // the offscreen compositor so exact-frame 3D stays aligned on both screens.
         && !inputs.capture3dSourceValid
         && !inputs.previousTopSourceValid
         && !inputs.previousBottomSourceValid;
@@ -3238,6 +3240,11 @@ bool VulkanSurfacePresenter::recordSurfaceCommands(
         pushConstants.previousTopSourceValid = inputs.previousTopSourceValid ? 1u : 0u;
         pushConstants.previousBottomSourceValid = inputs.previousBottomSourceValid ? 1u : 0u;
         pushConstants.captureSourceValid = inputs.capture3dSourceValid ? 1u : 0u;
+        pushConstants.liveSourceScreenSwap = inputs.liveSourceScreenSwap ? 1u : 0u;
+        pushConstants.class4VramStructuredPair = inputs.class4VramStructuredPair ? 1u : 0u;
+        pushConstants.class4NoAboveVramStructuredPair = inputs.class4NoAboveVramStructuredPair ? 1u : 0u;
+        pushConstants.class4PreservePackedVramValid = inputs.class4PreservePackedVramValid ? 1u : 0u;
+        pushConstants.class4PreservePackedVramScreenSwap = inputs.class4PreservePackedVramScreenSwap ? 1u : 0u;
         pushConstants.viewportWidth = drawCall.viewportWidth;
         pushConstants.viewportHeight = drawCall.viewportHeight;
         if (MelonDSAndroid::areRendererDebugBgObjLogsEnabled())

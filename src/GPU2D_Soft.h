@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <cstddef>
+
 #include "GPU2D.h"
 
 namespace melonDS
@@ -43,6 +45,20 @@ public:
         u32 CaptureDestinationBlankLines = 0;
         u32 Opaque3DSourcePixels = 0;
         u32 Opaque3DBackdropPixels = 0;
+        u32 SourceAOutputUsefulPixels = 0;
+        u32 SourceAOutputVisiblePixels = 0;
+        u32 SourceAOutputOpaqueBlackPixels = 0;
+        u32 StructuredCopyLines = 0;
+        u32 StructuredCopyPlane0UsefulPixels = 0;
+        u32 StructuredCopyPlane1UsefulPixels = 0;
+        u32 StructuredCopySlotPixels = 0;
+        u32 StructuredCopyAbovePixels = 0;
+        u32 StructuredCopy2DOnlyPixels = 0;
+        u32 StructuredCopySourceBOverlayPixels = 0;
+        u32 CaptureBacked3DLines = 0;
+        u32 CaptureBacked3DNoBestClassLines = 0;
+        u32 CaptureBacked3DExplicitSlotLines = 0;
+        u32 CaptureBacked3DBestClassCounts[17] {};
         u32 CompModeCounts[8] {};
     };
 
@@ -55,7 +71,15 @@ public:
     [[nodiscard]] const DebugCaptureStats& GetDebugCaptureStats() const noexcept { return LastDebugCaptureStats; }
     [[nodiscard]] const u32* GetDebugCapture3dSource() const noexcept { return HasLastDebugCapture3dSource ? LastDebugCapture3dSource : nullptr; }
     [[nodiscard]] const std::array<u8, 192>& GetDebugCaptureLineUses3dMask() const noexcept { return CaptureLineUses3d; }
+    [[nodiscard]] const u32* GetStructuredVulkan2DPlane(bool topScreen, u32 plane) const noexcept;
+    void ClearStructuredVulkan2DState() noexcept;
 private:
+    static constexpr size_t kStructuredScreenWidth = 256;
+    static constexpr size_t kStructuredScreenHeight = 192;
+    static constexpr size_t kStructuredPixelCount = kStructuredScreenWidth * kStructuredScreenHeight;
+    static constexpr size_t kStructuredPlaneCount = 3;
+    static constexpr size_t kStructuredScreenCount = 2;
+
     melonDS::GPU& GPU;
     alignas(8) u32 BGOBJLine[256*3];
     u32* _3DLine;
@@ -137,6 +161,47 @@ private:
         return rb | g | 0xFF000000;
     }
     u32 ColorComposite(int i, u32 val1, u32 val2) const;
+    void ClearStructuredVulkan2DLine(u32 line);
+    void ClearStructuredVulkan2DCapture(u32 vramBank);
+    void ClearStructuredVulkan2DCaptureRange(u32 vramBank, u32 dstAddress, u32 width);
+    void SaveStructuredVulkan2DCaptureSourceLine(u32 line);
+    void CopyStructuredVulkan2DCaptureSourceLineToCapture(u32 line, u32 vramBank, u32 dstAddress, u32 width);
+    void CopyStructuredVulkan2DCurrentLineToCapture(u32 line, u32 vramBank, u32 dstAddress, u32 width);
+    void CopyStructuredVulkan2DCaptureLineToCurrentScreen(u32 line, u32 vramBank);
+    bool ReadStructuredVulkan2DCapture2DOverlayPixel(
+        u32 vramBank,
+        u32 vramAddress,
+        u32& overlayPixel,
+        u32& overlayControlAlpha) const noexcept;
+    void MergeStructuredVulkan2DCapture2DOverlayPixel(
+        u32 vramBank,
+        u32 vramAddress,
+        u32 overlayPixel,
+        u32 overlayControlAlpha);
+    [[nodiscard]] bool CurrentUnitTargetsTopScreen() const noexcept;
+    void StoreStructuredVulkan2DPixel(
+        u32 line,
+        u32 x,
+        u32 originalVal1,
+        u32 originalVal2,
+        u32 originalVal3,
+        u32 legacyVal1,
+        u32 legacyVal2,
+        u32 legacyControl,
+        u32 captureBacked3DSourceClass);
+    void StoreStructuredVulkan2DCapturePixel(
+        u32 vramBank,
+        u32 vramAddress,
+        u32 originalVal1,
+        u32 originalVal2,
+        u32 originalVal3,
+        u32 legacyVal1,
+        u32 legacyVal2,
+        u32 legacyControl,
+        u32 external3DSourceClass,
+        bool external3DSlot,
+        bool external3DCoverage,
+        bool allowUnclassifiedExternal3DSlot);
 
     template<u32 bgmode> void DrawScanlineBGMode(u32 line);
     void DrawScanlineBGMode6(u32 line);
@@ -145,6 +210,8 @@ private:
 
     static void DrawPixel_Normal(u32* dst, u16 color, u32 flag);
     static void DrawPixel_Accel(u32* dst, u16 color, u32 flag);
+    static void PushRawPixel_Accel(u32* dst, u32 value);
+    bool TryDrawStructuredVulkan2DCapturePixel(u32* dst, u32 flatByteAddress);
 
     typedef void (*DrawPixel)(u32* dst, u16 color, u32 flag);
 
@@ -166,6 +233,14 @@ private:
     bool HasLastDebugCapture3dSource = false;
     alignas(8) u32 LastDebugCapture3dSource[256 * 192] {};
     std::array<u8, 192> CaptureLineUses3d {};
+    bool CurrentLineRegularCaptureUses3d = false;
+    std::array<u32, kStructuredScreenCount * kStructuredPlaneCount * kStructuredPixelCount> StructuredVulkan2DPlanes {};
+    std::array<u32, kStructuredPlaneCount * kStructuredScreenWidth> StructuredVulkan2DCaptureSourceLine {};
+    bool StructuredVulkan2DCaptureSourceLineValid = false;
+    u32 StructuredVulkan2DCaptureSourceLineY = 0;
+    bool StructuredVulkan2DCurrentLineTargetsTop = false;
+    std::array<u32, 4 * kStructuredPlaneCount * kStructuredPixelCount> StructuredVulkan2DCapturePlanes {};
+    std::array<u8, 4 * kStructuredScreenHeight> StructuredVulkan2DCaptureLineValid {};
 };
 
 }

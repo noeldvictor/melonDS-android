@@ -56,6 +56,7 @@ public:
     void SetupAccelFrame() override;
     void PrepareCaptureFrame() override;
     void BeginCaptureFrame() override;
+    void SetCaptureScreenSwapHint(bool screenSwap) override;
     void Blit(const GPU& gpu) override;
     void Stop(const GPU& gpu) override;
 
@@ -87,6 +88,11 @@ public:
     [[nodiscard]] bool IsDebug3dClearMagentaEnabled() const noexcept { return Debug3dClearMagenta; }
     [[nodiscard]] size_t GetAsyncRenderContextCount() const noexcept { return AsyncRenderContextCount; }
     [[nodiscard]] bool WaitsForReadbackSourceOnly() const noexcept { return true; }
+    [[nodiscard]] bool GetCurrentRenderScreenSwap() const noexcept { return CurrentRenderScreenSwap; }
+    [[nodiscard]] bool IsCurrentCaptureScreenSwapHintValid() const noexcept { return HasCurrentCaptureScreenSwapHint; }
+    [[nodiscard]] bool GetCurrentCaptureScreenSwapHint() const noexcept { return CurrentCaptureScreenSwapHint; }
+    [[nodiscard]] bool IsLastValidExactCaptureAvailable() const noexcept { return HasLastValidExactCapture; }
+    [[nodiscard]] bool GetLastValidExactCaptureScreenSwap() const noexcept { return LastValidExactCaptureScreenSwap; }
     [[nodiscard]] bool EnsureVulkanReadyForValidation();
     [[nodiscard]] bool HasColorTarget() const noexcept { return ColorImage != VK_NULL_HANDLE && ColorImageView != VK_NULL_HANDLE; }
     [[nodiscard]] bool IsColorTargetInitialized() const noexcept { return ColorImageInitialized; }
@@ -597,6 +603,11 @@ private:
         GraphicsWModeCount * GraphicsDepthCompareModeCount * GraphicsDepthWriteModeCount * GraphicsFogWriteModeCount * GraphicsAlphaBlendModeCount;
     static constexpr u32 GraphicsEdgeMarkPipelineCount = GraphicsWModeCount;
     std::array<VkPipeline, GraphicsOpaquePipelineCount> GraphicsOpaquePipelines{};
+    std::array<VkPipeline, GraphicsOpaquePipelineCount> GraphicsOpaqueFastModulatePipelines{};
+    std::array<VkPipeline, GraphicsOpaquePipelineCount> GraphicsOpaqueFastModulateToonPipelines{};
+    std::array<VkPipeline, GraphicsOpaquePipelineCount> GraphicsOpaqueFastModulatePlainPipelines{};
+    std::array<VkPipeline, GraphicsOpaquePipelineCount> GraphicsOpaqueFastModulateOpaqueAlphaToonPipelines{};
+    std::array<VkPipeline, GraphicsOpaquePipelineCount> GraphicsOpaqueFastModulateOpaqueAlphaPlainPipelines{};
     std::array<VkPipeline, GraphicsTranslucentPipelineCount> GraphicsTranslucentPipelines{};
     std::array<VkPipeline, GraphicsBgZeroTranslucentPipelineCount> GraphicsBgZeroTranslucentPipelines{};
     std::array<VkPipeline, GraphicsShadowMaskPipelineCount> GraphicsShadowMaskPipelines{};
@@ -608,6 +619,7 @@ private:
     VkPipeline GraphicsClearPipeline = VK_NULL_HANDLE;
     VkPipeline GraphicsStencilBitClearPipeline = VK_NULL_HANDLE;
     VkPipeline GraphicsFinalEdgePipeline = VK_NULL_HANDLE;
+    VkPipeline GraphicsFinalEdgeFogPipeline = VK_NULL_HANDLE;
     VkPipeline GraphicsFinalFogPipeline = VK_NULL_HANDLE;
     VkRenderPass GraphicsRasterRenderPass = VK_NULL_HANDLE;
     VkRenderPass GraphicsFinalRenderPass = VK_NULL_HANDLE;
@@ -712,6 +724,8 @@ private:
     u32 ActiveCaptureLineBufferSlot = 0;
     int PendingCaptureLineBufferSlot = -1;
     int ReadyCaptureLineBufferSlot = -1;
+    bool PendingCaptureLineScreenSwap = false;
+    bool ReadyCaptureLineScreenSwap = false;
 
     VkImage FallbackTextureImage = VK_NULL_HANDLE;
     VkDeviceMemory FallbackTextureMemory = VK_NULL_HANDLE;
@@ -740,6 +754,10 @@ private:
     u32 ExactCaptureFallbackPackedColor = 0;
     bool ExactCaptureFallbackValid = false;
     bool HasLastValidExactCapture = false;
+    bool LastValidExactCaptureScreenSwap = false;
+    bool CurrentCaptureScreenSwapHint = false;
+    bool HasCurrentCaptureScreenSwapHint = false;
+    bool CurrentRenderScreenSwap = false;
     PFN_vkResetQueryPoolEXT ResetQueryPool = nullptr;
     float TimestampPeriodNs = 0.0f;
     bool TimestampQueriesSupported = false;
@@ -776,6 +794,24 @@ private:
     u32 LastGraphicsOpaqueDrawCount = 0;
     u32 LastGraphicsNeedOpaqueDrawCount = 0;
     u32 LastGraphicsAlphaDrawCount = 0;
+    u32 LastGraphicsOpaqueWDrawCount = 0;
+    u32 LastGraphicsOpaqueZDrawCount = 0;
+    u32 LastGraphicsOpaqueTexturedDrawCount = 0;
+    u32 LastGraphicsOpaqueUntexturedDrawCount = 0;
+    u32 LastGraphicsOpaqueModulateDrawCount = 0;
+    u32 LastGraphicsOpaqueDecalDrawCount = 0;
+    u32 LastGraphicsOpaqueToonDrawCount = 0;
+    u32 LastGraphicsOpaqueHighlightDrawCount = 0;
+    u32 LastGraphicsOpaqueLinearDrawCount = 0;
+    u32 LastGraphicsOpaqueRepeatDrawCount = 0;
+    u32 LastGraphicsOpaqueMirrorDrawCount = 0;
+    u32 LastGraphicsOpaqueRepeatSDrawCount = 0;
+    u32 LastGraphicsOpaqueRepeatTDrawCount = 0;
+    u32 LastGraphicsOpaqueMirrorSDrawCount = 0;
+    u32 LastGraphicsOpaqueMirrorTDrawCount = 0;
+    u32 LastGraphicsOpaqueClampSDrawCount = 0;
+    u32 LastGraphicsOpaqueClampTDrawCount = 0;
+    u32 LastGraphicsOpaqueFullAlphaDrawCount = 0;
     u64 ContextMissCount = 0;
     u64 LateFrameCount = 0;
     u64 DroppedFrameCount = 0;

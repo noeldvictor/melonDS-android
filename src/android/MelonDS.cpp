@@ -44,6 +44,7 @@ namespace MelonDSAndroid
         bool fastForwardActive = false;
         std::atomic_bool rendererDebugToolsEnabled = false;
         std::atomic_bool rendererDebugBgObjEnabled = false;
+        std::atomic_bool rendererDebugLatchTraceEnabled = false;
         std::atomic_uint vulkanDiagnosticFlags = 0;
         constexpr int kRenderer2DDebugNativeMode = -1;
         constexpr u32 kRenderer2DDebugAllFeatures =
@@ -142,7 +143,7 @@ namespace MelonDSAndroid
 
         bool RendererDebugControlsAvailable()
         {
-            return MELONDS_ANDROID_DEBUG_BUILD != 0;
+            return true;
         }
 
         bool RendererDebugControlsEnabled()
@@ -242,6 +243,26 @@ namespace MelonDSAndroid
                     return static_cast<const OpenGlRenderSettings&>(*configuration.renderSettings).rendererDebugBgObjEnabled;
                 case Renderer::Vulkan:
                     return static_cast<const VulkanRenderSettings&>(*configuration.renderSettings).rendererDebugBgObjEnabled;
+                case Renderer::Compute:
+                    return false;
+            }
+
+            return false;
+        }
+
+        bool ResolveRendererDebugLatchTraceEnabled(const EmulatorConfiguration& configuration)
+        {
+            if (!configuration.renderSettings)
+                return false;
+
+            switch (configuration.renderer)
+            {
+                case Renderer::Software:
+                    return static_cast<const SoftwareRenderSettings&>(*configuration.renderSettings).rendererDebugLatchTraceEnabled;
+                case Renderer::OpenGl:
+                    return static_cast<const OpenGlRenderSettings&>(*configuration.renderSettings).rendererDebugLatchTraceEnabled;
+                case Renderer::Vulkan:
+                    return static_cast<const VulkanRenderSettings&>(*configuration.renderSettings).rendererDebugLatchTraceEnabled;
                 case Renderer::Compute:
                     return false;
             }
@@ -375,6 +396,7 @@ namespace MelonDSAndroid
         internalFilesDir = currentConfiguration->internalFilesDir;
         rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*currentConfiguration), std::memory_order_relaxed);
         rendererDebugBgObjEnabled.store(ResolveRendererDebugBgObjEnabled(*currentConfiguration), std::memory_order_relaxed);
+        rendererDebugLatchTraceEnabled.store(ResolveRendererDebugLatchTraceEnabled(*currentConfiguration), std::memory_order_relaxed);
         vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
         ResetRenderer2DDebugControls();
         ResetRenderer3DDebugControls();
@@ -496,6 +518,7 @@ namespace MelonDSAndroid
         currentConfiguration = sharedConfig;
         rendererDebugToolsEnabled.store(ResolveRendererDebugToolsEnabled(*sharedConfig), std::memory_order_relaxed);
         rendererDebugBgObjEnabled.store(ResolveRendererDebugBgObjEnabled(*sharedConfig), std::memory_order_relaxed);
+        rendererDebugLatchTraceEnabled.store(ResolveRendererDebugLatchTraceEnabled(*sharedConfig), std::memory_order_relaxed);
         vulkanDiagnosticFlags.store(ResolveVulkanDiagnosticFlags(), std::memory_order_relaxed);
     }
 
@@ -666,6 +689,12 @@ namespace MelonDSAndroid
     {
         return rendererDebugToolsEnabled.load(std::memory_order_relaxed)
             && rendererDebugBgObjEnabled.load(std::memory_order_relaxed);
+    }
+
+    bool areRendererDebugLatchTraceLogsEnabled()
+    {
+        return rendererDebugToolsEnabled.load(std::memory_order_relaxed)
+            && rendererDebugLatchTraceEnabled.load(std::memory_order_relaxed);
     }
 
     Renderer2DDebugControlState getRenderer2DDebugControls()
@@ -1020,6 +1049,12 @@ namespace MelonDSAndroid
             return -1;
 
         return instance->getCurrentFrameIndexForDebug();
+    }
+
+    void requestPreparedRendererDebugSnapshot()
+    {
+        if (instance)
+            instance->requestPreparedRendererDebugSnapshotForDebug();
     }
 
     void clearPreparedRendererDebugSnapshot()

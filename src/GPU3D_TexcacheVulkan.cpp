@@ -192,6 +192,7 @@ TexcacheVulkanLoader::TextureHandle TexcacheVulkanLoader::GenerateTexture(u32 wi
     textureArray.Width = width;
     textureArray.Height = height;
     textureArray.Layers = layers;
+    textureArray.LayerOpaque.assign(layers, 0u);
 
     VkImageCreateInfo imageCreateInfo{};
     imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -404,6 +405,18 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
         return;
 
     const size_t layerPixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    bool layerOpaque = true;
+    const u32* sourcePixels = static_cast<const u32*>(data);
+    for (size_t pixel = 0; pixel < layerPixelCount; pixel++)
+    {
+        if (((sourcePixels[pixel] >> 24u) & 0x1Fu) != 0x1Fu)
+        {
+            layerOpaque = false;
+            break;
+        }
+    }
+    if (layer < textureArray.LayerOpaque.size())
+        textureArray.LayerOpaque[layer] = layerOpaque ? 1u : 0u;
 
     void* mappedMemory = nullptr;
     if (vkMapMemory(State->Device, textureArray.StagingMemory, 0, textureArray.StagingSize, 0, &mappedMemory) != VK_SUCCESS)
@@ -549,6 +562,22 @@ bool TexcacheVulkanLoader::GetTextureDescriptor(TextureHandle handle, VkDescript
     outImageInfo->imageView = textureArray.ArrayView;
     outImageInfo->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     return true;
+}
+
+bool TexcacheVulkanLoader::IsTextureLayerOpaque(TextureHandle handle, u32 layer) const
+{
+    if (State == nullptr)
+        return false;
+
+    auto it = State->TextureArrays.find(handle);
+    if (it == State->TextureArrays.end())
+        return false;
+
+    const TextureArray& textureArray = it->second;
+    if (layer >= textureArray.LayerOpaque.size())
+        return false;
+
+    return textureArray.LayerOpaque[layer] != 0u;
 }
 
 }

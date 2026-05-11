@@ -17,6 +17,7 @@ struct SoftwareRenderSettings : public RenderSettings
     bool threadedRendering;
     bool rendererDebugToolsEnabled;
     bool rendererDebugBgObjEnabled;
+    bool rendererDebugLatchTraceEnabled;
 };
 
 struct OpenGlRenderSettings : public RenderSettings
@@ -25,6 +26,7 @@ struct OpenGlRenderSettings : public RenderSettings
     int scale;
     bool rendererDebugToolsEnabled;
     bool rendererDebugBgObjEnabled;
+    bool rendererDebugLatchTraceEnabled;
     bool conservativeCoverageEnabled;
     float conservativeCoveragePx;
     float conservativeCoverageDepthBias;
@@ -47,6 +49,7 @@ struct VulkanRenderSettings : public RenderSettings
     bool useSimplePipeline = true;
     bool rendererDebugToolsEnabled;
     bool rendererDebugBgObjEnabled;
+    bool rendererDebugLatchTraceEnabled;
     bool conservativeCoverageEnabled;
     float conservativeCoveragePx;
     float conservativeCoverageDepthBias;

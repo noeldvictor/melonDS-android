@@ -183,6 +183,8 @@ void GPU3D::ResetRenderingState() noexcept
 
     RenderClearAttr1 = 0x3F000000;
     RenderClearAttr2 = 0x00007FFF;
+
+    RenderScreenSwapAt3D = false;
 }
 
 void GPU3D::Reset() noexcept
@@ -2535,6 +2537,7 @@ void GPU3D::VBlank() noexcept
 
 void GPU3D::VCount215(GPU& gpu) noexcept
 {
+    RenderScreenSwapAt3D = (NDS.PowerControl9 & (1u << 15)) != 0;
     CurrentRenderer->RenderFrame(gpu);
 }
 

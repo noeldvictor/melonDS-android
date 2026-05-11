@@ -19,6 +19,7 @@ struct VulkanDeviceProfile
     bool IsQualcomm = false;
     bool IsAdreno = false;
     bool IsArmMali = false;
+    bool IsPowerVR = false;
     bool IsMaliG52Class = false;
 };
 

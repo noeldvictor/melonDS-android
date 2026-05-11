@@ -86,6 +86,7 @@ public:
     std::vector<u32> captureCurrent3dCoverageForDebug();
     bool isCurrentFrameReadyForDebug() const;
     int getCurrentFrameIndexForDebug() const;
+    void requestPreparedRendererDebugSnapshotForDebug();
     void clearPreparedRendererDebugSnapshotForDebug();
     void startDenseScreenBurstCaptureForDebug(int frameCount, int stepFrames, u32 captureKindsMask);
     bool isDenseScreenBurstCaptureCompleteForDebug() const;
@@ -141,6 +142,16 @@ private:
         std::vector<u32> coverage;
     };
 
+    struct PreparedOpenGlDebugSnapshot
+    {
+        int frameId = -1;
+        std::vector<u32> frame;
+        std::vector<u32> captureFrame;
+        std::vector<u32> depth;
+        std::vector<u32> attr;
+        std::vector<u32> coverage;
+    };
+
     struct DenseScreenBurstFrame
     {
         std::vector<u32> screenFrame;
@@ -169,12 +180,14 @@ private:
     void setDateTime();
     void saveRewindState(RewindSaveState* rewindSaveState);
     void clearLatchedSoftPackedFrameSnapshot();
-    bool latchSoftPackedFrameSnapshot(const Frame* frame, int frontBuffer, bool screenSwap);
+    bool latchSoftPackedFrameSnapshot(const Frame* frame, int frontBuffer, bool screenSwap, bool useStructuredVulkan2D);
     std::vector<u32> captureCurrentPackedPrimaryForDebug(bool topScreen);
     std::vector<u32> captureCurrentComp4PlaceholderForDebug(bool topScreen);
     std::vector<u32> captureLiveScreenFrameForDebug(Frame* frameOverride, int scaleOverride);
     void maybeCaptureDenseScreenBurstFrame(Frame* frameOverride, int scaleOverride, int completedFrame);
     void clearPreparedVulkanDebugSnapshot();
+    void clearPreparedOpenGlDebugSnapshot();
+    void prepareOpenGlDebugSnapshot(int completedFrame);
     bool ensurePreparedVulkanDebugSnapshot(Frame* frame, VulkanRenderer3D& renderer3D);
     bool hasPreparedVulkanDebugSnapshot(const Frame* frame) const;
 
@@ -207,9 +220,25 @@ private:
     std::array<u8, SoftPackedFrameSnapshot::kLineCount> lastValidBottomScreenResolvedPrimaryLines{};
     bool hasLastValidTopScreenCapture3dDsFrame = false;
     bool hasLastValidBottomScreenCapture3dDsFrame = false;
+    bool vulkanRegularCaptureTransitionResyncPending = false;
+    int vulkanStructuredCaptureGateFrames = 0;
     SoftPackedFrameSnapshot lastSoftPackedFrameSnapshot;
     SoftPackedFrameSnapshot previousSoftPackedFrameSnapshot;
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> cachedEngineATopPlane0{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> cachedEngineATopPlane1{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> cachedEngineATopControl{};
+    std::array<u32, SoftPackedFrameSnapshot::kLineCount> cachedEngineATopLineMeta{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> cachedEngineABottomPlane0{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> cachedEngineABottomPlane1{};
+    std::array<u32, SoftPackedFrameSnapshot::kPixelCount> cachedEngineABottomControl{};
+    std::array<u32, SoftPackedFrameSnapshot::kLineCount> cachedEngineABottomLineMeta{};
+    bool cachedEngineATopValid = false;
+    bool cachedEngineABottomValid = false;
+    int framesSinceLastScreenSwapToggle = 1024;
+    bool wasInAlternatingMode = false;
     PreparedVulkanDebugSnapshot preparedVulkanDebugSnapshot;
+    PreparedOpenGlDebugSnapshot preparedOpenGlDebugSnapshot;
+    std::atomic_bool openGlDebugSnapshotRequested = false;
     mutable std::mutex denseScreenBurstCaptureMutex;
     DenseScreenBurstCapture denseScreenBurstCapture;
     ScreenshotRenderer screenshotRenderer;
@@ -219,6 +248,9 @@ private:
     bool vulkanRuntimeConfigLogged;
     bool vulkanRuntimeFailureHandled;
     int vulkanPrepareFailureCount;
+    u64 vulkanSoftPackedMissingWindow = 0;
+    u64 vulkanHeldPreviousFrameWindow = 0;
+    u64 vulkanPrepareFailedWindow = 0;
     int frame;
     PerfSampleWindow<120> vulkanRunFrameCpuWindow;
     PerfSampleWindow<120> vulkanSetupCpuWindow;

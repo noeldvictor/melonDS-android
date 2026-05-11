@@ -210,18 +210,29 @@ void FrameQueue::commitPresentedFrame(Frame* frame, const FrameQueuePolicy& requ
 
     if (!policy.PreserveBacklogOnPresent)
     {
-        const u64 staleFrameCount = static_cast<u64>(presentQueue.size());
         for (auto f : presentQueue)
         {
             freeQueue.push(f);
-            recordDroppedFrameLocked(f, PresentDropCause::Stale, nowNs);
+            if (policy.TreatBacklogTrimAsFastForwardSkip)
+            {
+                f->queuedAtNs = 0;
+                stats.FastForwardFramesSkipped++;
+            }
+            else
+            {
+                recordDroppedFrameLocked(f, PresentDropCause::Stale, nowNs);
+            }
         }
-        stats.StaleFramesDropped += staleFrameCount;
-        stats.PresentFramesDroppedByPolicy += staleFrameCount;
+        const u64 staleFrameCount = static_cast<u64>(presentQueue.size());
+        if (!policy.TreatBacklogTrimAsFastForwardSkip)
+        {
+            stats.StaleFramesDropped += staleFrameCount;
+            stats.PresentFramesDroppedByPolicy += staleFrameCount;
+        }
         presentQueue.clear();
     }
 
-    dropPendingFramesToBacklogLocked(policy.MaxBacklogDepth);
+    dropPendingFramesToBacklogLocked(policy.MaxBacklogDepth, policy.TreatBacklogTrimAsFastForwardSkip);
     updateBacklogStatsLocked();
 }
 
@@ -339,7 +350,9 @@ void FrameQueue::pushRenderedFrame(Frame* frame, const FrameQueuePolicy& request
     std::unique_lock lock(frameLock);
     const FrameQueuePolicy policy = sanitizePolicy(requestedPolicy);
     frame->queuedAtNs = MelonDSAndroid::PerfNowNs();
-    dropPendingFramesToBacklogLocked(policy.MaxBacklogDepth > 0 ? policy.MaxBacklogDepth - 1 : 0);
+    dropPendingFramesToBacklogLocked(
+        policy.MaxBacklogDepth > 0 ? policy.MaxBacklogDepth - 1 : 0,
+        policy.TreatBacklogTrimAsFastForwardSkip);
     presentQueue.push_front(frame);
     stats.RenderFramesQueued++;
     updateBacklogStatsLocked();
@@ -459,7 +472,7 @@ void FrameQueue::rebuildFreeQueueLocked()
         freeQueue.push(&frame);
 }
 
-void FrameQueue::dropPendingFramesToBacklogLocked(u64 maxBacklogDepth)
+void FrameQueue::dropPendingFramesToBacklogLocked(u64 maxBacklogDepth, bool treatAsFastForwardSkip)
 {
     const u64 nowNs = MelonDSAndroid::PerfNowNs();
     while (static_cast<u64>(presentQueue.size()) > maxBacklogDepth && !presentQueue.empty())
@@ -467,8 +480,16 @@ void FrameQueue::dropPendingFramesToBacklogLocked(u64 maxBacklogDepth)
         Frame* frame = presentQueue.back();
         presentQueue.pop_back();
         freeQueue.push(frame);
-        stats.PresentFramesDroppedByPolicy++;
-        recordDroppedFrameLocked(frame, PresentDropCause::BacklogTrim, nowNs);
+        if (treatAsFastForwardSkip)
+        {
+            frame->queuedAtNs = 0;
+            stats.FastForwardFramesSkipped++;
+        }
+        else
+        {
+            stats.PresentFramesDroppedByPolicy++;
+            recordDroppedFrameLocked(frame, PresentDropCause::BacklogTrim, nowNs);
+        }
     }
     updateBacklogStatsLocked();
 }

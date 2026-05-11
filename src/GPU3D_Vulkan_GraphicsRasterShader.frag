@@ -1,5 +1,29 @@
 #version 450
 
+#ifndef MELONDS_NO_FRAG_DEPTH
+#define MELONDS_NO_FRAG_DEPTH 0
+#endif
+
+#ifndef MELONDS_DIRECT_TEXTURE_INDEXING
+#define MELONDS_DIRECT_TEXTURE_INDEXING 0
+#endif
+
+#ifndef MELONDS_FAST_OPAQUE_MODULATE
+#define MELONDS_FAST_OPAQUE_MODULATE 0
+#endif
+
+#ifndef MELONDS_FAST_TOON_MODE
+#define MELONDS_FAST_TOON_MODE 0
+#endif
+
+#ifndef MELONDS_FAST_TEXTURE_PUSH_CONSTANTS
+#define MELONDS_FAST_TEXTURE_PUSH_CONSTANTS 0
+#endif
+
+#ifndef MELONDS_FAST_OPAQUE_FULL_ALPHA
+#define MELONDS_FAST_OPAQUE_FULL_ALPHA 0
+#endif
+
 const uint MAX_TEXTURE_DESCRIPTORS = 128u;
 
 layout(constant_id = 0) const uint DEPTH_INTERPOLATION_MODE = 0u;
@@ -47,6 +71,8 @@ layout(location = 2) out float oDepthValue;
 
 const uint TRI_FLAG_TEXTURED = 1u << 1u;
 const uint TRI_FLAG_DECAL = 1u << 2u;
+const uint TRI_FLAG_LINEAR = 1u << 6u;
+const float LINEAR_TEXEL_COORD_BIAS = 1.0 / 8.0;
 
 struct Color6A5
 {
@@ -78,6 +104,9 @@ Color6A5 decodeTexelRgb6a5(uvec4 texel)
 
 uvec4 fetchTextureArrayTexel(uint descriptorIndex, ivec3 coord)
 {
+#if MELONDS_DIRECT_TEXTURE_INDEXING != 0
+    return texelFetch(texArrays[descriptorIndex], coord, 0);
+#else
     switch (descriptorIndex)
     {
         case 0u: return texelFetch(texArrays[0], coord, 0);
@@ -210,6 +239,7 @@ uvec4 fetchTextureArrayTexel(uint descriptorIndex, ivec3 coord)
         case 127u: return texelFetch(texArrays[127], coord, 0);
         default: return texelFetch(texArrays[127], coord, 0);
     }
+#endif
 }
 
 int wrapTexelCoord(int coord, int size, bool repeat, bool mirror)
@@ -260,13 +290,25 @@ Color6A5 sampleTexture()
     whiteTexel.b = 63;
     whiteTexel.a = 31;
 
+#if MELONDS_FAST_OPAQUE_MODULATE == 0
     uint flags = fTriInfo0.x;
+#endif
+#if MELONDS_FAST_OPAQUE_MODULATE != 0 && MELONDS_FAST_TEXTURE_PUSH_CONSTANTS != 0
+    uint texLayer = pc.variantKey >> 16u;
+    uint texArrayIndex = pc.variantKey & 0xFFFFu;
+    uint texWidth = pc.passIndex & 0xFFFFu;
+    uint texHeight = pc.passIndex >> 16u;
+    uint texParam = pc.triangleBase;
+#else
     uint texLayer = fTriInfo0.y;
     uint texArrayIndex = fTriInfo0.z;
     uint texWidth = fTriInfo0.w;
     uint texHeight = fTriInfo1.x;
     uint texParam = fTriInfo1.y;
+#endif
+    vec2 texcoord = fTexcoord;
 
+#if MELONDS_FAST_OPAQUE_MODULATE == 0
     if ((flags & TRI_FLAG_TEXTURED) == 0u
         || texWidth == 0u
         || texHeight == 0u
@@ -275,8 +317,17 @@ Color6A5 sampleTexture()
         return whiteTexel;
     }
 
-    int sampleS = int(floor(fTexcoord.x));
-    int sampleT = int(floor(fTexcoord.y));
+    if ((flags & TRI_FLAG_LINEAR) != 0u)
+    {
+        vec2 renderScale = max(vec2(float(pc.width) * (1.0 / 256.0), float(pc.height) * (1.0 / 192.0)), vec2(1.0));
+        vec2 subpixelOffset = mod(gl_FragCoord.xy - vec2(0.5), renderScale);
+        texcoord += dFdx(fTexcoord) * -subpixelOffset.x + dFdy(fTexcoord) * -subpixelOffset.y;
+        texcoord -= vec2(LINEAR_TEXEL_COORD_BIAS);
+    }
+#endif
+
+    int sampleS = int(floor(texcoord.x));
+    int sampleT = int(floor(texcoord.y));
     bool repeatS = (texParam & (1u << 16u)) != 0u;
     bool repeatT = (texParam & (1u << 17u)) != 0u;
     bool mirrorS = (texParam & (1u << 18u)) != 0u;
@@ -300,20 +351,39 @@ vec4 encodeColor(Color6A5 color)
 
 void main()
 {
+#if MELONDS_FAST_OPAQUE_MODULATE == 0
     uint flags = fTriInfo0.x;
+#endif
+#if MELONDS_FAST_OPAQUE_MODULATE != 0 && MELONDS_FAST_TEXTURE_PUSH_CONSTANTS != 0
+    uint polyAttr = pc.depthBlendMode;
+#else
     uint polyAttr = fTriInfo1.z;
+#endif
     uint polyAlpha = (polyAttr >> 16u) & 0x1Fu;
     uint blendMode = (polyAttr >> 4u) & 0x3u;
     bool highlightEnabled = (pc.dispCnt & (1u << 1u)) != 0u;
+#if MELONDS_FAST_OPAQUE_MODULATE == 0
     bool textureMapsEnabled = (pc.dispCnt & (1u << 0u)) != 0u;
+#endif
 
     Color6A5 sourceColor;
     sourceColor.r = clamp6(int(clamp(fColor.r * 63.0 + 0.5, 0.0, 63.0)));
     sourceColor.g = clamp6(int(clamp(fColor.g * 63.0 + 0.5, 0.0, 63.0)));
     sourceColor.b = clamp6(int(clamp(fColor.b * 63.0 + 0.5, 0.0, 63.0)));
+#if MELONDS_FAST_OPAQUE_FULL_ALPHA != 0
+    sourceColor.a = 31;
+#else
     sourceColor.a = clamp5(int(polyAlpha));
+#endif
 
     int highlightShade = sourceColor.r;
+#if MELONDS_FAST_OPAQUE_MODULATE != 0 && MELONDS_FAST_TOON_MODE == 1
+    Color6A5 toonColor = unpackToonColor(uint(clamp(sourceColor.r >> 1, 0, 31)));
+    sourceColor.r = toonColor.r;
+    sourceColor.g = toonColor.g;
+    sourceColor.b = toonColor.b;
+#elif MELONDS_FAST_OPAQUE_MODULATE != 0 && MELONDS_FAST_TOON_MODE == 2
+#else
     if (blendMode == 2u)
     {
         if (highlightEnabled)
@@ -330,7 +400,17 @@ void main()
             sourceColor.b = toonColor.b;
         }
     }
+#endif
 
+#if MELONDS_FAST_OPAQUE_MODULATE != 0
+    Color6A5 texelColor = sampleTexture();
+    sourceColor.r = clamp6((((texelColor.r + 1) * (sourceColor.r + 1)) - 1) >> 6);
+    sourceColor.g = clamp6((((texelColor.g + 1) * (sourceColor.g + 1)) - 1) >> 6);
+    sourceColor.b = clamp6((((texelColor.b + 1) * (sourceColor.b + 1)) - 1) >> 6);
+#if MELONDS_FAST_OPAQUE_FULL_ALPHA == 0
+    sourceColor.a = clamp5((((texelColor.a + 1) * (sourceColor.a + 1)) - 1) >> 5);
+#endif
+#else
     if (textureMapsEnabled && (flags & TRI_FLAG_TEXTURED) != 0u)
     {
         Color6A5 texelColor = sampleTexture();
@@ -357,7 +437,9 @@ void main()
             sourceColor.a = clamp5((((texelColor.a + 1) * (sourceColor.a + 1)) - 1) >> 5);
         }
     }
+#endif
 
+#if !(MELONDS_FAST_OPAQUE_MODULATE != 0 && MELONDS_FAST_TOON_MODE == 2)
     if (blendMode == 2u && highlightEnabled)
     {
         Color6A5 highlightColor = unpackToonColor(uint(clamp(highlightShade >> 1, 0, 31)));
@@ -365,12 +447,15 @@ void main()
         sourceColor.g = clamp6(sourceColor.g + highlightColor.g);
         sourceColor.b = clamp6(sourceColor.b + highlightColor.b);
     }
+#endif
 
+#if MELONDS_FAST_OPAQUE_FULL_ALPHA == 0
     if (polyAlpha == 0u)
         sourceColor.a = 31;
 
     if (sourceColor.a <= int(pc.alphaRef))
         discard;
+#endif
 
     if (EDGE_MARK_PASS != 0u)
     {
@@ -382,7 +467,9 @@ void main()
 
         float edgeDepth = DEPTH_INTERPOLATION_MODE != 0u ? fDepthPerspective : fDepthLinear;
         oDepthValue = edgeDepth;
+#if MELONDS_NO_FRAG_DEPTH == 0
         gl_FragDepth = edgeDepth;
+#endif
         return;
     }
 
@@ -396,8 +483,10 @@ void main()
     }
     else
     {
+#if MELONDS_FAST_OPAQUE_FULL_ALPHA == 0
         if (sourceColor.a < 31)
             discard;
+#endif
 
         uint polyId = (polyAttr >> 24u) & 0x3Fu;
         float fogFlag = ((polyAttr & (1u << 15u)) != 0u) ? 1.0 : 0.0;
@@ -407,5 +496,7 @@ void main()
 
     float depth = DEPTH_INTERPOLATION_MODE != 0u ? fDepthPerspective : fDepthLinear;
     oDepthValue = depth;
+#if MELONDS_NO_FRAG_DEPTH == 0
     gl_FragDepth = depth;
+#endif
 }

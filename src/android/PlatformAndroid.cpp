@@ -150,8 +150,12 @@ namespace Platform
         if (path.empty())
             return nullptr;
 
-        // Always open file as absolute
-        return OpenFile(path, mode);
+        if (path[0] == '/')
+            return OpenFile(path, mode);
+
+        std::filesystem::path fullFilePath = MelonDSAndroid::internalFilesDir;
+        fullFilePath /= path;
+        return OpenFile(fullFilePath, mode);
     }
 
     FileHandle* OpenInternalFile(const std::string path, FileMode mode)

@@ -27,6 +27,7 @@ struct FrameQueuePolicy
     bool AllowDropForDeadline = false;
     bool PreferOldestFrame = false;
     bool PreserveBacklogOnPresent = false;
+    bool TreatBacklogTrimAsFastForwardSkip = false;
 };
 
 enum class FrameBackend : u8 {
@@ -49,6 +50,7 @@ struct FrameQueueStats
     u64 PresentDroppedByDeadline = 0;
     u64 PresentDroppedByBacklogTrim = 0;
     u64 PresentDeferredByDeadline = 0;
+    u64 FastForwardFramesSkipped = 0;
     u64 PreviousFrameReused = 0;
     u64 MaxBacklogDepth = 0;
     u64 CurrentBacklogDepth = 0;
@@ -101,7 +103,7 @@ private:
 
     static FrameQueuePolicy sanitizePolicy(FrameQueuePolicy policy);
     void rebuildFreeQueueLocked();
-    void dropPendingFramesToBacklogLocked(u64 maxBacklogDepth);
+    void dropPendingFramesToBacklogLocked(u64 maxBacklogDepth, bool treatAsFastForwardSkip);
     void updateBacklogStatsLocked();
     void recordPresentedFrameAgeLocked(Frame* frame, u64 nowNs);
     void recordDroppedFrameLocked(Frame* frame, PresentDropCause cause, u64 nowNs);

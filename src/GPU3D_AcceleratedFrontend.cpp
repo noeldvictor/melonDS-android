@@ -7,14 +7,6 @@
 namespace melonDS
 {
 
-namespace
-{
-s32 clampFixed16(s32 value) noexcept
-{
-    return std::clamp(value, 0, 0xFFFF);
-}
-}
-
 bool HasAcceleratedPolygonFlag(const AcceleratedPolygonMeta& polygonMeta, u32 flag) noexcept
 {
     return (polygonMeta.Flags & flag) != 0u;
@@ -126,16 +118,16 @@ s32 ResolveAcceleratedVertexFixedX(const Vertex& vertex, int scale, bool useHire
 {
     const int safeScale = std::max(scale, 1);
     if (useHiresCoordinates)
-        return clampFixed16(vertex.HiresPosition[0] * safeScale);
-    return clampFixed16(vertex.FinalPosition[0] << 4);
+        return std::clamp(vertex.HiresPosition[0] * safeScale, 0, 0xFFFF);
+    return std::clamp(vertex.FinalPosition[0] << 4, 0, 0xFFFF);
 }
 
 s32 ResolveAcceleratedVertexFixedY(const Vertex& vertex, int scale, bool useHiresCoordinates) noexcept
 {
     const int safeScale = std::max(scale, 1);
     if (useHiresCoordinates)
-        return clampFixed16(vertex.HiresPosition[1] * safeScale);
-    return clampFixed16(vertex.FinalPosition[1] << 4);
+        return std::clamp(vertex.HiresPosition[1] * safeScale, 0, 0xFFFF);
+    return std::clamp(vertex.FinalPosition[1] << 4, 0, 0xFFFF);
 }
 
 AcceleratedCoverageFixState ResolveAcceleratedCoverageFix(
@@ -270,8 +262,8 @@ void BuildAcceleratedScene(
             | (static_cast<u32>(std::min<u16>(31u, a)) << 24u);
     };
 
-    const auto appendSceneVertex = [&](u32 xFixed,
-                                       u32 yFixed,
+    const auto appendSceneVertex = [&](s32 xFixed,
+                                       s32 yFixed,
                                        u32 zRaw,
                                        u32 wRaw,
                                        u16 finalColorR,
@@ -281,12 +273,21 @@ void BuildAcceleratedScene(
                                        s16 texCoordS,
                                        s16 texCoordT,
                                        u32 vertexAttrBase,
+                                       bool preserveSignedScreenCoords = false,
                                        std::optional<u32> glColorOverride = std::nullopt) -> u16 {
         AcceleratedSceneVertex sceneVertex{};
-        sceneVertex.XFixed = std::min<u32>(xFixed, 0xFFFFu);
-        sceneVertex.YFixed = std::min<u32>(yFixed, 0xFFFFu);
-        sceneVertex.X = std::clamp(static_cast<float>(sceneVertex.XFixed) * (1.0f / 16.0f), 0.0f, maxTargetX);
-        sceneVertex.Y = std::clamp(static_cast<float>(sceneVertex.YFixed) * (1.0f / 16.0f), 0.0f, maxTargetY);
+        sceneVertex.XFixed = static_cast<u32>(std::clamp<s32>(xFixed, 0, 0xFFFF));
+        sceneVertex.YFixed = static_cast<u32>(std::clamp<s32>(yFixed, 0, 0xFFFF));
+        if (preserveSignedScreenCoords)
+        {
+            sceneVertex.X = static_cast<float>(xFixed) * (1.0f / 16.0f);
+            sceneVertex.Y = static_cast<float>(yFixed) * (1.0f / 16.0f);
+        }
+        else
+        {
+            sceneVertex.X = std::clamp(static_cast<float>(sceneVertex.XFixed) * (1.0f / 16.0f), 0.0f, maxTargetX);
+            sceneVertex.Y = std::clamp(static_cast<float>(sceneVertex.YFixed) * (1.0f / 16.0f), 0.0f, maxTargetY);
+        }
         sceneVertex.Z = zRaw;
         sceneVertex.W = std::max<u32>(1u, wRaw);
         sceneVertex.FinalColorR = std::min<u16>(511u, finalColorR);
@@ -403,6 +404,30 @@ void BuildAcceleratedScene(
         draw.SourcePolygon = polygon;
         draw.Meta = BuildAcceleratedPolygonMeta(*polygon);
         draw.CoverageFixState = ResolveAcceleratedCoverageFix(*polygon, config.CoverageFix);
+        if (draw.CoverageFixState.Apply)
+        {
+            bool polygonTouchesClipEdge = false;
+            for (u32 vertexIndex = 0; vertexIndex < polygon->NumVertices; vertexIndex++)
+            {
+                const Vertex* vertex = polygon->Vertices[vertexIndex];
+                if (vertex == nullptr)
+                    continue;
+
+                const s32 xFixed = config.UseHiresCoordinates
+                    ? vertex->HiresPosition[0] * safeScale
+                    : vertex->FinalPosition[0] << 4;
+                const s32 yFixed = config.UseHiresCoordinates
+                    ? vertex->HiresPosition[1] * safeScale
+                    : vertex->FinalPosition[1] << 4;
+                if (xFixed < 0 || yFixed < 0 || xFixed > config.MaxFixedX || yFixed > config.MaxFixedY)
+                {
+                    polygonTouchesClipEdge = true;
+                    break;
+                }
+            }
+            if (polygonTouchesClipEdge)
+                draw.CoverageFixState = {};
+        }
         draw.FirstVertex = static_cast<u32>(outScene.Vertices.size());
         draw.FirstIndex = static_cast<u32>(outScene.Indices.size());
         draw.FirstEdgeIndex = static_cast<u32>(outScene.EdgeIndices.size());
@@ -434,27 +459,29 @@ void BuildAcceleratedScene(
         std::vector<u16> polygonVertexIndices{};
         polygonVertexIndices.reserve(std::max<u32>(polygon->NumVertices + 1u, 3u));
 
-        const auto resolveFixedCoords = [&](u32 vertexIndex) -> std::pair<u32, u32> {
+        const auto resolveFixedCoords = [&](u32 vertexIndex) -> std::pair<s32, s32> {
             const Vertex* vertex = polygon->Vertices[vertexIndex];
-            u32 xFixed = 0;
-            u32 yFixed = 0;
+            s32 xFixed = 0;
+            s32 yFixed = 0;
             if (vertex != nullptr)
             {
                 if (draw.CoverageFixState.Apply)
                 {
-                    xFixed = expandedX[vertexIndex];
-                    yFixed = expandedY[vertexIndex];
+                    xFixed = static_cast<s32>(expandedX[vertexIndex]);
+                    yFixed = static_cast<s32>(expandedY[vertexIndex]);
+                }
+                else if (config.UseHiresCoordinates)
+                {
+                    xFixed = vertex->HiresPosition[0] * safeScale;
+                    yFixed = vertex->HiresPosition[1] * safeScale;
                 }
                 else
                 {
-                    xFixed = static_cast<u32>(ResolveAcceleratedVertexFixedX(*vertex, safeScale, config.UseHiresCoordinates));
-                    yFixed = static_cast<u32>(ResolveAcceleratedVertexFixedY(*vertex, safeScale, config.UseHiresCoordinates));
+                    xFixed = vertex->FinalPosition[0] << 4;
+                    yFixed = vertex->FinalPosition[1] << 4;
                 }
             }
-            return {
-                std::min<u32>(xFixed, 0xFFFFu),
-                std::min<u32>(yFixed, 0xFFFFu),
-            };
+            return {xFixed, yFixed};
         };
 
         if (polygon->Type == 1)
@@ -493,8 +520,8 @@ void BuildAcceleratedScene(
 
         if (config.BetterPolygons && polygon->NumVertices > 3u)
         {
-            u32 centerXFixed = 0u;
-            u32 centerYFixed = 0u;
+            s64 centerXFixedSum = 0;
+            s64 centerYFixedSum = 0;
             float centerZ = 0.0f;
             float centerReciprocalW = 0.0f;
             float centerRawR = 0.0f;
@@ -516,8 +543,9 @@ void BuildAcceleratedScene(
                     break;
                 }
 
-                centerXFixed += static_cast<u32>(std::max<s32>(0, vertex->HiresPosition[0]));
-                centerYFixed += static_cast<u32>(std::max<s32>(0, vertex->HiresPosition[1]));
+                const auto [xFixed, yFixed] = resolveFixedCoords(vertexIndex);
+                centerXFixedSum += static_cast<s64>(xFixed);
+                centerYFixedSum += static_cast<s64>(yFixed);
 
                 const float fw = static_cast<float>(std::max<s32>(1, polygon->FinalW[vertexIndex]))
                     * static_cast<float>(polygon->NumVertices);
@@ -543,8 +571,8 @@ void BuildAcceleratedScene(
 
             if (validCenter && centerReciprocalW > 0.0f)
             {
-                centerXFixed = std::min<u32>((centerXFixed / polygon->NumVertices) * static_cast<u32>(safeScale), static_cast<u32>(std::max(config.MaxFixedX, 0)));
-                centerYFixed = std::min<u32>((centerYFixed / polygon->NumVertices) * static_cast<u32>(safeScale), static_cast<u32>(std::max(config.MaxFixedY, 0)));
+                const s32 centerXFixed = static_cast<s32>(centerXFixedSum / static_cast<s64>(polygon->NumVertices));
+                const s32 centerYFixed = static_cast<s32>(centerYFixedSum / static_cast<s64>(polygon->NumVertices));
                 const float centerW = 1.0f / centerReciprocalW;
                 if (polygon->WBuffer)
                     centerZ *= centerW;
@@ -577,6 +605,7 @@ void BuildAcceleratedScene(
                     static_cast<s16>(static_cast<s32>(centerS)),
                     static_cast<s16>(static_cast<s32>(centerT)),
                     vertexAttrBase,
+                    true,
                     glColorPacked);
                 polygonVertexIndices.push_back(centerVertexIndex);
             }

@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 #include "GPU3D_Texcache.h"
@@ -22,6 +23,7 @@ public:
     void UploadTexture(TextureHandle handle, u32 width, u32 height, u32 layer, void* data);
     void DeleteTexture(TextureHandle handle);
     bool GetTextureDescriptor(TextureHandle handle, VkDescriptorImageInfo* outImageInfo) const;
+    bool IsTextureLayerOpaque(TextureHandle handle, u32 layer) const;
 
 private:
     struct TextureArray
@@ -38,6 +40,7 @@ private:
         VkBuffer StagingBuffer = VK_NULL_HANDLE;
         VkDeviceMemory StagingMemory = VK_NULL_HANDLE;
         VkDeviceSize StagingSize = 0;
+        std::vector<u8> LayerOpaque;
     };
 
     struct SharedState

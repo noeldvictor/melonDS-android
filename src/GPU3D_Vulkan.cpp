@@ -33,11 +33,19 @@
 #include "GPU3D_Vulkan_CaptureLineExportShaderData.h"
 #include "GPU3D_Vulkan_DepthBlendShaderData.h"
 #include "GPU3D_Vulkan_FinalPassShaderData.h"
+#include "GPU3D_Vulkan_GraphicsEdgeFogShaderData.h"
 #include "GPU3D_Vulkan_GraphicsEdgeShaderData.h"
 #include "GPU3D_Vulkan_GraphicsFinalShaderVertexData.h"
 #include "GPU3D_Vulkan_GraphicsFogShaderData.h"
 #include "GPU3D_Vulkan_GraphicsClearShaderData.h"
 #include "GPU3D_Vulkan_GraphicsNoColorShaderData.h"
+#include "GPU3D_Vulkan_GraphicsRasterNoFragDepthDirectFastModulateOpaqueAlphaPlainShaderFragmentData.h"
+#include "GPU3D_Vulkan_GraphicsRasterNoFragDepthDirectFastModulateOpaqueAlphaToonShaderFragmentData.h"
+#include "GPU3D_Vulkan_GraphicsRasterNoFragDepthDirectFastModulatePlainShaderFragmentData.h"
+#include "GPU3D_Vulkan_GraphicsRasterNoFragDepthDirectFastModulateShaderFragmentData.h"
+#include "GPU3D_Vulkan_GraphicsRasterNoFragDepthDirectFastModulateToonShaderFragmentData.h"
+#include "GPU3D_Vulkan_GraphicsRasterNoFragDepthDirectShaderFragmentData.h"
+#include "GPU3D_Vulkan_GraphicsRasterNoFragDepthShaderFragmentData.h"
 #include "GPU3D_Vulkan_GraphicsRasterShaderFragmentData.h"
 #include "GPU3D_Vulkan_GraphicsRasterShaderVertexData.h"
 #include "GPU3D_Vulkan_InterpSpansShaderData.h"
@@ -695,6 +703,10 @@ void VulkanRenderer3D::ResetActiveBackend(GPU& gpu)
     clearLineCache();
     LastValidExactCaptureLineCache.fill(0);
     HasLastValidExactCapture = false;
+    LastValidExactCaptureScreenSwap = false;
+    CurrentCaptureScreenSwapHint = false;
+    HasCurrentCaptureScreenSwapHint = false;
+    CurrentRenderScreenSwap = false;
     CaptureLineExportCount = 0;
     EarlySubmitAttemptCount = 0;
     EarlySubmitHitCount = 0;
@@ -724,7 +736,8 @@ void VulkanRenderer3D::VCount144ActiveBackend(GPU& gpu)
     if (!ensureInitialized())
         return;
 
-    if (VulkanContext::Get().GetDeviceProfile().IsAdreno)
+    const VulkanDeviceProfile& deviceProfile = VulkanContext::Get().GetDeviceProfile();
+    if (deviceProfile.IsAdreno || deviceProfile.IsArmMali || deviceProfile.IsPowerVR)
         return;
 
     EarlySubmitAttemptCount++;
@@ -751,6 +764,7 @@ void VulkanRenderer3D::RenderFrame(GPU& gpu)
 void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
 {
     refreshActiveBackendMode();
+    CurrentRenderScreenSwap = gpu.GPU3D.RenderScreenSwapAt3D;
 
     if (SkipRenderAtVCount215 && gpu.VCount == 215u)
     {
@@ -771,6 +785,32 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
     const u32 scale = static_cast<u32>(std::max(1, ScaleFactor));
     const u32 targetWidth = 256u * scale;
     const u32 targetHeight = 192u * scale;
+    const u32 captureCnt = gpu.GPU2D_A.CaptureCnt;
+    const bool captureEnabled = (captureCnt & (1u << 31u)) != 0u;
+    const u32 captureMode = (captureCnt >> 29u) & 0x3u;
+    const u32 captureSizeMode = (captureCnt >> 20u) & 0x3u;
+    const bool captureSource3d = (captureCnt & (1u << 24u)) != 0u;
+    const bool sourceAContributes = captureMode == 0u
+        || ((captureMode >= 2u) && ((captureCnt & 0x1Fu) != 0u));
+    const bool bg0Uses3d = (gpu.GPU2D_A.DispCnt & 0x0108u) == 0x0108u;
+    const bool captureNeedsCpuReadback = false;
+    const bool captureNeedsGpuCaptureLineBase =
+        captureEnabled
+        && (captureMode != 1u)
+        && (captureSource3d || (bg0Uses3d && sourceAContributes));
+    const auto updateExactCaptureFallbackColor = [&]() {
+        const u32 clearColor = Debug3dClearMagenta ? 0xFFFF00FFu : buildClearColorRgba8(gpu);
+        const u32 r = clearColor & 0xFFu;
+        const u32 g = (clearColor >> 8u) & 0xFFu;
+        const u32 b = (clearColor >> 16u) & 0xFFu;
+        const u32 a = (clearColor >> 24u) & 0xFFu;
+        ExactCaptureFallbackPackedColor =
+            (r >> 2u)
+            | ((g >> 2u) << 8u)
+            | ((b >> 2u) << 16u)
+            | ((a >> 3u) << 24u);
+        ExactCaptureFallbackValid = true;
+    };
     FrameIdentical = !textureCacheChanged && gpu.GPU3D.RenderFrameIdentical;
     const bool needsZeroGeometryRefresh =
         gpu.GPU3D.RenderNumPolygons == 0u && LastSubmittedRenderPolygonCount != 0u;
@@ -782,15 +822,18 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
         && ColorImageHeight == targetHeight
         && !needsZeroGeometryRefresh;
     if (canReuseIdenticalFrame)
+    {
+        if (ActiveBackendMode == BackendMode::GraphicsHardware && captureNeedsGpuCaptureLineBase)
+        {
+            updateExactCaptureFallbackColor();
+            if (!CaptureLinePending && !CaptureLineReady)
+                (void)submitGraphicsCaptureExportForCurrentFrame();
+        }
         return;
+    }
 
     if (ActiveBackendMode == BackendMode::GraphicsHardware)
     {
-        // Each newly rendered graphics_hw frame must invalidate the previous
-        // exact DS-sized capture cache. Keeping ExactCaptureLineCachePrepared
-        // latched across frames allows PrepareCaptureFrame()/GetLine() to
-        // reuse stale capture lines with pending=0/ready=0, which shows up as
-        // deterministic A/B oscillation in Phantom Hourglass.
         ExactCaptureLineCachePrepared = false;
         ExactCaptureLineCacheFresh = false;
         HasCpuFrame = false;
@@ -804,24 +847,6 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
 
     const VulkanDeviceProfile& deviceProfile = VulkanContext::Get().GetDeviceProfile();
     const bool hadCpuFrame = HasCpuFrame;
-    const u32 captureCnt = gpu.GPU2D_A.CaptureCnt;
-    const bool captureEnabled = (captureCnt & (1u << 31u)) != 0u;
-    const u32 captureMode = (captureCnt >> 29u) & 0x3u;
-    const u32 captureSizeMode = (captureCnt >> 20u) & 0x3u;
-    const bool captureSource3d = (captureCnt & (1u << 24u)) != 0u;
-    const bool sourceAContributes = captureMode == 0u
-        || ((captureMode >= 2u) && ((captureCnt & 0x1Fu) != 0u));
-    const bool bg0Uses3d = (gpu.GPU2D_A.DispCnt & 0x0108u) == 0x0108u;
-    const bool captureNeedsCpuReadback = false;
-    // software 2D still resolves accelerated 3D through GetLine()/PrepareCaptureFrame().
-    // In graphics_hw, keep the exact same "capture uses source A 3D" gate that
-    // software/OpenGL use for PrepareCaptureFrame(). Exporting a DS-sized 3D
-    // capture on frames that do not actually consume source A leaves stale
-    // intro/previous-scene data available for the next capture-backed screen.
-    const bool captureNeedsGpuCaptureLineBase =
-        captureEnabled
-        && (captureMode != 1u)
-        && (captureSource3d || (bg0Uses3d && sourceAContributes));
     bool deferGpuCaptureLineExport = false;
     if (ActiveBackendMode == BackendMode::GraphicsHardware && captureNeedsGpuCaptureLineBase)
     {
@@ -1061,18 +1086,7 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
     }
 
     const u32 clearColor = Debug3dClearMagenta ? 0xFFFF00FFu : buildClearColorRgba8(gpu);
-    {
-        const u32 r = clearColor & 0xFFu;
-        const u32 g = (clearColor >> 8u) & 0xFFu;
-        const u32 b = (clearColor >> 16u) & 0xFFu;
-        const u32 a = (clearColor >> 24u) & 0xFFu;
-        ExactCaptureFallbackPackedColor =
-            (r >> 2u)
-            | ((g >> 2u) << 8u)
-            | ((b >> 2u) << 16u)
-            | ((a >> 3u) << 24u);
-        ExactCaptureFallbackValid = true;
-    }
+    updateExactCaptureFallbackColor();
     const u32 clearDepth = ((gpu.GPU3D.RenderClearAttr2 & 0x7FFFu) * 0x200u) + 0x1FFu;
     if (!dispatchRasterAndReadback(
             renderContext,
@@ -1159,7 +1173,13 @@ u32* VulkanRenderer3D::GetLineActiveBackend(int line)
             resetCaptureLineState();
         }
 
-        if (!HasCpuFrame && CaptureLineReady && ReadyCaptureLineData != nullptr)
+        const auto readyCaptureMatchesHint = [&]() {
+            return !exactCaptureOnly
+                || !HasCurrentCaptureScreenSwapHint
+                || ReadyCaptureLineScreenSwap == CurrentCaptureScreenSwapHint;
+        };
+
+        if (!HasCpuFrame && CaptureLineReady && ReadyCaptureLineData != nullptr && readyCaptureMatchesHint())
         {
             HasCpuFrame = copyReadyCaptureLineToLineCache();
         }
@@ -1178,7 +1198,7 @@ u32* VulkanRenderer3D::GetLineActiveBackend(int line)
 
         if (!HasCpuFrame)
         {
-            if (CaptureLineReady && ReadyCaptureLineData != nullptr)
+            if (CaptureLineReady && ReadyCaptureLineData != nullptr && readyCaptureMatchesHint())
             {
                 // Latch capture export to a stable CPU buffer. Returning the
                 // persistently mapped GPU buffer directly can flicker when threaded
@@ -1240,6 +1260,12 @@ void VulkanRenderer3D::PrepareCaptureFrame()
     activeBackend().PrepareCaptureFrame();
 }
 
+void VulkanRenderer3D::SetCaptureScreenSwapHint(bool screenSwap)
+{
+    CurrentCaptureScreenSwapHint = screenSwap;
+    HasCurrentCaptureScreenSwapHint = true;
+}
+
 void VulkanRenderer3D::BeginCaptureFrame()
 {
     BeginCaptureFrameActiveBackend();
@@ -1257,7 +1283,11 @@ void VulkanRenderer3D::PrepareCaptureFrameActiveBackend()
     {
         if (finalizeCaptureLineFrame(exactCaptureOnly))
         {
-            HasCpuFrame = copyReadyCaptureLineToLineCache();
+            const bool readyMatchesHint =
+                !exactCaptureOnly
+                || !HasCurrentCaptureScreenSwapHint
+                || ReadyCaptureLineScreenSwap == CurrentCaptureScreenSwapHint;
+            HasCpuFrame = readyMatchesHint && copyReadyCaptureLineToLineCache();
             return;
         }
         if (CaptureLinePending)
@@ -1319,15 +1349,6 @@ void VulkanRenderer3D::BeginCaptureFrameActiveBackend()
     if (ActiveBackendMode != BackendMode::GraphicsHardware)
         return;
 
-    // GPU2D_Soft::VBlankEnd() is the boundary for the next DS-sized capture
-    // consumer. Preserve the most recently latched exact export across that
-    // boundary until a newer export is actually ready; otherwise GetLine() can
-    // see pending=0/ready=0 and hand software 2D an all-black DS source even
-    // though the previous frame already exported the correct capture.
-    //
-    // The cache is still invalidated when a new frame render actually starts,
-    // so this only carries the immediately previous exact export into the next
-    // capture consumer instead of keeping arbitrarily stale data alive.
     if (!ExactCaptureLineCachePrepared)
         HasCpuFrame = false;
     ExactCaptureLineCacheFresh = false;
@@ -1354,6 +1375,8 @@ void VulkanRenderer3D::Blit(const GPU& gpu)
 
 void VulkanRenderer3D::BlitActiveBackend(const GPU& gpu)
 {
+    CurrentRenderScreenSwap = gpu.GPU3D.RenderScreenSwapAt3D;
+
     if (ActiveBackendMode != BackendMode::GraphicsHardware
         || !Initialized
         || !ColorImageInitialized
@@ -1420,6 +1443,10 @@ void VulkanRenderer3D::StopActiveBackend(const GPU& gpu)
     clearLineCache();
     LastValidExactCaptureLineCache.fill(0);
     HasLastValidExactCapture = false;
+    LastValidExactCaptureScreenSwap = false;
+    CurrentCaptureScreenSwapHint = false;
+    HasCurrentCaptureScreenSwapHint = false;
+    CurrentRenderScreenSwap = false;
     CaptureLineExportCount = 0;
     EarlySubmitAttemptCount = 0;
     EarlySubmitHitCount = 0;
@@ -1805,6 +1832,11 @@ void VulkanRenderer3D::destroyVulkan()
         vkDestroyPipeline(Device, GraphicsFinalEdgePipeline, nullptr);
         GraphicsFinalEdgePipeline = VK_NULL_HANDLE;
     }
+    if (GraphicsFinalEdgeFogPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsFinalEdgeFogPipeline, nullptr);
+        GraphicsFinalEdgeFogPipeline = VK_NULL_HANDLE;
+    }
 
     if (GraphicsClearPipeline != VK_NULL_HANDLE)
     {
@@ -1891,6 +1923,51 @@ void VulkanRenderer3D::destroyVulkan()
     }
 
     for (VkPipeline& pipeline : GraphicsOpaquePipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulatePipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateToonPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulatePlainPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateOpaqueAlphaToonPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateOpaqueAlphaPlainPipelines)
     {
         if (pipeline != VK_NULL_HANDLE)
         {
@@ -2390,6 +2467,8 @@ void VulkanRenderer3D::resetCaptureLineState()
     ReadyCaptureLineData = nullptr;
     PendingCaptureLineBufferSlot = -1;
     ReadyCaptureLineBufferSlot = -1;
+    PendingCaptureLineScreenSwap = false;
+    ReadyCaptureLineScreenSwap = false;
 }
 
 void VulkanRenderer3D::clearRawReadbackState()
@@ -2489,6 +2568,8 @@ bool VulkanRenderer3D::finalizeCaptureLineFrame(bool blocking)
     CaptureLinePending = false;
     PendingCaptureLineContext = nullptr;
     PendingCaptureLineBufferSlot = -1;
+    ReadyCaptureLineScreenSwap = PendingCaptureLineScreenSwap;
+    PendingCaptureLineScreenSwap = false;
     CaptureLineReady = ReadyCaptureLineData != nullptr;
     return CaptureLineReady;
 }
@@ -2557,14 +2638,28 @@ void VulkanRenderer3D::consumeGpuTiming(RenderContext* context)
 
         const u64 gpuTimeNs = toGpuNs(0, TimestampQueryCount - 1);
         GpuWindow.Add(gpuTimeNs);
-        InterpGpuWindow.Add(toGpuNs(0, 1));
-        BinGpuWindow.Add(toGpuNs(1, 2));
-        WorkOffsetsGpuWindow.Add(toGpuNs(2, 3));
-        SortGpuWindow.Add(toGpuNs(3, 4));
-        RasterGpuWindow.Add(toGpuNs(4, 5));
-        DepthBlendGpuWindow.Add(toGpuNs(5, 6));
-        FinalGpuWindow.Add(toGpuNs(6, 7));
-        CaptureLineExportGpuWindow.Add(toGpuNs(7, 8));
+        if (ActiveBackendMode == BackendMode::GraphicsHardware)
+        {
+            InterpGpuWindow.Add(toGpuNs(0, 3));
+            BinGpuWindow.Add(toGpuNs(3, 4));
+            WorkOffsetsGpuWindow.Add(0);
+            SortGpuWindow.Add(0);
+            RasterGpuWindow.Add(toGpuNs(0, 4));
+            DepthBlendGpuWindow.Add(toGpuNs(4, 6));
+            FinalGpuWindow.Add(toGpuNs(6, 7));
+            CaptureLineExportGpuWindow.Add(toGpuNs(7, 8));
+        }
+        else
+        {
+            InterpGpuWindow.Add(toGpuNs(0, 1));
+            BinGpuWindow.Add(toGpuNs(1, 2));
+            WorkOffsetsGpuWindow.Add(toGpuNs(2, 3));
+            SortGpuWindow.Add(toGpuNs(3, 4));
+            RasterGpuWindow.Add(toGpuNs(4, 5));
+            DepthBlendGpuWindow.Add(toGpuNs(5, 6));
+            FinalGpuWindow.Add(toGpuNs(6, 7));
+            CaptureLineExportGpuWindow.Add(toGpuNs(7, 8));
+        }
     }
 
     timestampPending = false;
@@ -2700,15 +2795,21 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
         );
         Log(
             LogLevel::Warn,
-            "VulkanPerf[GPU3DPasses]: sceneBuild cpu avg=%.3fms p95=%.3fms opaque cpu avg=%.3fms p95=%.3fms alphaShadow cpu avg=%.3fms p95=%.3fms raster gpu avg=%.3fms p95=%.3fms final cpu avg=%.3fms p95=%.3fms final gpu avg=%.3fms p95=%.3fms captureExport cpu avg=%.3fms p95=%.3fms captureExport gpu avg=%.3fms p95=%.3fms opaqueDraws=%u needOpaqueDraws=%u alphaShadowDraws=%u triangles=%zu pipelines=%u",
+            "VulkanPerf[GPU3DPasses]: sceneBuild cpu avg=%.3fms p95=%.3fms opaque cpu avg=%.3fms p95=%.3fms opaque gpu avg=%.3fms p95=%.3fms opaqueDraw gpu avg=%.3fms p95=%.3fms edge gpu avg=%.3fms p95=%.3fms alphaShadow cpu avg=%.3fms p95=%.3fms alphaShadow gpu avg=%.3fms p95=%.3fms final cpu avg=%.3fms p95=%.3fms final gpu avg=%.3fms p95=%.3fms captureExport cpu avg=%.3fms p95=%.3fms captureExport gpu avg=%.3fms p95=%.3fms opaqueDraws=%u needOpaqueDraws=%u alphaShadowDraws=%u opaqueW=%u opaqueZ=%u opaqueTex=%u opaqueNoTex=%u opaqueMod=%u opaqueDecal=%u opaqueToon=%u opaqueHighlight=%u opaqueLinear=%u opaqueRepeat=%u opaqueMirror=%u opaqueRepeatS=%u opaqueRepeatT=%u opaqueMirrorS=%u opaqueMirrorT=%u opaqueClampS=%u opaqueClampT=%u opaqueFullAlpha=%u activeTextures=%u triangles=%zu pipelines=%u",
             PerfNsToMs(graphicsSceneBuildCpuSummary.MeanNs),
             PerfNsToMs(graphicsSceneBuildCpuSummary.P95Ns),
             PerfNsToMs(graphicsMainCpuSummary.MeanNs),
             PerfNsToMs(graphicsMainCpuSummary.P95Ns),
-            PerfNsToMs(graphicsAlphaCpuSummary.MeanNs),
-            PerfNsToMs(graphicsAlphaCpuSummary.P95Ns),
             PerfNsToMs(rasterGpuSummary.MeanNs),
             PerfNsToMs(rasterGpuSummary.P95Ns),
+            PerfNsToMs(interpGpuSummary.MeanNs),
+            PerfNsToMs(interpGpuSummary.P95Ns),
+            PerfNsToMs(binGpuSummary.MeanNs),
+            PerfNsToMs(binGpuSummary.P95Ns),
+            PerfNsToMs(graphicsAlphaCpuSummary.MeanNs),
+            PerfNsToMs(graphicsAlphaCpuSummary.P95Ns),
+            PerfNsToMs(depthBlendGpuSummary.MeanNs),
+            PerfNsToMs(depthBlendGpuSummary.P95Ns),
             PerfNsToMs(finalCpuSummary.MeanNs),
             PerfNsToMs(finalCpuSummary.P95Ns),
             PerfNsToMs(finalGpuSummary.MeanNs),
@@ -2720,9 +2821,33 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
             LastGraphicsOpaqueDrawCount,
             LastGraphicsNeedOpaqueDrawCount,
             LastGraphicsAlphaDrawCount,
+            LastGraphicsOpaqueWDrawCount,
+            LastGraphicsOpaqueZDrawCount,
+            LastGraphicsOpaqueTexturedDrawCount,
+            LastGraphicsOpaqueUntexturedDrawCount,
+            LastGraphicsOpaqueModulateDrawCount,
+            LastGraphicsOpaqueDecalDrawCount,
+            LastGraphicsOpaqueToonDrawCount,
+            LastGraphicsOpaqueHighlightDrawCount,
+            LastGraphicsOpaqueLinearDrawCount,
+            LastGraphicsOpaqueRepeatDrawCount,
+            LastGraphicsOpaqueMirrorDrawCount,
+            LastGraphicsOpaqueRepeatSDrawCount,
+            LastGraphicsOpaqueRepeatTDrawCount,
+            LastGraphicsOpaqueMirrorSDrawCount,
+            LastGraphicsOpaqueMirrorTDrawCount,
+            LastGraphicsOpaqueClampSDrawCount,
+            LastGraphicsOpaqueClampTDrawCount,
+            LastGraphicsOpaqueFullAlphaDrawCount,
+            ActiveTextureDescriptorCount,
             Triangles.size(),
             static_cast<u32>(
                 GraphicsOpaquePipelineCount
+                + GraphicsOpaquePipelineCount
+                + GraphicsOpaquePipelineCount
+                + GraphicsOpaquePipelineCount
+                + GraphicsOpaquePipelineCount
+                + GraphicsOpaquePipelineCount
                 + GraphicsTranslucentPipelineCount
                 + GraphicsBgZeroTranslucentPipelineCount
                 + GraphicsShadowMaskPipelineCount
@@ -4057,27 +4182,51 @@ bool VulkanRenderer3D::createGraphicsPipelines()
 
     VkShaderModule rasterVertModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_vert_spv, melonDS_gpu3d_vulkan_graphics_raster_vert_spv_len);
     VkShaderModule rasterFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_frag_spv_len);
+    VkShaderModule rasterNoFragDepthFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_frag_spv_len);
+    VkShaderModule rasterNoFragDepthDirectFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_frag_spv_len);
+    VkShaderModule rasterNoFragDepthDirectFastModulateFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_frag_spv_len);
+    VkShaderModule rasterNoFragDepthDirectFastModulateToonFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_toon_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_toon_frag_spv_len);
+    VkShaderModule rasterNoFragDepthDirectFastModulatePlainFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_plain_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_plain_frag_spv_len);
+    VkShaderModule rasterNoFragDepthDirectFastModulateOpaqueAlphaToonFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_opaque_alpha_toon_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_opaque_alpha_toon_frag_spv_len);
+    VkShaderModule rasterNoFragDepthDirectFastModulateOpaqueAlphaPlainFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_opaque_alpha_plain_frag_spv, melonDS_gpu3d_vulkan_graphics_raster_no_frag_depth_direct_fast_modulate_opaque_alpha_plain_frag_spv_len);
     VkShaderModule noColorFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_no_color_frag_spv, melonDS_gpu3d_vulkan_graphics_no_color_frag_spv_len);
     VkShaderModule clearFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_clear_frag_spv, melonDS_gpu3d_vulkan_graphics_clear_frag_spv_len);
     VkShaderModule finalVertModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_final_vert_spv, melonDS_gpu3d_vulkan_graphics_final_vert_spv_len);
     VkShaderModule edgeFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_edge_frag_spv, melonDS_gpu3d_vulkan_graphics_edge_frag_spv_len);
+    VkShaderModule edgeFogFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_edge_fog_frag_spv, melonDS_gpu3d_vulkan_graphics_edge_fog_frag_spv_len);
     VkShaderModule fogFragModule = createShaderModule(Device, melonDS_gpu3d_vulkan_graphics_fog_frag_spv, melonDS_gpu3d_vulkan_graphics_fog_frag_spv_len);
 
     if (rasterVertModule == VK_NULL_HANDLE
         || rasterFragModule == VK_NULL_HANDLE
+        || rasterNoFragDepthFragModule == VK_NULL_HANDLE
+        || rasterNoFragDepthDirectFragModule == VK_NULL_HANDLE
+        || rasterNoFragDepthDirectFastModulateFragModule == VK_NULL_HANDLE
+        || rasterNoFragDepthDirectFastModulateToonFragModule == VK_NULL_HANDLE
+        || rasterNoFragDepthDirectFastModulatePlainFragModule == VK_NULL_HANDLE
+        || rasterNoFragDepthDirectFastModulateOpaqueAlphaToonFragModule == VK_NULL_HANDLE
+        || rasterNoFragDepthDirectFastModulateOpaqueAlphaPlainFragModule == VK_NULL_HANDLE
         || noColorFragModule == VK_NULL_HANDLE
         || clearFragModule == VK_NULL_HANDLE
         || finalVertModule == VK_NULL_HANDLE
         || edgeFragModule == VK_NULL_HANDLE
+        || edgeFogFragModule == VK_NULL_HANDLE
         || fogFragModule == VK_NULL_HANDLE)
     {
         Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics shader modules");
         if (rasterVertModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterVertModule, nullptr);
         if (rasterFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterFragModule, nullptr);
+        if (rasterNoFragDepthFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterNoFragDepthFragModule, nullptr);
+        if (rasterNoFragDepthDirectFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterNoFragDepthDirectFragModule, nullptr);
+        if (rasterNoFragDepthDirectFastModulateFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateFragModule, nullptr);
+        if (rasterNoFragDepthDirectFastModulateToonFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateToonFragModule, nullptr);
+        if (rasterNoFragDepthDirectFastModulatePlainFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulatePlainFragModule, nullptr);
+        if (rasterNoFragDepthDirectFastModulateOpaqueAlphaToonFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateOpaqueAlphaToonFragModule, nullptr);
+        if (rasterNoFragDepthDirectFastModulateOpaqueAlphaPlainFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateOpaqueAlphaPlainFragModule, nullptr);
         if (noColorFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, noColorFragModule, nullptr);
         if (clearFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, clearFragModule, nullptr);
         if (finalVertModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, finalVertModule, nullptr);
         if (edgeFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, edgeFragModule, nullptr);
+        if (edgeFogFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, edgeFogFragModule, nullptr);
         if (fogFragModule != VK_NULL_HANDLE) vkDestroyShaderModule(Device, fogFragModule, nullptr);
         return false;
     }
@@ -4217,7 +4366,7 @@ bool VulkanRenderer3D::createGraphicsPipelines()
         pipelineCreateInfo.renderPass = GraphicsRasterRenderPass;
         pipelineCreateInfo.subpass = 0;
 
-        return vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
+        return vkCreateGraphicsPipelines(Device, ComputePipelineCache, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
     };
 
     auto createFullscreenRasterPipeline = [&](VkShaderModule fragmentModule,
@@ -4315,7 +4464,7 @@ bool VulkanRenderer3D::createGraphicsPipelines()
         pipelineCreateInfo.renderPass = GraphicsRasterRenderPass;
         pipelineCreateInfo.subpass = 0;
 
-        return vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
+        return vkCreateGraphicsPipelines(Device, ComputePipelineCache, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
     };
 
     auto createFinalPipeline = [&](VkShaderModule fragmentModule,
@@ -4384,7 +4533,7 @@ bool VulkanRenderer3D::createGraphicsPipelines()
         pipelineCreateInfo.renderPass = GraphicsFinalRenderPass;
         pipelineCreateInfo.subpass = 0;
 
-        return vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
+        return vkCreateGraphicsPipelines(Device, ComputePipelineCache, 1, &pipelineCreateInfo, nullptr, outPipeline) == VK_SUCCESS;
     };
 
     struct RasterFragmentSpecialization
@@ -4472,8 +4621,14 @@ bool VulkanRenderer3D::createGraphicsPipelines()
                 makeBlendAttachment(colorWriteR, false, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD),
             };
 
+            const bool useDirectWBufferTextureIndexing =
+                wMode != 0u && VulkanContext::Get().SupportsDynamicTextureIndexing();
+            VkShaderModule opaqueFragModule = rasterFragModule;
+            if (wMode != 0u)
+                opaqueFragModule = useDirectWBufferTextureIndexing ? rasterNoFragDepthDirectFragModule : rasterNoFragDepthFragModule;
+
             if (!createRasterPipeline(
-                    rasterFragModule,
+                    opaqueFragModule,
                     &opaqueSpecializationInfo,
                     opaqueBlendAttachments,
                     true,
@@ -4487,6 +4642,89 @@ bool VulkanRenderer3D::createGraphicsPipelines()
             {
                 Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics opaque pipeline");
                 return false;
+            }
+            if (useDirectWBufferTextureIndexing)
+            {
+                if (!createRasterPipeline(
+                        rasterNoFragDepthDirectFastModulateFragModule,
+                        &opaqueSpecializationInfo,
+                        opaqueBlendAttachments,
+                        true,
+                        depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                        true,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_REPLACE,
+                        VK_COMPARE_OP_ALWAYS,
+                        &GraphicsOpaqueFastModulatePipelines[makeOpaqueIndex(wMode, depthCompareMode)]))
+                {
+                    Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics opaque fast-modulate pipeline");
+                    return false;
+                }
+                if (!createRasterPipeline(
+                        rasterNoFragDepthDirectFastModulateToonFragModule,
+                        &opaqueSpecializationInfo,
+                        opaqueBlendAttachments,
+                        true,
+                        depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                        true,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_REPLACE,
+                        VK_COMPARE_OP_ALWAYS,
+                        &GraphicsOpaqueFastModulateToonPipelines[makeOpaqueIndex(wMode, depthCompareMode)]))
+                {
+                    Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics opaque fast-modulate-toon pipeline");
+                    return false;
+                }
+                if (!createRasterPipeline(
+                        rasterNoFragDepthDirectFastModulatePlainFragModule,
+                        &opaqueSpecializationInfo,
+                        opaqueBlendAttachments,
+                        true,
+                        depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                        true,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_REPLACE,
+                        VK_COMPARE_OP_ALWAYS,
+                        &GraphicsOpaqueFastModulatePlainPipelines[makeOpaqueIndex(wMode, depthCompareMode)]))
+                {
+                    Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics opaque fast-modulate-plain pipeline");
+                    return false;
+                }
+                if (!createRasterPipeline(
+                        rasterNoFragDepthDirectFastModulateOpaqueAlphaToonFragModule,
+                        &opaqueSpecializationInfo,
+                        opaqueBlendAttachments,
+                        true,
+                        depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                        true,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_REPLACE,
+                        VK_COMPARE_OP_ALWAYS,
+                        &GraphicsOpaqueFastModulateOpaqueAlphaToonPipelines[makeOpaqueIndex(wMode, depthCompareMode)]))
+                {
+                    Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics opaque fast-modulate-opaque-alpha-toon pipeline");
+                    return false;
+                }
+                if (!createRasterPipeline(
+                        rasterNoFragDepthDirectFastModulateOpaqueAlphaPlainFragModule,
+                        &opaqueSpecializationInfo,
+                        opaqueBlendAttachments,
+                        true,
+                        depthCompareMode != 0u ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS,
+                        true,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_KEEP,
+                        VK_STENCIL_OP_REPLACE,
+                        VK_COMPARE_OP_ALWAYS,
+                        &GraphicsOpaqueFastModulateOpaqueAlphaPlainPipelines[makeOpaqueIndex(wMode, depthCompareMode)]))
+                {
+                    Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics opaque fast-modulate-opaque-alpha-plain pipeline");
+                    return false;
+                }
             }
 
             for (u32 depthWriteMode = 0; depthWriteMode < GraphicsDepthWriteModeCount; depthWriteMode++)
@@ -4797,6 +5035,21 @@ bool VulkanRenderer3D::createGraphicsPipelines()
         return false;
     }
 
+    const VkPipelineColorBlendAttachmentState finalEdgeFogBlendAttachment = makeBlendAttachment(
+        colorWriteRgb,
+        true,
+        VK_BLEND_FACTOR_ONE,
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_OP_ADD,
+        VK_BLEND_FACTOR_ONE,
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        VK_BLEND_OP_ADD);
+    if (!createFinalPipeline(edgeFogFragModule, finalEdgeFogBlendAttachment, &GraphicsFinalEdgeFogPipeline))
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics final-edge-fog pipeline");
+        return false;
+    }
+
     const VkPipelineColorBlendAttachmentState finalFogBlendAttachment = makeBlendAttachment(
         colorWriteRgb,
         true,
@@ -4814,13 +5067,22 @@ bool VulkanRenderer3D::createGraphicsPipelines()
 
     vkDestroyShaderModule(Device, rasterVertModule, nullptr);
     vkDestroyShaderModule(Device, rasterFragModule, nullptr);
+    vkDestroyShaderModule(Device, rasterNoFragDepthFragModule, nullptr);
+    vkDestroyShaderModule(Device, rasterNoFragDepthDirectFragModule, nullptr);
+    vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateFragModule, nullptr);
+    vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateToonFragModule, nullptr);
+    vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulatePlainFragModule, nullptr);
+    vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateOpaqueAlphaToonFragModule, nullptr);
+    vkDestroyShaderModule(Device, rasterNoFragDepthDirectFastModulateOpaqueAlphaPlainFragModule, nullptr);
     vkDestroyShaderModule(Device, noColorFragModule, nullptr);
     vkDestroyShaderModule(Device, clearFragModule, nullptr);
     vkDestroyShaderModule(Device, finalVertModule, nullptr);
     vkDestroyShaderModule(Device, edgeFragModule, nullptr);
+    vkDestroyShaderModule(Device, edgeFogFragModule, nullptr);
     vkDestroyShaderModule(Device, fogFragModule, nullptr);
 
     GraphicsReady = true;
+    savePipelineCache();
     return true;
 }
 
@@ -8933,16 +9195,20 @@ bool VulkanRenderer3D::dispatchRasterAndReadback(
             CaptureLinePending = false;
             PendingCaptureLineContext = nullptr;
             PendingCaptureLineBufferSlot = -1;
+            PendingCaptureLineScreenSwap = false;
             CaptureLineReady = ReadyCaptureLineData != nullptr;
             ReadyCaptureLineBufferSlot = CaptureLineReady ? static_cast<int>(ActiveCaptureLineBufferSlot) : -1;
+            ReadyCaptureLineScreenSwap = CurrentRenderScreenSwap;
         }
         else
         {
             CaptureLinePending = true;
             PendingCaptureLineContext = context;
             PendingCaptureLineBufferSlot = -1;
+            PendingCaptureLineScreenSwap = CurrentRenderScreenSwap;
             CaptureLineReady = false;
             ReadyCaptureLineBufferSlot = -1;
+            ReadyCaptureLineScreenSwap = false;
         }
     }
 
@@ -8967,7 +9233,11 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
     bool readbackToCpu,
     bool captureReadbackPath)
 {
+    constexpr u32 kTriangleFlagTextured = 1u << 1u;
+    constexpr u32 kTriangleFlagDecal = 1u << 2u;
     constexpr u32 kTriangleFlagWBuffer = 1u << 4u;
+    constexpr u32 kTriangleFlagLinear = 1u << 6u;
+    constexpr u32 kTriangleFlagTextureOpaque = 1u << 14u;
     constexpr u32 kCaptureReadbackWidth = 256u;
     constexpr u32 kCaptureReadbackHeight = 192u;
 
@@ -9018,6 +9288,20 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
     if (captureReadbackPath && (captureLineBuffer == VK_NULL_HANDLE || captureLineMapped == nullptr))
         return false;
 
+    if (useSynchronousContext)
+    {
+        const u64 waitStartNs = PerfNowNs();
+        const VkResult waitResult = vkWaitForFences(Device, 1, &frameFence, VK_TRUE, UINT64_MAX);
+        if (waitResult != VK_SUCCESS)
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: graphics vkWaitForFences failed (%d)", static_cast<int>(waitResult));
+            return false;
+        }
+
+        FenceWaitCpuWindow.Add(PerfNowNs() - waitStartNs);
+        consumeGpuTiming(nullptr);
+    }
+
     if (!updateToonBuffer(context, toonTable))
         return false;
 
@@ -9052,20 +9336,6 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
             if (!createReadbackBuffer(readbackWidth, readbackHeight))
                 return false;
         }
-    }
-
-    if (useSynchronousContext)
-    {
-        const u64 waitStartNs = PerfNowNs();
-        const VkResult waitResult = vkWaitForFences(Device, 1, &frameFence, VK_TRUE, UINT64_MAX);
-        if (waitResult != VK_SUCCESS)
-        {
-            Log(LogLevel::Error, "VulkanRenderer3D: graphics vkWaitForFences failed (%d)", static_cast<int>(waitResult));
-            return false;
-        }
-
-        FenceWaitCpuWindow.Add(PerfNowNs() - waitStartNs);
-        consumeGpuTiming(nullptr);
     }
 
     if (vkResetFences(Device, 1, &frameFence) != VK_SUCCESS)
@@ -9330,7 +9600,8 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (GraphicsClearPipeline != VK_NULL_HANDLE)
+    const bool useBitmapClear = (dispCnt & (1u << 14u)) != 0u;
+    if (useBitmapClear && GraphicsClearPipeline != VK_NULL_HANDLE)
     {
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsClearPipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
@@ -9362,6 +9633,41 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         u32 mainShadowBlend = 0;
         u32 mainTranslucent = 0;
     } graphicsPassDebugStats{};
+
+    VkPipeline boundGraphicsPipeline = VK_NULL_HANDLE;
+    bool graphicsDescriptorSetBound = false;
+    u32 boundStencilCompareMask = std::numeric_limits<u32>::max();
+    u32 boundStencilWriteMask = std::numeric_limits<u32>::max();
+    u32 boundStencilReference = std::numeric_limits<u32>::max();
+    const auto bindGraphicsPipelineCached = [&](VkPipeline pipeline) {
+        if (boundGraphicsPipeline == pipeline)
+            return;
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        boundGraphicsPipeline = pipeline;
+    };
+    const auto bindGraphicsDescriptorSetCached = [&]() {
+        if (graphicsDescriptorSetBound)
+            return;
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        graphicsDescriptorSetBound = true;
+    };
+    const auto setStencilStateCached = [&](u32 compareMask, u32 writeMask, u32 reference) {
+        if (boundStencilCompareMask != compareMask)
+        {
+            vkCmdSetStencilCompareMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, compareMask);
+            boundStencilCompareMask = compareMask;
+        }
+        if (boundStencilWriteMask != writeMask)
+        {
+            vkCmdSetStencilWriteMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, writeMask);
+            boundStencilWriteMask = writeMask;
+        }
+        if (boundStencilReference != reference)
+        {
+            vkCmdSetStencilReference(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
+            boundStencilReference = reference;
+        }
+    };
 
     const auto opaquePipelineIndexFor = [&](const GraphicsPolygonDraw& draw) -> u32 {
         const bool wBuffer = draw.triangleCount > 0u
@@ -9401,6 +9707,52 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
     const auto fogWriteEnabledFor = [&](const GraphicsPolygonDraw& draw) -> bool {
         return ((dispCnt & (1u << 7u)) != 0u) && ((draw.polyAttr & (1u << 15u)) == 0u);
     };
+    const auto fastOpaqueModulatePipelineFor = [&](const GraphicsPolygonDraw& draw, u32 pipelineIndex) -> VkPipeline {
+        if ((dispCnt & (1u << 0u)) == 0u
+            || draw.firstTriangle >= Triangles.size()
+            || pipelineIndex >= GraphicsOpaqueFastModulatePipelines.size())
+        {
+            return VK_NULL_HANDLE;
+        }
+
+        const u32 flags = Triangles[draw.firstTriangle].flags;
+        const u32 requiredFlags = kTriangleFlagWBuffer | kTriangleFlagTextured;
+        const u32 disallowedFlags = kTriangleFlagDecal | kTriangleFlagLinear;
+        if ((flags & requiredFlags) != requiredFlags || (flags & disallowedFlags) != 0u)
+            return VK_NULL_HANDLE;
+
+        const u32 blendMode = (draw.polyAttr >> 4u) & 0x3u;
+        const bool fullAlpha =
+            (flags & kTriangleFlagTextureOpaque) != 0u
+            && ((draw.polyAttr >> 16u) & 0x1Fu) == 0x1Fu
+            && alphaRef < 0x1Fu;
+        if (blendMode == 2u && (dispCnt & (1u << 1u)) == 0u)
+        {
+            if (fullAlpha)
+            {
+                VkPipeline pipeline = GraphicsOpaqueFastModulateOpaqueAlphaToonPipelines[pipelineIndex];
+                if (pipeline != VK_NULL_HANDLE)
+                    return pipeline;
+            }
+            VkPipeline pipeline = GraphicsOpaqueFastModulateToonPipelines[pipelineIndex];
+            if (pipeline != VK_NULL_HANDLE)
+                return pipeline;
+        }
+        else if (blendMode != 2u)
+        {
+            if (fullAlpha)
+            {
+                VkPipeline pipeline = GraphicsOpaqueFastModulateOpaqueAlphaPlainPipelines[pipelineIndex];
+                if (pipeline != VK_NULL_HANDLE)
+                    return pipeline;
+            }
+            VkPipeline pipeline = GraphicsOpaqueFastModulatePlainPipelines[pipelineIndex];
+            if (pipeline != VK_NULL_HANDLE)
+                return pipeline;
+        }
+
+        return GraphicsOpaqueFastModulatePipelines[pipelineIndex];
+    };
     const auto bindAndDrawGraphics = [&](const GraphicsPolygonDraw& draw,
                                          VkPipeline pipeline,
                                          u32 stencilCompareMask,
@@ -9409,24 +9761,29 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         if (pipeline == VK_NULL_HANDLE || draw.triangleCount == 0u || draw.firstTriangle >= Triangles.size())
             return false;
 
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-        pushConstants.depthBlendMode = (Triangles[draw.firstTriangle].flags & kTriangleFlagWBuffer) != 0u ? 1u : 0u;
-        pushConstants.triangleBase = draw.firstTriangle;
+        bindGraphicsPipelineCached(pipeline);
+        bindGraphicsDescriptorSetCached();
+        const TriangleGpu& firstTriangle = Triangles[draw.firstTriangle];
+        pushConstants.depthBlendMode = draw.polyAttr;
+        pushConstants.variantKey = ((firstTriangle.texLayer & 0xFFFFu) << 16u) | (firstTriangle.texArrayIndex & 0xFFFFu);
+        pushConstants.passIndex = ((firstTriangle.texHeight & 0xFFFFu) << 16u) | (firstTriangle.texWidth & 0xFFFFu);
+        pushConstants.triangleBase = firstTriangle.texParam;
         pushConstants.triangleCount = draw.triangleCount;
         vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
-        vkCmdSetStencilCompareMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, stencilCompareMask);
-        vkCmdSetStencilWriteMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, stencilWriteMask);
-        vkCmdSetStencilReference(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, stencilReference);
+        setStencilStateCached(stencilCompareMask, stencilWriteMask, stencilReference);
         vkCmdDraw(commandBuffer, draw.triangleCount * 3u, 1u, draw.firstTriangle * 3u, 0u);
         drawCount++;
         return true;
     };
     const auto drawNeedOpaquePass = [&](const GraphicsPolygonDraw& draw) {
         const u32 pipelineIndex = opaquePipelineIndexFor(draw);
-        const VkPipeline pipeline = pipelineIndex < GraphicsOpaquePipelines.size()
-            ? GraphicsOpaquePipelines[pipelineIndex]
-            : VK_NULL_HANDLE;
+        VkPipeline pipeline = fastOpaqueModulatePipelineFor(draw, pipelineIndex);
+        if (pipeline == VK_NULL_HANDLE)
+        {
+            pipeline = pipelineIndex < GraphicsOpaquePipelines.size()
+                ? GraphicsOpaquePipelines[pipelineIndex]
+                : VK_NULL_HANDLE;
+        }
         bindAndDrawGraphics(draw, pipeline, 0xFFu, 0xFFu, (draw.polyAttr >> 24u) & 0x3Fu);
     };
     const auto bindAndDrawGraphicsEdges = [&](const GraphicsPolygonDraw& draw) -> bool {
@@ -9440,8 +9797,8 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         if (pipeline == VK_NULL_HANDLE)
             return false;
 
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        bindGraphicsPipelineCached(pipeline);
+        bindGraphicsDescriptorSetCached();
         pushConstants.depthBlendMode = wMode;
         pushConstants.triangleBase = draw.firstTriangle;
         pushConstants.triangleCount = draw.triangleCount;
@@ -9454,12 +9811,10 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         if (GraphicsStencilBitClearPipeline == VK_NULL_HANDLE)
             return;
 
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsStencilBitClearPipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        bindGraphicsPipelineCached(GraphicsStencilBitClearPipeline);
+        bindGraphicsDescriptorSetCached();
         vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
-        vkCmdSetStencilCompareMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0x80u);
-        vkCmdSetStencilWriteMask(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0x80u);
-        vkCmdSetStencilReference(commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0x00u);
+        setStencilStateCached(0x80u, 0x80u, 0x00u);
         vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
         drawCount++;
     };
@@ -9474,10 +9829,18 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
 
         const GraphicsPolygonDraw& draw = GraphicsPolygons[drawIndex];
         const u32 pipelineIndex = opaquePipelineIndexFor(draw);
-        const VkPipeline pipeline = pipelineIndex < GraphicsOpaquePipelines.size() ? GraphicsOpaquePipelines[pipelineIndex] : VK_NULL_HANDLE;
+        VkPipeline pipeline = fastOpaqueModulatePipelineFor(draw, pipelineIndex);
+        if (pipeline == VK_NULL_HANDLE)
+        {
+            pipeline = pipelineIndex < GraphicsOpaquePipelines.size()
+                ? GraphicsOpaquePipelines[pipelineIndex]
+                : VK_NULL_HANDLE;
+        }
         if (bindAndDrawGraphics(draw, pipeline, 0xFFu, 0xFFu, (draw.polyAttr >> 24u) & 0x3Fu))
             graphicsPassDebugStats.opaque++;
     }
+    if ((timestampQueryPool != VK_NULL_HANDLE) && timestampPending)
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 3);
 
     if ((dispCnt & (1u << 5u)) != 0u)
     {
@@ -9630,6 +9993,8 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         }
     }
     GraphicsAlphaCpuWindow.Add(PerfNowNs() - graphicsAlphaCpuStartNs);
+    if ((timestampQueryPool != VK_NULL_HANDLE) && timestampPending)
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 6);
 
     if (MelonDSAndroid::areRendererDebugToolsEnabled() && CaptureDebugLogsRemaining > 0u)
     {
@@ -9719,20 +10084,28 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    if (runEdgePass && GraphicsFinalEdgePipeline != VK_NULL_HANDLE)
+    if (runEdgePass && runFogPass && GraphicsFinalEdgeFogPipeline != VK_NULL_HANDLE)
     {
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsFinalEdgePipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        bindGraphicsPipelineCached(GraphicsFinalEdgeFogPipeline);
+        bindGraphicsDescriptorSetCached();
+        vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
+    }
+    else if (runEdgePass && GraphicsFinalEdgePipeline != VK_NULL_HANDLE)
+    {
+        bindGraphicsPipelineCached(GraphicsFinalEdgePipeline);
+        bindGraphicsDescriptorSetCached();
         vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
         const float edgeBlendConstants[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         vkCmdSetBlendConstants(commandBuffer, edgeBlendConstants);
         vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
     }
 
-    if (runFogPass && GraphicsFinalFogPipeline != VK_NULL_HANDLE)
+    if (!(runEdgePass && runFogPass && GraphicsFinalEdgeFogPipeline != VK_NULL_HANDLE)
+        && runFogPass && GraphicsFinalFogPipeline != VK_NULL_HANDLE)
     {
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsFinalFogPipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, GraphicsPipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        bindGraphicsPipelineCached(GraphicsFinalFogPipeline);
+        bindGraphicsDescriptorSetCached();
         vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
         const float fogBlendConstants[4] = {
             static_cast<float>(fogColor & 0x1Fu) * (1.0f / 31.0f),
@@ -9748,10 +10121,7 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
     FinalCpuWindow.Add(PerfNowNs() - finalCpuStartNs);
 
     if ((timestampQueryPool != VK_NULL_HANDLE) && timestampPending)
-    {
-        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 6);
         vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, timestampQueryPool, 7);
-    }
 
     bool deferCaptureReadbackCompletion = false;
     if (captureReadbackPath || readbackToCpu)
@@ -9990,9 +10360,11 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         CaptureLinePending = true;
         CaptureLineDataIsRgba8 = false;
         PendingCaptureLineBufferSlot = -1;
+        PendingCaptureLineScreenSwap = CurrentRenderScreenSwap;
         CaptureLineReady = false;
         ReadyCaptureLineBufferSlot = -1;
         ReadyCaptureLineData = nullptr;
+        ReadyCaptureLineScreenSwap = false;
         ActiveCapturePathMode = CapturePathMode::CaptureLineExport;
         CapturePathModeCounts[static_cast<size_t>(CapturePathMode::CaptureLineExport)]++;
     }
@@ -10271,9 +10643,11 @@ bool VulkanRenderer3D::submitGraphicsCaptureExportForCurrentFrame()
     CaptureLinePending = true;
     CaptureLineDataIsRgba8 = true;
     PendingCaptureLineBufferSlot = static_cast<int>(ActiveCaptureLineBufferSlot);
+    PendingCaptureLineScreenSwap = CurrentRenderScreenSwap;
     CaptureLineReady = false;
     ReadyCaptureLineBufferSlot = -1;
     ReadyCaptureLineData = nullptr;
+    ReadyCaptureLineScreenSwap = false;
     ActiveCapturePathMode = CapturePathMode::CaptureLineExport;
     CapturePathModeCounts[static_cast<size_t>(CapturePathMode::CaptureLineExport)]++;
     return true;
@@ -11033,6 +11407,7 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
     constexpr u32 kTriangleFlagTopLeftEdge0 = 1u << 11u;
     constexpr u32 kTriangleFlagTopLeftEdge1 = 1u << 12u;
     constexpr u32 kTriangleFlagTopLeftEdge2 = 1u << 13u;
+    constexpr u32 kTriangleFlagTextureOpaque = 1u << 14u;
     constexpr u32 kVariantFlagTextured = 1u << 0u;
     constexpr u32 kVariantFlagDecal = 1u << 1u;
     constexpr u32 kVariantFlagModulate = 1u << 2u;
@@ -11129,6 +11504,7 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
         u32* helper = nullptr;
         u32 textureDescriptorIndex = FallbackTextureDescriptorIndex;
         bool textureFallbackUsed = false;
+        bool textureLayerOpaque = false;
         u32 texWidth = 0u;
         u32 texHeight = 0u;
         if (polygonTextured)
@@ -11170,12 +11546,15 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                         texWidth = 1u;
                         texHeight = 1u;
                         textureFallbackUsed = true;
+                        textureLayerOpaque = true;
                     }
                 }
                 else
                 {
                     textureDescriptorIndex = textureIt->second.DescriptorIndex;
                 }
+                if (!textureFallbackUsed)
+                    textureLayerOpaque = Texcache.GetLoader().IsTextureLayerOpaque(textureHandle, textureLayer);
             }
         }
 
@@ -11184,6 +11563,8 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
         if (hasTexture)
         {
             sceneVertexFlags |= kTriangleFlagTextured;
+            if (textureLayerOpaque)
+                sceneVertexFlags |= kTriangleFlagTextureOpaque;
             if ((blendMode & 0x1u) != 0u && !textureFallbackUsed)
                 sceneVertexFlags |= kTriangleFlagDecal;
         }
@@ -11236,8 +11617,8 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
 
         const auto makeTriangleVertex = [&](const AcceleratedSceneVertex& vertex, float x, float y) -> TriangleVertexData {
             TriangleVertexData triangleVertex{};
-            triangleVertex.x = std::clamp(x, 0.0f, maxTargetX);
-            triangleVertex.y = std::clamp(y, 0.0f, maxTargetY);
+            triangleVertex.x = x;
+            triangleVertex.y = y;
             triangleVertex.z = static_cast<float>(vertex.Z);
             triangleVertex.wRaw = std::max<u32>(1u, vertex.W);
             triangleVertex.w = static_cast<float>(triangleVertex.wRaw);
@@ -11290,6 +11671,8 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
             if (hasTexture)
             {
                 triangle.flags |= kTriangleFlagTextured;
+                if (textureLayerOpaque)
+                    triangle.flags |= kTriangleFlagTextureOpaque;
                 if ((blendMode & 0x1u) != 0u && !textureFallbackUsed)
                     triangle.flags |= kTriangleFlagDecal;
                 triangle.texArrayIndex = textureDescriptorIndex;
@@ -11457,16 +11840,16 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
             const float perpY = deltaX * inverseLineLength * halfLineWidth;
 
             const float quadPositionsX[4] = {
-                std::clamp(lineX0 + perpX, 0.0f, maxTargetX),
-                std::clamp(lineX0 - perpX, 0.0f, maxTargetX),
-                std::clamp(lineX1 - perpX, 0.0f, maxTargetX),
-                std::clamp(lineX1 + perpX, 0.0f, maxTargetX),
+                lineX0 + perpX,
+                lineX0 - perpX,
+                lineX1 - perpX,
+                lineX1 + perpX,
             };
             const float quadPositionsY[4] = {
-                std::clamp(lineY0 + perpY, 0.0f, maxTargetY),
-                std::clamp(lineY0 - perpY, 0.0f, maxTargetY),
-                std::clamp(lineY1 - perpY, 0.0f, maxTargetY),
-                std::clamp(lineY1 + perpY, 0.0f, maxTargetY),
+                lineY0 + perpY,
+                lineY0 - perpY,
+                lineY1 - perpY,
+                lineY1 + perpY,
             };
 
             const std::optional<u32> packedLineYBounds = packYBounds(quadPositionsY, 4u);
@@ -11533,6 +11916,87 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
     LastGraphicsNeedOpaqueDrawCount = static_cast<u32>(GraphicsNeedOpaqueDrawIndices.size());
     LastGraphicsAlphaDrawCount = static_cast<u32>(
         GraphicsAlphaDrawIndices.size() + GraphicsShadowMaskDrawIndices.size() + GraphicsShadowDrawIndices.size());
+    LastGraphicsOpaqueWDrawCount = 0;
+    LastGraphicsOpaqueZDrawCount = 0;
+    LastGraphicsOpaqueTexturedDrawCount = 0;
+    LastGraphicsOpaqueUntexturedDrawCount = 0;
+    LastGraphicsOpaqueModulateDrawCount = 0;
+    LastGraphicsOpaqueDecalDrawCount = 0;
+    LastGraphicsOpaqueToonDrawCount = 0;
+    LastGraphicsOpaqueHighlightDrawCount = 0;
+    LastGraphicsOpaqueLinearDrawCount = 0;
+    LastGraphicsOpaqueRepeatDrawCount = 0;
+    LastGraphicsOpaqueMirrorDrawCount = 0;
+    LastGraphicsOpaqueRepeatSDrawCount = 0;
+    LastGraphicsOpaqueRepeatTDrawCount = 0;
+    LastGraphicsOpaqueMirrorSDrawCount = 0;
+    LastGraphicsOpaqueMirrorTDrawCount = 0;
+    LastGraphicsOpaqueClampSDrawCount = 0;
+    LastGraphicsOpaqueClampTDrawCount = 0;
+    LastGraphicsOpaqueFullAlphaDrawCount = 0;
+    for (u32 drawIndex : GraphicsOpaqueDrawIndices)
+    {
+        if (drawIndex >= GraphicsPolygons.size())
+            continue;
+
+        const GraphicsPolygonDraw& draw = GraphicsPolygons[drawIndex];
+        const u32 firstTriangleFlags = draw.firstTriangle < Triangles.size() ? Triangles[draw.firstTriangle].flags : 0u;
+        if ((draw.flags & AcceleratedPolygonFlagWBuffer) != 0u)
+            LastGraphicsOpaqueWDrawCount++;
+        else
+            LastGraphicsOpaqueZDrawCount++;
+
+        const bool textured = (firstTriangleFlags & kTriangleFlagTextured) != 0u;
+        if (textured)
+        {
+            LastGraphicsOpaqueTexturedDrawCount++;
+            if ((firstTriangleFlags & kTriangleFlagTextureOpaque) != 0u
+                && ((draw.polyAttr >> 16u) & 0x1Fu) == 0x1Fu
+                && gpu.GPU3D.RenderAlphaRef < 0x1Fu)
+            {
+                LastGraphicsOpaqueFullAlphaDrawCount++;
+            }
+            if ((firstTriangleFlags & kTriangleFlagDecal) != 0u)
+                LastGraphicsOpaqueDecalDrawCount++;
+            else
+                LastGraphicsOpaqueModulateDrawCount++;
+
+            const u32 texParam = Triangles[draw.firstTriangle].texParam;
+            const bool repeatS = (texParam & (1u << 16u)) != 0u;
+            const bool repeatT = (texParam & (1u << 17u)) != 0u;
+            const bool mirrorS = (texParam & (1u << 18u)) != 0u;
+            const bool mirrorT = (texParam & (1u << 19u)) != 0u;
+            if (repeatS || repeatT)
+                LastGraphicsOpaqueRepeatDrawCount++;
+            if (mirrorS || mirrorT)
+                LastGraphicsOpaqueMirrorDrawCount++;
+            if (repeatS)
+                LastGraphicsOpaqueRepeatSDrawCount++;
+            else
+                LastGraphicsOpaqueClampSDrawCount++;
+            if (repeatT)
+                LastGraphicsOpaqueRepeatTDrawCount++;
+            else
+                LastGraphicsOpaqueClampTDrawCount++;
+            if (mirrorS)
+                LastGraphicsOpaqueMirrorSDrawCount++;
+            if (mirrorT)
+                LastGraphicsOpaqueMirrorTDrawCount++;
+        }
+        else
+            LastGraphicsOpaqueUntexturedDrawCount++;
+
+        const u32 blendMode = (draw.polyAttr >> 4u) & 0x3u;
+        if (blendMode == 2u)
+        {
+            if (highlightEnabled)
+                LastGraphicsOpaqueHighlightDrawCount++;
+            else
+                LastGraphicsOpaqueToonDrawCount++;
+        }
+        if ((firstTriangleFlags & kTriangleFlagLinear) != 0u)
+            LastGraphicsOpaqueLinearDrawCount++;
+    }
 
     if (MelonDSAndroid::areRendererDebugToolsEnabled() && CaptureDebugLogsRemaining > 0u)
     {
@@ -12551,6 +13015,16 @@ bool VulkanRenderer3D::copyReadyCaptureLineToLineCache()
         resetCaptureLineState();
         return false;
     }
+    if (ActiveBackendMode == BackendMode::GraphicsHardware
+        && HasCurrentCaptureScreenSwapHint
+        && ReadyCaptureLineScreenSwap != CurrentCaptureScreenSwapHint)
+    {
+        CaptureLineReady = false;
+        ReadyCaptureLineData = nullptr;
+        ReadyCaptureLineBufferSlot = -1;
+        ReadyCaptureLineScreenSwap = false;
+        return false;
+    }
 
     if (CaptureLineDataIsRgba8)
     {
@@ -12581,6 +13055,7 @@ bool VulkanRenderer3D::copyReadyCaptureLineToLineCache()
     {
         LastValidExactCaptureLineCache = LineCache;
         HasLastValidExactCapture = true;
+        LastValidExactCaptureScreenSwap = ReadyCaptureLineScreenSwap;
     }
     CaptureLineReady = false;
     ReadyCaptureLineData = nullptr;
@@ -12597,6 +13072,11 @@ bool VulkanRenderer3D::restoreLastValidExactCaptureToLineCache()
 {
     if (!HasLastValidExactCapture)
         return false;
+    if (HasCurrentCaptureScreenSwapHint
+        && LastValidExactCaptureScreenSwap != CurrentCaptureScreenSwapHint)
+    {
+        return false;
+    }
 
     LineCache = LastValidExactCaptureLineCache;
     ExactCaptureLineCachePrepared = true;

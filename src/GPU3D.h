@@ -273,6 +273,8 @@ public:
 
     bool RenderFrameIdentical = false; // not part of the hardware state, don't serialize
 
+    bool RenderScreenSwapAt3D = false;
+
     bool AbortFrame = false;
 
     u64 Timestamp = 0;
@@ -354,6 +356,7 @@ public:
     virtual void SetupAccelFrame() {}
     virtual void PrepareCaptureFrame() {}
     virtual void BeginCaptureFrame() {}
+    virtual void SetCaptureScreenSwapHint(bool screenSwap) { (void)screenSwap; }
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
 

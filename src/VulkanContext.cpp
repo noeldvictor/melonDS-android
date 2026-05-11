@@ -96,6 +96,11 @@ VulkanDeviceProfile makeDeviceProfile(const VkPhysicalDeviceProperties& devicePr
         deviceProperties.vendorID == 0x13B5u
         || containsInsensitive(deviceNameLower, "mali")
         || containsInsensitive(deviceNameLower, "arm");
+    profile.IsPowerVR =
+        containsInsensitive(deviceNameLower, "powervr")
+        || containsInsensitive(deviceNameLower, "power vr")
+        || containsInsensitive(deviceNameLower, "imgtec")
+        || containsInsensitive(deviceNameLower, "imagination");
     profile.IsMaliG52Class =
         profile.IsArmMali
         && (containsInsensitive(deviceNameLower, "g52") || containsInsensitive(deviceNameLower, "mali-g52"));
@@ -645,12 +650,13 @@ bool VulkanContext::initializeLocked()
         }
         Platform::Log(
             Platform::LogLevel::Warn,
-            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d g52=%d timeline=%d dynamicIndexing=%d nonUniformTextures=%d ahbInterop=%d forceTimelineOff=%d forceDynamicOff=%d)",
+            "VulkanContext: selected '%s' (vendor=%#x device=%#x adreno=%d mali=%d powervr=%d g52=%d timeline=%d dynamicIndexing=%d nonUniformTextures=%d ahbInterop=%d forceTimelineOff=%d forceDynamicOff=%d)",
             deviceProperties.deviceName,
             deviceProperties.vendorID,
             deviceProperties.deviceID,
             DeviceProfile.IsAdreno ? 1 : 0,
             DeviceProfile.IsArmMali ? 1 : 0,
+            DeviceProfile.IsPowerVR ? 1 : 0,
             DeviceProfile.IsMaliG52Class ? 1 : 0,
             TimelineSemaphoresSupported ? 1 : 0,
             DynamicTextureIndexingSupported ? 1 : 0,

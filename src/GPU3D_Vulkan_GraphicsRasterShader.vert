@@ -47,15 +47,7 @@ void main()
     vec2 screenSize = vec2(max(pc.width, 1u), max(pc.height, 1u));
     vec2 ndcXY = ((vec2(x, y) * 2.0) / screenSize) - 1.0;
 
-    if ((pc.depthBlendMode & 0x1u) != 0u)
-    {
-        gl_Position = vec4(ndcXY * clipW, 0.0, clipW);
-    }
-    else
-    {
-        float clipZ = clamp((z * (1.0 / 8388608.0)) - 1.0, -1.0, 1.0);
-        gl_Position = vec4(ndcXY * clipW, clipZ * clipW, clipW);
-    }
+    gl_Position = vec4(ndcXY * clipW, depth * clipW, clipW);
 
     fDepthLinear = depth;
     fDepthPerspective = depth;
