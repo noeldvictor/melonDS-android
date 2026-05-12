@@ -317,13 +317,6 @@ Color6A5 sampleTexture()
         return whiteTexel;
     }
 
-    if ((flags & TRI_FLAG_LINEAR) != 0u)
-    {
-        vec2 renderScale = max(vec2(float(pc.width) * (1.0 / 256.0), float(pc.height) * (1.0 / 192.0)), vec2(1.0));
-        vec2 subpixelOffset = mod(gl_FragCoord.xy - vec2(0.5), renderScale);
-        texcoord += dFdx(fTexcoord) * -subpixelOffset.x + dFdy(fTexcoord) * -subpixelOffset.y;
-        texcoord -= vec2(LINEAR_TEXEL_COORD_BIAS);
-    }
 #endif
 
     int sampleS = int(floor(texcoord.x));
