@@ -39,7 +39,6 @@ public:
     enum class BackendMode : u8
     {
         GraphicsHardware = 1,
-        ComputeLegacy = 2,
     };
 
     static std::unique_ptr<VulkanRenderer3D> New() noexcept;
@@ -114,7 +113,6 @@ public:
 
 private:
     class IVulkan3DBackend;
-    class ComputeLegacyBackend;
     class SimpleGraphicsBackend;
 
     static constexpr u32 MaxTextureDescriptors = 128;
@@ -559,7 +557,6 @@ private:
     BackendMode RequestedBackendMode = BackendMode::GraphicsHardware;
     BackendMode ActiveBackendMode = BackendMode::GraphicsHardware;
     bool UseSimplePipeline = true;
-    std::unique_ptr<IVulkan3DBackend> ComputeLegacyBackendInstance;
     std::unique_ptr<IVulkan3DBackend> SimpleGraphicsBackendInstance;
     RasterExecutionProfile ActiveRasterExecutionProfile = RasterExecutionProfile::LegacyFallback;
     RasterTileLoopMode ActiveRasterTileLoopMode = RasterTileLoopMode::DenseGroupList;

@@ -519,71 +519,6 @@ protected:
     VulkanRenderer3D& Renderer;
 };
 
-class VulkanRenderer3D::ComputeLegacyBackend final : public VulkanRenderer3D::IVulkan3DBackend
-{
-public:
-    using IVulkan3DBackend::IVulkan3DBackend;
-
-    BackendMode mode() const noexcept override
-    {
-        return BackendMode::ComputeLegacy;
-    }
-
-    void Reset(GPU& gpu) override
-    {
-        activate();
-        Renderer.ResetActiveBackend(gpu);
-    }
-
-    void VCount144(GPU& gpu) override
-    {
-        activate();
-        Renderer.VCount144ActiveBackend(gpu);
-    }
-
-    void RenderFrame(GPU& gpu) override
-    {
-        activate();
-        Renderer.RenderFrameActiveBackend(gpu);
-    }
-
-    void RestartFrame(GPU& gpu) override
-    {
-        activate();
-        Renderer.RestartFrameActiveBackend(gpu);
-    }
-
-    u32* GetLine(int line) override
-    {
-        activate();
-        return Renderer.GetLineActiveBackend(line);
-    }
-
-    void SetupAccelFrame() override
-    {
-        activate();
-        Renderer.SetupAccelFrameActiveBackend();
-    }
-
-    void PrepareCaptureFrame() override
-    {
-        activate();
-        Renderer.PrepareCaptureFrameActiveBackend();
-    }
-
-    void Blit(const GPU& gpu) override
-    {
-        activate();
-        Renderer.BlitActiveBackend(gpu);
-    }
-
-    void Stop(const GPU& gpu) override
-    {
-        activate();
-        Renderer.StopActiveBackend(gpu);
-    }
-};
-
 class VulkanRenderer3D::SimpleGraphicsBackend final : public VulkanRenderer3D::IVulkan3DBackend
 {
 public:
@@ -657,7 +592,6 @@ std::unique_ptr<VulkanRenderer3D> VulkanRenderer3D::New() noexcept
 VulkanRenderer3D::VulkanRenderer3D() noexcept
     : Renderer3D(true)
     , Texcache(TexcacheVulkanLoader())
-    , ComputeLegacyBackendInstance(std::make_unique<ComputeLegacyBackend>(*this))
     , SimpleGraphicsBackendInstance(std::make_unique<SimpleGraphicsBackend>(*this))
 {
     clearLineCache();
@@ -671,9 +605,7 @@ VulkanRenderer3D::~VulkanRenderer3D()
 VulkanRenderer3D::IVulkan3DBackend& VulkanRenderer3D::activeBackend() noexcept
 {
     refreshActiveBackendMode();
-    return ActiveBackendMode == BackendMode::GraphicsHardware
-        ? *SimpleGraphicsBackendInstance
-        : *ComputeLegacyBackendInstance;
+    return *SimpleGraphicsBackendInstance;
 }
 
 void VulkanRenderer3D::activateBackendMode(BackendMode mode) noexcept
@@ -1472,7 +1404,8 @@ void VulkanRenderer3D::SetRenderSettings(
     const int oldScale = ScaleFactor;
     BetterPolygons = betterPolygons;
     ScaleFactor = std::max(1, scale);
-    UseSimplePipeline = useSimplePipeline;
+    (void)useSimplePipeline;
+    UseSimplePipeline = true;
     CoverageFixEnabled = conservativeCoverageEnabled;
     CoverageFixPx = std::clamp(conservativeCoveragePx, 0.0f, 2.0f);
     CoverageFixDepthBias = std::clamp(conservativeCoverageDepthBias, 0.0f, 0.01f);
@@ -1531,8 +1464,9 @@ void VulkanRenderer3D::SetThreaded(bool threaded, GPU& gpu) noexcept
 
 void VulkanRenderer3D::SetBackendMode(BackendMode mode) noexcept
 {
-    const bool modeChanged = RequestedBackendMode != mode;
-    RequestedBackendMode = mode;
+    (void)mode;
+    const bool modeChanged = RequestedBackendMode != BackendMode::GraphicsHardware;
+    RequestedBackendMode = BackendMode::GraphicsHardware;
     refreshActiveBackendMode();
     if (modeChanged)
         InvalidatePresentationState(true);
@@ -1729,11 +1663,17 @@ bool VulkanRenderer3D::ensureInitialized()
 
     if (!createGraphicsDescriptorObjects())
     {
-        Log(LogLevel::Warn, "VulkanRenderer3D: graphics descriptor initialization failed, falling back to compute backend");
+        Log(LogLevel::Error, "VulkanRenderer3D: graphics descriptor initialization failed");
+        destroyVulkan();
+        InitFailed = true;
+        return false;
     }
     else if (!createGraphicsPipelines())
     {
-        Log(LogLevel::Warn, "VulkanRenderer3D: graphics pipeline initialization failed, falling back to compute backend");
+        Log(LogLevel::Error, "VulkanRenderer3D: graphics pipeline initialization failed");
+        destroyVulkan();
+        InitFailed = true;
+        return false;
     }
 
     Initialized = true;
@@ -7051,8 +6991,6 @@ u32 VulkanRenderer3D::getTextureBindingDescriptorCount() const noexcept
 
 VulkanRenderer3D::BackendMode VulkanRenderer3D::resolveRequestedBackendMode() const noexcept
 {
-    if (RequestedBackendMode == BackendMode::ComputeLegacy)
-        return RequestedBackendMode;
     return BackendMode::GraphicsHardware;
 }
 
@@ -7109,8 +7047,6 @@ const char* VulkanRenderer3D::backendModeName(BackendMode mode) noexcept
     {
         case BackendMode::GraphicsHardware:
             return "simple_graphics";
-        case BackendMode::ComputeLegacy:
-            return "compute_legacy";
     }
     return "unknown";
 }
