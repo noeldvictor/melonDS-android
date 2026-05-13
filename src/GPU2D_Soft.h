@@ -161,6 +161,7 @@ private:
         return rb | g | 0xFF000000;
     }
     u32 ColorComposite(int i, u32 val1, u32 val2) const;
+    [[nodiscard]] bool UseStructuredVulkan2D() const noexcept;
     void ClearStructuredVulkan2DLine(u32 line);
     void ClearStructuredVulkan2DCapture(u32 vramBank);
     void ClearStructuredVulkan2DCaptureRange(u32 vramBank, u32 dstAddress, u32 width);

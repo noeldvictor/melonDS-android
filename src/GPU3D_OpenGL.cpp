@@ -19,13 +19,13 @@
 #include "GPU3D_OpenGL.h"
 
 #include <algorithm>
+#include <array>
 #include <assert.h>
 #include <cmath>
 #include <stdio.h>
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
-#include "GPU3D_AcceleratedFrontend.h"
 #include "GPU3D_OpenGL_shaders.h"
 
 namespace melonDS
@@ -57,6 +57,81 @@ u32 PackOpenGlAttrToLogical(u32 packedColor)
         attr |= 0x10u << 8u;
     }
     return attr;
+}
+
+u32 ResolveOpenGlVertexX(const Vertex& vertex, int scale)
+{
+    return scale > 1
+        ? static_cast<u32>((vertex.HiresPosition[0] * scale) >> 4)
+        : vertex.FinalPosition[0];
+}
+
+u32 ResolveOpenGlVertexY(const Vertex& vertex, int scale)
+{
+    return scale > 1
+        ? static_cast<u32>((vertex.HiresPosition[1] * scale) >> 4)
+        : vertex.FinalPosition[1];
+}
+
+void ComputeOpenGlCoverageExpandedVertices(
+    const Polygon& polygon,
+    int scale,
+    int screenW,
+    int screenH,
+    float coveragePx,
+    std::array<u32, 10>& outX,
+    std::array<u32, 10>& outY)
+{
+    outX.fill(0u);
+    outY.fill(0u);
+
+    float centerX = 0.0f;
+    float centerY = 0.0f;
+    u32 vertexCount = 0;
+    std::array<float, 10> baseX{};
+    std::array<float, 10> baseY{};
+
+    for (u32 vertexIndex = 0; vertexIndex < polygon.NumVertices; vertexIndex++)
+    {
+        const Vertex* vertex = polygon.Vertices[vertexIndex];
+        if (vertex == nullptr)
+            continue;
+
+        baseX[vertexIndex] = static_cast<float>(ResolveOpenGlVertexX(*vertex, scale));
+        baseY[vertexIndex] = static_cast<float>(ResolveOpenGlVertexY(*vertex, scale));
+        centerX += baseX[vertexIndex];
+        centerY += baseY[vertexIndex];
+        vertexCount++;
+    }
+
+    if (vertexCount == 0)
+        return;
+
+    centerX /= static_cast<float>(vertexCount);
+    centerY /= static_cast<float>(vertexCount);
+    const int maxX = std::max(screenW - 1, 0);
+    const int maxY = std::max(screenH - 1, 0);
+
+    for (u32 vertexIndex = 0; vertexIndex < polygon.NumVertices; vertexIndex++)
+    {
+        if (polygon.Vertices[vertexIndex] == nullptr)
+            continue;
+
+        const float dx = baseX[vertexIndex] - centerX;
+        const float dy = baseY[vertexIndex] - centerY;
+        float x = baseX[vertexIndex];
+        float y = baseY[vertexIndex];
+        const float lengthSquared = (dx * dx) + (dy * dy);
+        if (lengthSquared > 0.000001f)
+        {
+            const float inverseLength = 1.0f / std::sqrt(lengthSquared);
+            x += dx * inverseLength * coveragePx;
+            y += dy * inverseLength * coveragePx;
+        }
+
+        outX[vertexIndex] = static_cast<u32>(std::clamp(static_cast<int>(std::lround(x)), 0, maxX));
+        outY[vertexIndex] = static_cast<u32>(std::clamp(static_cast<int>(std::lround(y)), 0, maxY));
+    }
 }
 }
 
@@ -422,23 +497,63 @@ void GLRenderer::SetRenderSettings(bool betterpolygons, int scale) noexcept
 void GLRenderer::SetupPolygon(GLRenderer::RendererPolygon* rp, Polygon* polygon) const
 {
     rp->PolyData = polygon;
-    rp->Meta = BuildAcceleratedPolygonMeta(*polygon);
+
+    // render key: depending on what we're drawing
+    // opaque polygons:
+    // - depthfunc
+    // -- alpha=0
+    // regular translucent polygons:
+    // - depthfunc
+    // -- depthwrite
+    // --- polyID
+    // ---- need opaque
+    // shadow mask polygons:
+    // - depthfunc?????
+    // shadow polygons:
+    // - depthfunc
+    // -- depthwrite
+    // --- polyID
+
+    rp->RenderKey = (polygon->Attr >> 14) & 0x1; // bit14 - depth func
+    if (!polygon->IsShadowMask)
+    {
+        if (polygon->Translucent)
+        {
+            if (polygon->IsShadow) rp->RenderKey |= 0x20000;
+            else                   rp->RenderKey |= 0x10000;
+            rp->RenderKey |= (polygon->Attr >> 10) & 0x2; // bit11 - depth write
+            rp->RenderKey |= (polygon->Attr >> 13) & 0x4; // bit15 - fog
+            rp->RenderKey |= (polygon->Attr & 0x3F000000) >> 16; // polygon ID
+            if ((polygon->Attr & 0x001F0000) == 0x001F0000) // need opaque
+                rp->RenderKey |= 0x4000;
+        }
+        else
+        {
+            if ((polygon->Attr & 0x001F0000) == 0)
+                rp->RenderKey |= 0x2;
+            rp->RenderKey |= (polygon->Attr & 0x3F000000) >> 16; // polygon ID
+        }
+    }
+    else
+    {
+        rp->RenderKey |= 0x30000;
+    }
 }
 
 u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32* vptr) const
 {
-    const bool useHiresCoordinates = ScaleFactor > 1;
-    const u32 xFixed = static_cast<u32>(ResolveAcceleratedVertexFixedX(*vtx, ScaleFactor, useHiresCoordinates));
-    const u32 yFixed = static_cast<u32>(ResolveAcceleratedVertexFixedY(*vtx, ScaleFactor, useHiresCoordinates));
-
-    return SetupVertex(poly, vid, vtx, vtxattr, xFixed, yFixed, vptr);
+    return SetupVertex(
+        poly,
+        vid,
+        vtx,
+        vtxattr,
+        ResolveOpenGlVertexX(*vtx, ScaleFactor),
+        ResolveOpenGlVertexY(*vtx, ScaleFactor),
+        vptr);
 }
 
 u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 x, u32 y, u32* vptr) const
 {
-    if (x > 0xFFFF) x = 0xFFFF;
-    if (y > 0xFFFF) y = 0xFFFF;
-
     u32 z = poly->FinalZ[vid];
     u32 w = poly->FinalW[vid];
 
@@ -487,44 +602,256 @@ u32* GLRenderer::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u3
     return vptr;
 }
 
-void GLRenderer::BuildPolygons(const AcceleratedScene& scene)
+void GLRenderer::BuildPolygons(GLRenderer::RendererPolygon* polygons, int npolys)
 {
-    NumVertices = static_cast<u32>(scene.Vertices.size());
-    NumIndices = static_cast<u32>(scene.Indices.size());
-    NumEdgeIndices = static_cast<u32>(scene.EdgeIndices.size());
-
     u32* vptr = &VertexBuffer[0];
-    for (u32 drawIndex = 0; drawIndex < scene.Draws.size(); drawIndex++)
+    u32 vidx = 0;
+
+    u32 iidx = 0;
+    u32 eidx = EdgeIndicesOffset;
+
+    for (int i = 0; i < npolys; i++)
     {
-        const AcceleratedSceneDraw& draw = scene.Draws[drawIndex];
-        RendererPolygon* rp = &PolygonList[drawIndex];
-        rp->PolyData = const_cast<Polygon*>(draw.SourcePolygon);
-        rp->Meta = draw.Meta;
-        rp->NumIndices = draw.IndexCount;
-        rp->IndicesOffset = draw.FirstIndex;
-        rp->PrimType = draw.PrimitiveType == AcceleratedPrimitiveType::Lines ? GL_LINES : GL_TRIANGLES;
-        rp->NumEdgeIndices = draw.EdgeIndexCount;
-        rp->EdgeIndicesOffset = EdgeIndicesOffset + draw.FirstEdgeIndex;
+        RendererPolygon* rp = &polygons[i];
+        Polygon* poly = rp->PolyData;
 
-        const Polygon* poly = draw.SourcePolygon;
-        for (u32 vertexIndex = draw.FirstVertex; vertexIndex < draw.FirstVertex + draw.VertexCount; vertexIndex++)
+        rp->IndicesOffset = iidx;
+        rp->NumIndices = 0;
+
+        u32 vidx_first = vidx;
+
+        u32 polyattr = poly->Attr;
+
+        u32 alpha = (polyattr >> 16) & 0x1F;
+
+        u32 vtxattr = polyattr & 0x1F00C8F0;
+        if (poly->FacingView) vtxattr |= (1<<8);
+        if (poly->WBuffer)    vtxattr |= (1<<9);
+
+        std::array<u32, 10> coverageX{};
+        std::array<u32, 10> coverageY{};
+        bool applyCoverageFix = false;
+        if (CoverageFixEnabled && CoverageFixPx > 0.0f && poly->Type != 1)
         {
-            if (vertexIndex >= scene.Vertices.size() || poly == nullptr)
-                continue;
-
-            const AcceleratedSceneVertex& vertex = scene.Vertices[vertexIndex];
-            *vptr++ = vertex.XFixed | (vertex.YFixed << 16u);
-            *vptr++ = vertex.GlZWPacked;
-            *vptr++ = vertex.GlColorPacked;
-            *vptr++ = static_cast<u16>(vertex.TexCoordS) | (static_cast<u16>(vertex.TexCoordT) << 16u);
-            *vptr++ = vertex.VertexAttr;
-            *vptr++ = poly->TexParam & 0xFFFFu;
-            *vptr++ = (poly->TexParam >> 16u) | (poly->TexPalette << 16u);
+            const bool wrapS = (poly->TexParam & (1u << 16)) != 0u;
+            const bool wrapT = (poly->TexParam & (1u << 17)) != 0u;
+            const bool isRepeat = wrapS || wrapT;
+            applyCoverageFix = isRepeat ? CoverageFixApplyRepeat : CoverageFixApplyClamp;
+            if (applyCoverageFix)
+            {
+                vtxattr |= (1u << 10);
+                ComputeOpenGlCoverageExpandedVertices(
+                    *poly,
+                    ScaleFactor,
+                    ScreenW,
+                    ScreenH,
+                    CoverageFixPx,
+                    coverageX,
+                    coverageY);
+            }
         }
+
+        // assemble vertices
+        if (poly->Type == 1) // line
+        {
+            rp->PrimType = GL_LINES;
+
+            u32 lastx, lasty;
+            int nout = 0;
+            for (u32 j = 0; j < poly->NumVertices; j++)
+            {
+                Vertex* vtx = poly->Vertices[j];
+
+                if (j > 0)
+                {
+                    if (lastx == vtx->FinalPosition[0] &&
+                        lasty == vtx->FinalPosition[1]) continue;
+                }
+
+                lastx = vtx->FinalPosition[0];
+                lasty = vtx->FinalPosition[1];
+
+                vptr = SetupVertex(poly, j, vtx, vtxattr, vptr);
+
+                IndexBuffer[iidx++] = vidx;
+                rp->NumIndices++;
+
+                vidx++;
+                nout++;
+                if (nout >= 2) break;
+            }
+        }
+        else if (poly->NumVertices == 3) // regular triangle
+        {
+            rp->PrimType = GL_TRIANGLES;
+
+            for (int j = 0; j < 3; j++)
+            {
+                Vertex* vtx = poly->Vertices[j];
+
+                vptr = applyCoverageFix
+                    ? SetupVertex(poly, j, vtx, vtxattr, coverageX[j], coverageY[j], vptr)
+                    : SetupVertex(poly, j, vtx, vtxattr, vptr);
+                vidx++;
+            }
+
+            // build a triangle
+            IndexBuffer[iidx++] = vidx_first;
+            IndexBuffer[iidx++] = vidx - 2;
+            IndexBuffer[iidx++] = vidx - 1;
+            rp->NumIndices += 3;
+        }
+        else // quad, pentagon, etc
+        {
+            rp->PrimType = GL_TRIANGLES;
+
+            if (!BetterPolygons)
+            {
+                // regular triangle-splitting
+
+                for (u32 j = 0; j < poly->NumVertices; j++)
+                {
+                    Vertex* vtx = poly->Vertices[j];
+
+                    vptr = applyCoverageFix
+                        ? SetupVertex(poly, j, vtx, vtxattr, coverageX[j], coverageY[j], vptr)
+                        : SetupVertex(poly, j, vtx, vtxattr, vptr);
+
+                    if (j >= 2)
+                    {
+                        // build a triangle
+                        IndexBuffer[iidx++] = vidx_first;
+                        IndexBuffer[iidx++] = vidx - 1;
+                        IndexBuffer[iidx++] = vidx;
+                        rp->NumIndices += 3;
+                    }
+
+                    vidx++;
+                }
+            }
+            else
+            {
+                // attempt at 'better' splitting
+                // this doesn't get rid of the error while splitting a bigger polygon into triangles
+                // but we can attempt to reduce it
+
+                u32 cX = 0, cY = 0;
+                float cZ = 0;
+                float cW = 0;
+
+                float cR = 0, cG = 0, cB = 0;
+                float cS = 0, cT = 0;
+
+                for (u32 j = 0; j < poly->NumVertices; j++)
+                {
+                    Vertex* vtx = poly->Vertices[j];
+
+                    cX += vtx->HiresPosition[0];
+                    cY += vtx->HiresPosition[1];
+
+                    float fw = (float)poly->FinalW[j] * poly->NumVertices;
+                    cW += 1.0f / fw;
+
+                    if (poly->WBuffer) cZ += poly->FinalZ[j] / fw;
+                    else               cZ += poly->FinalZ[j];
+
+                    cR += (vtx->FinalColor[0] >> 1) / fw;
+                    cG += (vtx->FinalColor[1] >> 1) / fw;
+                    cB += (vtx->FinalColor[2] >> 1) / fw;
+
+                    cS += vtx->TexCoords[0] / fw;
+                    cT += vtx->TexCoords[1] / fw;
+                }
+
+                cX /= poly->NumVertices;
+                cY /= poly->NumVertices;
+
+                cW = 1.0f / cW;
+
+                if (poly->WBuffer) cZ *= cW;
+                else               cZ /= poly->NumVertices;
+
+                cR *= cW;
+                cG *= cW;
+                cB *= cW;
+
+                cS *= cW;
+                cT *= cW;
+
+                cX = (cX * ScaleFactor) >> 4;
+                cY = (cY * ScaleFactor) >> 4;
+
+                u32 w = (u32)cW;
+
+                u32 z = (u32)cZ;
+                u32 zshift = 0;
+                while (z > 0xFFFF) { z >>= 1; zshift++; }
+
+                // build center vertex
+                *vptr++ = cX | (cY << 16);
+                *vptr++ = z | (w << 16);
+
+                *vptr++ =  (u32)cR |
+                          ((u32)cG << 8) |
+                          ((u32)cB << 16) |
+                          (alpha << 24);
+
+                *vptr++ = (u16)cS | ((u16)cT << 16);
+
+                // Split TexParam into 2 because some GPUs don't have 32 bit ints. TexPalette only uses 13 bits
+                *vptr++ = vtxattr | (zshift << 16);
+                *vptr++ = poly->TexParam & 0xFFFF;
+                *vptr++ = (poly->TexParam >> 16 ) | (poly->TexPalette << 16);
+
+                vidx++;
+
+                // build the final polygon
+                for (u32 j = 0; j < poly->NumVertices; j++)
+                {
+                    Vertex* vtx = poly->Vertices[j];
+
+                    vptr = applyCoverageFix
+                        ? SetupVertex(poly, j, vtx, vtxattr, coverageX[j], coverageY[j], vptr)
+                        : SetupVertex(poly, j, vtx, vtxattr, vptr);
+
+                    if (j >= 1)
+                    {
+                        // build a triangle
+                        IndexBuffer[iidx++] = vidx_first;
+                        IndexBuffer[iidx++] = vidx - 1;
+                        IndexBuffer[iidx++] = vidx;
+                        rp->NumIndices += 3;
+                    }
+
+                    vidx++;
+                }
+
+                IndexBuffer[iidx++] = vidx_first;
+                IndexBuffer[iidx++] = vidx - 1;
+                IndexBuffer[iidx++] = vidx_first + 1;
+                rp->NumIndices += 3;
+            }
+        }
+
+        rp->EdgeIndicesOffset = eidx;
+        rp->NumEdgeIndices = 0;
+
+        u32 vidx_cur = vidx_first;
+        for (u32 j = 1; j < poly->NumVertices; j++)
+        {
+            IndexBuffer[eidx++] = vidx_cur;
+            IndexBuffer[eidx++] = vidx_cur + 1;
+            vidx_cur++;
+            rp->NumEdgeIndices += 2;
+        }
+        IndexBuffer[eidx++] = vidx_cur;
+        IndexBuffer[eidx++] = vidx_first;
+        rp->NumEdgeIndices += 2;
     }
 
-    std::copy(scene.Indices.begin(), scene.Indices.end(), IndexBuffer);
-    std::copy(scene.EdgeIndices.begin(), scene.EdgeIndices.end(), IndexBuffer + EdgeIndicesOffset);
+    NumVertices = vidx;
+    NumIndices = iidx;
+    NumEdgeIndices = eidx - EdgeIndicesOffset;
 }
 
 int GLRenderer::RenderSinglePolygon(int i) const
@@ -540,7 +867,7 @@ int GLRenderer::RenderPolygonBatch(int i) const
 {
     const RendererPolygon* rp = &PolygonList[i];
     GLuint primtype = rp->PrimType;
-    u32 key = rp->Meta.RenderKey;
+    u32 key = rp->RenderKey;
     int numpolys = 0;
     u32 numindices = 0;
 
@@ -548,7 +875,7 @@ int GLRenderer::RenderPolygonBatch(int i) const
     {
         const RendererPolygon* cur_rp = &PolygonList[iend];
         if (cur_rp->PrimType != primtype) break;
-        if (cur_rp->Meta.RenderKey != key) break;
+        if (cur_rp->RenderKey != key) break;
 
         numpolys++;
         numindices += cur_rp->NumIndices;
@@ -561,14 +888,14 @@ int GLRenderer::RenderPolygonBatch(int i) const
 int GLRenderer::RenderPolygonEdgeBatch(int i) const
 {
     const RendererPolygon* rp = &PolygonList[i];
-    u32 key = rp->Meta.RenderKey;
+    u32 key = rp->RenderKey;
     int numpolys = 0;
     u32 numindices = 0;
 
     for (int iend = i; iend < NumFinalPolys; iend++)
     {
         const RendererPolygon* cur_rp = &PolygonList[iend];
-        if (cur_rp->Meta.RenderKey != key) break;
+        if (cur_rp->RenderKey != key) break;
 
         numpolys++;
         numindices += cur_rp->NumEdgeIndices;
@@ -606,17 +933,19 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
     for (int i = 0; i < NumFinalPolys; )
     {
         RendererPolygon* rp = &PolygonList[i];
-        const AcceleratedPolygonMeta& polygonMeta = rp->Meta;
 
-        if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask)) { i++; continue; }
-        if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagTranslucent)) { i++; continue; }
+        if (rp->PolyData->IsShadowMask) { i++; continue; }
+        if (rp->PolyData->Translucent) { i++; continue; }
 
-        if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagDepthEqual))
+        if (rp->PolyData->Attr & (1<<14))
             glDepthFunc(GL_LEQUAL);
         else
             glDepthFunc(GL_LESS);
 
-        glStencilFunc(GL_ALWAYS, polygonMeta.PolyId, 0xFF);
+        u32 polyattr = rp->PolyData->Attr;
+        u32 polyid = (polyattr >> 24) & 0x3F;
+
+        glStencilFunc(GL_ALWAYS, polyid, 0xFF);
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         glStencilMask(0xFF);
 
@@ -674,9 +1003,8 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
             for (int i = 0; i < NumFinalPolys; )
             {
                 RendererPolygon* rp = &PolygonList[i];
-                const AcceleratedPolygonMeta& polygonMeta = rp->Meta;
 
-                if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask))
+                if (rp->PolyData->IsShadowMask)
                 {
                     // draw actual shadow mask
 
@@ -694,13 +1022,14 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                     i += RenderPolygonBatch(i);
                 }
-                else if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagTranslucent))
+                else if (rp->PolyData->Translucent)
                 {
-                    bool needopaque = HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagNeedOpaquePass);
-                    u32 polyattr = polygonMeta.PolyAttr;
-                    u32 polyid = polygonMeta.PolyId;
+                    bool needopaque = ((rp->PolyData->Attr & 0x001F0000) == 0x001F0000);
 
-                    if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagDepthEqual))
+                    u32 polyattr = rp->PolyData->Attr;
+                    u32 polyid = (polyattr >> 24) & 0x3F;
+
+                    if (polyattr & (1<<14))
                         glDepthFunc(GL_LEQUAL);
                     else
                         glDepthFunc(GL_LESS);
@@ -724,11 +1053,11 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                     UseRenderShader(flags | RenderFlag_Trans);
 
-                    const GLboolean transfog = HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagFogWrite)
-                        ? fogenable
-                        : GL_FALSE;
+                    GLboolean transfog;
+                    if (!(polyattr & (1<<15))) transfog = fogenable;
+                    else                       transfog = GL_FALSE;
 
-                    if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadow))
+                    if (rp->PolyData->IsShadow)
                     {
                         // shadow against clear-plane will only pass if its polyID matches that of the clear plane
                         u32 clrpolyid = (gpu3d.RenderClearAttr1 >> 24) & 0x3F;
@@ -775,9 +1104,8 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
         for (int i = 0; i < NumFinalPolys; )
         {
             RendererPolygon* rp = &PolygonList[i];
-            const AcceleratedPolygonMeta& polygonMeta = rp->Meta;
 
-            if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadowMask))
+            if (rp->PolyData->IsShadowMask)
             {
                 // clear shadow bits in stencil buffer
 
@@ -799,13 +1127,14 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                 i += RenderPolygonBatch(i);
             }
-            else if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagTranslucent))
+            else if (rp->PolyData->Translucent)
             {
-                bool needopaque = HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagNeedOpaquePass);
-                u32 polyattr = polygonMeta.PolyAttr;
-                u32 polyid = polygonMeta.PolyId;
+                bool needopaque = ((rp->PolyData->Attr & 0x001F0000) == 0x001F0000);
 
-                if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagDepthEqual))
+                u32 polyattr = rp->PolyData->Attr;
+                u32 polyid = (polyattr >> 24) & 0x3F;
+
+                if (polyattr & (1<<14))
                     glDepthFunc(GL_LEQUAL);
                 else
                     glDepthFunc(GL_LESS);
@@ -829,11 +1158,11 @@ void GLRenderer::RenderSceneChunk(const GPU3D& gpu3d, int y, int h)
 
                 UseRenderShader(flags | RenderFlag_Trans);
 
-                const GLboolean transfog = HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagFogWrite)
-                    ? fogenable
-                    : GL_FALSE;
+                GLboolean transfog;
+                if (!(polyattr & (1<<15))) transfog = fogenable;
+                else                       transfog = GL_FALSE;
 
-                if (HasAcceleratedPolygonFlag(polygonMeta, AcceleratedPolygonFlagShadow))
+                if (rp->PolyData->IsShadow)
                 {
                     glDisable(GL_BLEND);
                     glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1111,27 +1440,26 @@ void GLRenderer::RenderFrame(GPU& gpu)
 
     if (gpu.GPU3D.RenderNumPolygons)
     {
+        // render shit here
         u32 flags = 0;
         if (gpu.GPU3D.RenderPolygonRAM[0]->WBuffer) flags |= RenderFlag_WBuffer;
 
-        AcceleratedSceneBuildConfig sceneBuildConfig{};
-        sceneBuildConfig.Scale = ScaleFactor;
-        sceneBuildConfig.BetterPolygons = BetterPolygons;
-        sceneBuildConfig.UseHiresCoordinates = ScaleFactor > 1;
-        sceneBuildConfig.MaxFixedX = (ScreenW * 16) - 1;
-        sceneBuildConfig.MaxFixedY = (ScreenH * 16) - 1;
-        sceneBuildConfig.CoverageFix.Enabled = CoverageFixEnabled;
-        sceneBuildConfig.CoverageFix.UserPx = CoverageFixPx;
-        sceneBuildConfig.CoverageFix.ApplyRepeat = CoverageFixApplyRepeat;
-        sceneBuildConfig.CoverageFix.ApplyClamp = CoverageFixApplyClamp;
+        int npolys = 0;
+        int firsttrans = -1;
+        for (u32 i = 0; i < gpu.GPU3D.RenderNumPolygons; i++)
+        {
+            if (gpu.GPU3D.RenderPolygonRAM[i]->Degenerate) continue;
 
-        BuildAcceleratedScene(gpu.GPU3D, sceneBuildConfig, SharedScene);
-        NumFinalPolys = static_cast<int>(SharedScene.Draws.size());
-        NumOpaqueFinalPolys = SharedScene.FirstTranslucentDraw == std::numeric_limits<u32>::max()
-            ? -1
-            : static_cast<int>(SharedScene.FirstTranslucentDraw);
+            SetupPolygon(&PolygonList[npolys], gpu.GPU3D.RenderPolygonRAM[i]);
+            if (firsttrans < 0 && gpu.GPU3D.RenderPolygonRAM[i]->Translucent)
+                firsttrans = npolys;
 
-        BuildPolygons(SharedScene);
+            npolys++;
+        }
+        NumFinalPolys = npolys;
+        NumOpaqueFinalPolys = firsttrans;
+
+        BuildPolygons(&PolygonList[0], npolys);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
 

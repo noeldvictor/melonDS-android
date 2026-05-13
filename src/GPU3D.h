@@ -357,6 +357,7 @@ public:
     virtual void PrepareCaptureFrame() {}
     virtual void BeginCaptureFrame() {}
     virtual void SetCaptureScreenSwapHint(bool screenSwap) { (void)screenSwap; }
+    [[nodiscard]] virtual bool UsesStructured2DMetadata() const noexcept { return false; }
     virtual void SetOutputTexture(int buffer, u32 texture) {}
     virtual void BindOutputTexture(int buffer) {}
 

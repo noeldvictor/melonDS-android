@@ -333,7 +333,7 @@ u32 SoftRenderer::ColorComposite(int i, u32 val1, u32 val2) const
 
 const u32* SoftRenderer::GetStructuredVulkan2DPlane(bool topScreen, u32 plane) const noexcept
 {
-    if (plane >= kStructuredPlaneCount)
+    if (!UseStructuredVulkan2D() || plane >= kStructuredPlaneCount)
         return nullptr;
 
     const size_t screenIndex = topScreen ? 0u : 1u;
@@ -356,9 +356,14 @@ void SoftRenderer::ClearStructuredVulkan2DState() noexcept
     StructuredVulkan2DCaptureLineValid.fill(0);
 }
 
+bool SoftRenderer::UseStructuredVulkan2D() const noexcept
+{
+    return GPU.GPU3D.GetCurrentRenderer().UsesStructured2DMetadata();
+}
+
 void SoftRenderer::ClearStructuredVulkan2DLine(u32 line)
 {
-    if (!GPU.GPU3D.IsRendererAccelerated() || line >= kStructuredScreenHeight)
+    if (!UseStructuredVulkan2D() || line >= kStructuredScreenHeight)
         return;
 
     const size_t screenIndex = StructuredVulkan2DCurrentLineTargetsTop ? 0u : 1u;
@@ -375,7 +380,7 @@ void SoftRenderer::ClearStructuredVulkan2DLine(u32 line)
 
 void SoftRenderer::ClearStructuredVulkan2DCapture(u32 vramBank)
 {
-    if (vramBank >= 4u)
+    if (!UseStructuredVulkan2D() || vramBank >= 4u)
         return;
 
     const size_t screenBase = static_cast<size_t>(vramBank) * kStructuredPlaneCount * kStructuredPixelCount;
@@ -391,7 +396,7 @@ void SoftRenderer::ClearStructuredVulkan2DCapture(u32 vramBank)
 
 void SoftRenderer::ClearStructuredVulkan2DCaptureRange(u32 vramBank, u32 dstAddress, u32 width)
 {
-    if (vramBank >= 4u)
+    if (!UseStructuredVulkan2D() || vramBank >= 4u)
         return;
 
     const size_t captureBase = static_cast<size_t>(vramBank) * kStructuredPlaneCount * kStructuredPixelCount;
@@ -414,7 +419,7 @@ void SoftRenderer::ClearStructuredVulkan2DCaptureRange(u32 vramBank, u32 dstAddr
 
 void SoftRenderer::SaveStructuredVulkan2DCaptureSourceLine(u32 line)
 {
-    if (!GPU.GPU3D.IsRendererAccelerated() || line >= kStructuredScreenHeight)
+    if (!UseStructuredVulkan2D() || line >= kStructuredScreenHeight)
         return;
 
     const bool sourceTop = CurrentUnitTargetsTopScreen();
@@ -438,7 +443,7 @@ void SoftRenderer::CopyStructuredVulkan2DCaptureSourceLineToCapture(
     u32 dstAddress,
     u32 width)
 {
-    if (!GPU.GPU3D.IsRendererAccelerated()
+    if (!UseStructuredVulkan2D()
         || !StructuredVulkan2DCaptureSourceLineValid
         || StructuredVulkan2DCaptureSourceLineY != line
         || vramBank >= 4u)
@@ -485,7 +490,7 @@ void SoftRenderer::CopyStructuredVulkan2DCaptureSourceLineToCapture(
 
 void SoftRenderer::CopyStructuredVulkan2DCurrentLineToCapture(u32 line, u32 vramBank, u32 dstAddress, u32 width)
 {
-    if (!GPU.GPU3D.IsRendererAccelerated()
+    if (!UseStructuredVulkan2D()
         || line >= kStructuredScreenHeight
         || vramBank >= 4u)
     {
@@ -535,7 +540,7 @@ void SoftRenderer::CopyStructuredVulkan2DCurrentLineToCapture(u32 line, u32 vram
 
 void SoftRenderer::CopyStructuredVulkan2DCaptureLineToCurrentScreen(u32 line, u32 vramBank)
 {
-    if (!GPU.GPU3D.IsRendererAccelerated()
+    if (!UseStructuredVulkan2D()
         || line >= kStructuredScreenHeight
         || vramBank >= 4u
         || StructuredVulkan2DCaptureLineValid[(static_cast<size_t>(vramBank) * kStructuredScreenHeight) + line] == 0u)
@@ -564,7 +569,7 @@ bool SoftRenderer::ReadStructuredVulkan2DCapture2DOverlayPixel(
 {
     overlayPixel = 0u;
     overlayControlAlpha = 0u;
-    if (vramBank >= 4u || vramAddress >= kStructuredPixelCount)
+    if (!UseStructuredVulkan2D() || vramBank >= 4u || vramAddress >= kStructuredPixelCount)
         return false;
 
     const u32 line = vramAddress / kStructuredScreenWidth;
@@ -607,7 +612,7 @@ void SoftRenderer::MergeStructuredVulkan2DCapture2DOverlayPixel(
     u32 overlayPixel,
     u32 overlayControlAlpha)
 {
-    if (vramBank >= 4u || vramAddress >= kStructuredPixelCount || overlayPixel == 0u)
+    if (!UseStructuredVulkan2D() || vramBank >= 4u || vramAddress >= kStructuredPixelCount || overlayPixel == 0u)
         return;
 
     const size_t captureBase = static_cast<size_t>(vramBank) * kStructuredPlaneCount * kStructuredPixelCount;
@@ -674,7 +679,7 @@ void SoftRenderer::StoreStructuredVulkan2DPixel(
     u32 legacyControl,
     u32 captureBacked3DSourceClass)
 {
-    if (line >= kStructuredScreenHeight || x >= kStructuredScreenWidth)
+    if (!UseStructuredVulkan2D() || line >= kStructuredScreenHeight || x >= kStructuredScreenWidth)
         return;
 
     const u32 flags0 = originalVal1 >> 24u;
@@ -802,7 +807,7 @@ void SoftRenderer::StoreStructuredVulkan2DCapturePixel(
     bool external3DCoverage,
     bool allowUnclassifiedExternal3DSlot)
 {
-    if (vramBank >= 4u || vramAddress >= kStructuredPixelCount)
+    if (!UseStructuredVulkan2D() || vramBank >= 4u || vramAddress >= kStructuredPixelCount)
         return;
 
     const size_t screenBase = static_cast<size_t>(vramBank) * kStructuredPlaneCount * kStructuredPixelCount;
@@ -1035,7 +1040,9 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
     // oddly that's not the case for GPU A
     if (CurUnit->Num && !CurUnit->Enabled) forceblank = true;
 
-    if (CurUnit->Num == 0 && line == 0)
+    const bool useStructuredVulkan2D = UseStructuredVulkan2D();
+
+    if (useStructuredVulkan2D && CurUnit->Num == 0 && line == 0)
         CaptureLineUses3d.fill(0);
 
     if (line == 0 && CurUnit->CaptureCnt & (1 << 31) && !forceblank)
@@ -1065,7 +1072,7 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
     // always render regular graphics
     DrawScanline_BGOBJ(line);
     CurUnit->UpdateMosaicCounters(line);
-    if (CurUnit->Num == 0 && CurUnit->CaptureLatch)
+    if (useStructuredVulkan2D && CurUnit->Num == 0 && CurUnit->CaptureLatch)
         SaveStructuredVulkan2DCaptureSourceLine(line);
 
     switch (dispmode)
@@ -1102,7 +1109,8 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
 
                     dst[i] = r | (g << 8) | (b << 16);
                 }
-                CopyStructuredVulkan2DCaptureLineToCurrentScreen(line, vrambank);
+                if (useStructuredVulkan2D)
+                    CopyStructuredVulkan2DCaptureLineToCurrentScreen(line, vrambank);
             }
             else
             {
@@ -1159,14 +1167,14 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
             (engineACaptureCnt & (1u << 31u)) != 0u
             && ((engineACaptureCnt >> 20u) & 0x3u) == 3u;
 
-        if (dispmode == 2)
+        if (useStructuredVulkan2D && dispmode == 2)
         {
             if (line < CaptureLineUses3d.size() && CaptureLineUses3d[line] != 0)
             {
                 rendererMetaFlags |= kMetaFlagVramCaptureUses3d;
             }
         }
-        else if (dispmode == 1)
+        else if (useStructuredVulkan2D && dispmode == 1)
         {
             const bool broadCaptureLineUses3d =
                 CurUnit->Num == 1
@@ -1239,6 +1247,13 @@ void SoftRenderer::VBlankEnd(Unit* unitA, Unit* unitB)
         const u32 captureCnt = unitA->CaptureCnt;
         const u32 captureMode = (captureCnt >> 29u) & 0x3u;
         const bool captureEnabled = (captureCnt & (1u << 31u)) != 0u;
+        if (!renderer3d.UsesStructured2DMetadata())
+        {
+            if (captureEnabled && captureMode != 1u)
+                renderer3d.PrepareCaptureFrame();
+            return;
+        }
+
         const bool captureUsesDirect3D = (captureCnt & (1u << 24u)) != 0u;
         const bool sourceAContributes = captureMode == 0u
             || ((captureMode >= 2u) && ((captureCnt & 0x1Fu) != 0u));
@@ -1264,7 +1279,8 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
     bool captureLineHasUseful3dAlpha = false;
     bool captureDestinationHasNonZeroPixel = false;
     bool debugCaptureSourceReady = false;
-    if (CurUnit->Num == 0 && line < CaptureLineUses3d.size())
+    const bool useStructuredVulkan2D = UseStructuredVulkan2D();
+    if (useStructuredVulkan2D && CurUnit->Num == 0 && line < CaptureLineUses3d.size())
         CaptureLineUses3d[line] = 0;
     const bool captureScreenSwap = (GPU.NDS.PowerControl9 & (1u << 15u)) != 0u;
     const bool captureDebugEnabled = MelonDSAndroid::areRendererDebugToolsEnabled();
@@ -1319,7 +1335,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
     const u32 structuredSourceBBaseAddr = srcBaddr;
     const u32 sourceBEvb = (captureCnt >> 8) & 0x1Fu;
     const bool captureBlendsStructuredSourceB =
-        GPU.GPU3D.IsRendererAccelerated()
+        useStructuredVulkan2D
         && captureMode >= 2u
         && sourceBEvb != 0u
         && structuredSourceBFromVram;
@@ -1339,7 +1355,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
         }
     }
 
-    if (GPU.GPU3D.IsRendererAccelerated())
+    if (useStructuredVulkan2D)
         ClearStructuredVulkan2DCaptureRange(dstvram, structuredCaptureDstBase, width);
 
     // TODO: handle 3D in GPU3D::CurrentRenderer->Accelerated mode!!
@@ -1576,10 +1592,10 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
     }
 
     dstaddr &= 0xFFFF;
-    if (GPU.GPU3D.IsRendererAccelerated() && captureLineUses3d && !structuredCaptureStoredFromSourceA)
+    if (useStructuredVulkan2D && captureLineUses3d && !structuredCaptureStoredFromSourceA)
         CopyStructuredVulkan2DCurrentLineToCapture(line, dstvram, dstaddr, width);
 
-    if (CurUnit->Num == 0 && line < CaptureLineUses3d.size())
+    if (useStructuredVulkan2D && CurUnit->Num == 0 && line < CaptureLineUses3d.size())
         CaptureLineUses3d[line] = captureLineUses3d ? 1 : 0;
 
     if (captureDebugEnabled && captureLineUses3d && debugCaptureSourceReady && srcA != nullptr)
@@ -2074,6 +2090,8 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         const u32 displayMode =
             (CurUnit->DispCnt >> 16u) & (CurUnit->Num ? 0x1u : 0x3u);
         const bool captureBacked3DLine =
+            UseStructuredVulkan2D()
+            &&
             CurUnit->Num == 1
             && displayMode == 1u
             && line < CaptureLineUses3d.size()
@@ -2349,7 +2367,7 @@ void SoftRenderer::PushRawPixel_Accel(u32* dst, u32 value)
 
 bool SoftRenderer::TryDrawStructuredVulkan2DCapturePixel(u32* dst, u32 flatByteAddress)
 {
-    if (!GPU.GPU3D.IsRendererAccelerated())
+    if (!UseStructuredVulkan2D())
         return false;
 
     const u32 displayMode =

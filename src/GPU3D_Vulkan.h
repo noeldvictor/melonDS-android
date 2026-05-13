@@ -56,6 +56,7 @@ public:
     void PrepareCaptureFrame() override;
     void BeginCaptureFrame() override;
     void SetCaptureScreenSwapHint(bool screenSwap) override;
+    [[nodiscard]] bool UsesStructured2DMetadata() const noexcept override { return ActiveBackendMode == BackendMode::GraphicsHardware; }
     void Blit(const GPU& gpu) override;
     void Stop(const GPU& gpu) override;
 
