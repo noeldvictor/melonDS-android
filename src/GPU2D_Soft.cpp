@@ -1284,6 +1284,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
         CaptureLineUses3d[line] = 0;
     const bool captureScreenSwap = (GPU.NDS.PowerControl9 & (1u << 15u)) != 0u;
     const bool captureDebugEnabled = MelonDSAndroid::areRendererDebugToolsEnabled();
+    const bool captureMetadataEnabled = captureDebugEnabled || useStructuredVulkan2D;
     const bool logCaptureSamples = MelonDSAndroid::areRendererDebugBgObjLogsEnabled();
     if (line == 0)
     {
@@ -1371,7 +1372,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
             _3DLine = GPU.GPU3D.GetLine(static_cast<int>(sourceLine));
         srcA = _3DLine;
         captureLineUses3d = srcA != nullptr;
-        if (captureDebugEnabled && srcA != nullptr)
+        if (captureMetadataEnabled && srcA != nullptr)
             debugCaptureSourceReady = true;
         if (captureDebugEnabled && srcA != nullptr)
         {
@@ -1598,7 +1599,7 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
     if (useStructuredVulkan2D && CurUnit->Num == 0 && line < CaptureLineUses3d.size())
         CaptureLineUses3d[line] = captureLineUses3d ? 1 : 0;
 
-    if (captureDebugEnabled && captureLineUses3d && debugCaptureSourceReady && srcA != nullptr)
+    if (captureMetadataEnabled && captureLineUses3d && debugCaptureSourceReady && srcA != nullptr)
     {
         std::memcpy(
             &LastDebugCapture3dSource[static_cast<size_t>(sourceLine) * 256u],
@@ -1788,10 +1789,11 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
         }
     }
 
+    if (captureMetadataEnabled && captureLineUses3d)
+        LastDebugCaptureStats.CaptureLineUses3dLines++;
+
     if (captureDebugEnabled)
     {
-        if (captureLineUses3d)
-            LastDebugCaptureStats.CaptureLineUses3dLines++;
         if (captureLineHasUseful3dAlpha)
             LastDebugCaptureStats.CaptureLineUsefulAlphaLines++;
         if (!captureDestinationHasNonZeroPixel)
