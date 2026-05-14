@@ -447,6 +447,7 @@ private:
     RenderContext* tryAcquireReadyRenderContext() noexcept;
     bool waitForAllRenderContexts();
     bool waitForReadbackSource();
+    bool waitForTextureCacheMutationSafePoint();
     bool waitForDeviceIdle(const char* reason);
     RenderContext& acquireNextRenderContext() noexcept;
     void consumeGpuTiming(RenderContext* context);

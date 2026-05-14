@@ -6,6 +6,7 @@
 
 #include <assert.h>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #define XXH_STATIC_LINKING_ONLY
@@ -95,7 +96,8 @@ public:
         return false;
     }
 
-    bool Update(GPU& gpu)
+    template <typename BeforeMutationT>
+    bool Update(GPU& gpu, BeforeMutationT&& beforeMutation)
     {
         auto textureDirty = gpu.VRAMDirty_Texture.DeriveState(gpu.VRAMMap_Texture, gpu);
         auto texPalDirty = gpu.VRAMDirty_TexPal.DeriveState(gpu.VRAMMap_TexPal, gpu);
@@ -105,6 +107,7 @@ public:
 
         if (textureChanged || texPalChanged)
         {
+            std::forward<BeforeMutationT>(beforeMutation)();
             //printf("check invalidation %d\n", TexCache.size());
             for (auto it = Cache.begin(); it != Cache.end();)
             {
@@ -144,6 +147,11 @@ public:
         }
 
         return false;
+    }
+
+    bool Update(GPU& gpu)
+    {
+        return Update(gpu, []() {});
     }
 
     void GetTexture(GPU& gpu, u32 texParam, u32 palBase, TexHandleT& textureHandle, u32& layer, u32*& helper)

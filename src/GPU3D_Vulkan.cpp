@@ -711,7 +711,10 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
         logPerformanceIfNeeded();
     });
 
-    const bool textureCacheChanged = Texcache.Update(gpu);
+    const bool textureCacheChanged = Texcache.Update(gpu, [&]() {
+        if (Initialized && ActiveBackendMode == BackendMode::GraphicsHardware)
+            (void)waitForTextureCacheMutationSafePoint();
+    });
     WarmTextureCache(gpu);
 
     const u32 scale = static_cast<u32>(std::max(1, ScaleFactor));
@@ -2286,6 +2289,54 @@ bool VulkanRenderer3D::waitForReadbackSource()
         return waitForRenderContext(*LastSubmittedRenderContext);
 
     return waitForAllRenderContexts();
+}
+
+bool VulkanRenderer3D::waitForTextureCacheMutationSafePoint()
+{
+    if (Device == VK_NULL_HANDLE)
+        return false;
+
+    bool ok = true;
+    if (FrameFence != VK_NULL_HANDLE)
+    {
+        const VkResult fenceStatus = vkGetFenceStatus(Device, FrameFence);
+        if (fenceStatus == VK_SUCCESS)
+        {
+            FenceWaitCpuWindow.Add(0);
+            consumeGpuTiming(nullptr);
+        }
+        else if (fenceStatus == VK_NOT_READY)
+        {
+            const u64 waitStartNs = PerfNowNs();
+            const VkResult waitResult = vkWaitForFences(Device, 1, &FrameFence, VK_TRUE, UINT64_MAX);
+            if (waitResult == VK_SUCCESS)
+            {
+                const u64 waitDurationNs = PerfNowNs() - waitStartNs;
+                FenceWaitCpuWindow.Add(waitDurationNs);
+                if (waitDurationNs >= 1000000ull)
+                    LateFrameCount++;
+                consumeGpuTiming(nullptr);
+            }
+            else
+            {
+                Log(LogLevel::Error, "VulkanRenderer3D: texture cache frame fence wait failed (%d)", static_cast<int>(waitResult));
+                ok = false;
+            }
+        }
+        else
+        {
+            Log(LogLevel::Error, "VulkanRenderer3D: texture cache frame fence status failed (%d)", static_cast<int>(fenceStatus));
+            ok = false;
+        }
+    }
+
+    if (Threaded)
+    {
+        for (RenderContext& renderContext : RenderContexts)
+            ok = waitForRenderContext(renderContext) && ok;
+    }
+
+    return ok;
 }
 
 bool VulkanRenderer3D::finalizeCaptureReadback(bool blocking)
