@@ -1052,6 +1052,8 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
     {
         if (!GPU.GPU3D.IsRendererAccelerated())
             _3DLine = GPU.GPU3D.GetLine(n3dline);
+        else if (!useStructuredVulkan2D && CurUnit->CaptureLatch && (((CurUnit->CaptureCnt >> 29) & 0x3) != 1))
+            _3DLine = GPU.GPU3D.GetLine(n3dline);
     }
 
     if (forceblank)
@@ -1305,6 +1307,199 @@ void SoftRenderer::DoCapture(u32 line, u32 width, u32 sourceLine)
 
     u16* dst = (u16*)GPU.VRAM[dstvram];
     u32 dstaddr = (((captureCnt >> 18) & 0x3) << 14) + (line * width);
+    if (!useStructuredVulkan2D)
+    {
+        u32* srcA;
+        if (captureCnt & (1<<24))
+        {
+            srcA = _3DLine;
+        }
+        else
+        {
+            srcA = BGOBJLine;
+            if (GPU.GPU3D.IsRendererAccelerated())
+            {
+                for (int i = 0; i < 256; i++)
+                {
+                    u32 val1 = BGOBJLine[i];
+                    u32 val2 = BGOBJLine[256+i];
+                    u32 val3 = BGOBJLine[512+i];
+
+                    u32 compmode = (val3 >> 24) & 0xF;
+
+                    if (compmode == 4)
+                    {
+                        u32 _3dval = _3DLine[i];
+                        if ((_3dval >> 24) > 0)
+                            val1 = ColorBlend5(_3dval, val1);
+                        else
+                            val1 = val2;
+                    }
+                    else if (compmode == 1)
+                    {
+                        u32 _3dval = _3DLine[i];
+                        if ((_3dval >> 24) > 0)
+                        {
+                            u32 eva = (val3 >> 8) & 0x1F;
+                            u32 evb = (val3 >> 16) & 0x1F;
+
+                            val1 = ColorBlend4(val1, _3dval, eva, evb);
+                        }
+                        else
+                            val1 = val2;
+                    }
+                    else if (compmode <= 3)
+                    {
+                        u32 _3dval = _3DLine[i];
+                        if ((_3dval >> 24) > 0)
+                        {
+                            u32 evy = (val3 >> 8) & 0x1F;
+
+                            val1 = _3dval;
+                            if      (compmode == 2) val1 = ColorBrightnessUp(val1, evy, 0x8);
+                            else if (compmode == 3) val1 = ColorBrightnessDown(val1, evy, 0x7);
+                        }
+                        else
+                            val1 = val2;
+                    }
+
+                    BGOBJLine[i] = val1;
+                }
+            }
+        }
+
+        u16* srcB = NULL;
+        u32 srcBaddr = line * 256;
+
+        if (captureCnt & (1<<25))
+        {
+            srcB = &CurUnit->DispFIFOBuffer[0];
+            srcBaddr = 0;
+        }
+        else
+        {
+            u32 srcvram = (CurUnit->DispCnt >> 18) & 0x3;
+            if (GPU.VRAMMap_LCDC & (1<<srcvram))
+                srcB = (u16*)GPU.VRAM[srcvram];
+
+            if (((CurUnit->DispCnt >> 16) & 0x3) != 2)
+                srcBaddr += ((captureCnt >> 26) & 0x3) << 14;
+        }
+
+        dstaddr &= 0xFFFF;
+        srcBaddr &= 0xFFFF;
+
+        static_assert(VRAMDirtyGranularity == 512);
+        GPU.VRAMDirty[dstvram][(dstaddr * 2) / VRAMDirtyGranularity] = true;
+
+        switch ((captureCnt >> 29) & 0x3)
+        {
+        case 0:
+            {
+                for (u32 i = 0; i < width; i++)
+                {
+                    u32 val = srcA[i];
+
+                    u32 r = (val >> 1) & 0x1F;
+                    u32 g = (val >> 9) & 0x1F;
+                    u32 b = (val >> 17) & 0x1F;
+                    u32 a = ((val >> 24) != 0) ? 0x8000 : 0;
+
+                    dst[dstaddr] = r | (g << 5) | (b << 10) | a;
+                    dstaddr = (dstaddr + 1) & 0xFFFF;
+                }
+            }
+            break;
+
+        case 1:
+            {
+                if (srcB)
+                {
+                    for (u32 i = 0; i < width; i++)
+                    {
+                        dst[dstaddr] = srcB[srcBaddr];
+                        srcBaddr = (srcBaddr + 1) & 0xFFFF;
+                        dstaddr = (dstaddr + 1) & 0xFFFF;
+                    }
+                }
+                else
+                {
+                    for (u32 i = 0; i < width; i++)
+                    {
+                        dst[dstaddr] = 0;
+                        dstaddr = (dstaddr + 1) & 0xFFFF;
+                    }
+                }
+            }
+            break;
+
+        case 2:
+        case 3:
+            {
+                u32 eva = captureCnt & 0x1F;
+                u32 evb = (captureCnt >> 8) & 0x1F;
+
+                if (eva > 16) eva = 16;
+                if (evb > 16) evb = 16;
+
+                if (srcB)
+                {
+                    for (u32 i = 0; i < width; i++)
+                    {
+                        u32 val = srcA[i];
+
+                        u32 rA = (val >> 1) & 0x1F;
+                        u32 gA = (val >> 9) & 0x1F;
+                        u32 bA = (val >> 17) & 0x1F;
+                        u32 aA = ((val >> 24) != 0) ? 1 : 0;
+
+                        val = srcB[srcBaddr];
+
+                        u32 rB = val & 0x1F;
+                        u32 gB = (val >> 5) & 0x1F;
+                        u32 bB = (val >> 10) & 0x1F;
+                        u32 aB = val >> 15;
+
+                        u32 rD = ((rA * aA * eva) + (rB * aB * evb) + 8) >> 4;
+                        u32 gD = ((gA * aA * eva) + (gB * aB * evb) + 8) >> 4;
+                        u32 bD = ((bA * aA * eva) + (bB * aB * evb) + 8) >> 4;
+                        u32 aD = (eva>0 ? aA : 0) | (evb>0 ? aB : 0);
+
+                        if (rD > 0x1F) rD = 0x1F;
+                        if (gD > 0x1F) gD = 0x1F;
+                        if (bD > 0x1F) bD = 0x1F;
+
+                        dst[dstaddr] = rD | (gD << 5) | (bD << 10) | (aD << 15);
+                        srcBaddr = (srcBaddr + 1) & 0xFFFF;
+                        dstaddr = (dstaddr + 1) & 0xFFFF;
+                    }
+                }
+                else
+                {
+                    for (u32 i = 0; i < width; i++)
+                    {
+                        u32 val = srcA[i];
+
+                        u32 rA = (val >> 1) & 0x1F;
+                        u32 gA = (val >> 9) & 0x1F;
+                        u32 bA = (val >> 17) & 0x1F;
+                        u32 aA = ((val >> 24) != 0) ? 1 : 0;
+
+                        u32 rD = ((rA * aA * eva) + 8) >> 4;
+                        u32 gD = ((gA * aA * eva) + 8) >> 4;
+                        u32 bD = ((bA * aA * eva) + 8) >> 4;
+                        u32 aD = (eva>0 ? aA : 0);
+
+                        dst[dstaddr] = rD | (gD << 5) | (bD << 10) | (aD << 15);
+                        dstaddr = (dstaddr + 1) & 0xFFFF;
+                    }
+                }
+            }
+            break;
+        }
+        return;
+    }
+
     const u32 structuredCaptureDstBase = dstaddr & 0xFFFFu;
     bool structuredCaptureStoredFromSourceA = false;
 
@@ -1969,6 +2164,157 @@ void SoftRenderer::DrawScanlineBGMode7(u32 line)
 
 void SoftRenderer::DrawScanline_BGOBJ(u32 line)
 {
+    if (!UseStructuredVulkan2D() && !MelonDSAndroid::areRendererDebugToolsEnabled())
+    {
+        if (CurUnit->DispCnt & (1<<7))
+        {
+            for (int i = 0; i < 256; i++)
+                BGOBJLine[i] = 0xFF3F3F3F;
+
+            return;
+        }
+
+        u64 backdrop;
+        if (CurUnit->Num) backdrop = *(u16*)&GPU.Palette[0x400];
+        else     backdrop = *(u16*)&GPU.Palette[0];
+
+        {
+            u8 r = (backdrop & 0x001F) << 1;
+            u8 g = (backdrop & 0x03E0) >> 4;
+            u8 b = (backdrop & 0x7C00) >> 9;
+
+            backdrop = r | (g << 8) | (b << 16) | 0x20000000;
+            backdrop |= (backdrop << 32);
+
+            for (int i = 0; i < 256; i+=2)
+                *(u64*)&BGOBJLine[i] = backdrop;
+        }
+
+        if (CurUnit->DispCnt & 0xE000)
+            CurUnit->CalculateWindowMask(line, WindowMask, OBJWindow[CurUnit->Num]);
+        else
+            memset(WindowMask, 0xFF, 256);
+
+        ApplySpriteMosaicX();
+        CurBGXMosaicTable = MosaicTable[CurUnit->BGMosaicSize[0]].data();
+
+        switch (CurUnit->DispCnt & 0x7)
+        {
+        case 0: DrawScanlineBGMode<0>(line); break;
+        case 1: DrawScanlineBGMode<1>(line); break;
+        case 2: DrawScanlineBGMode<2>(line); break;
+        case 3: DrawScanlineBGMode<3>(line); break;
+        case 4: DrawScanlineBGMode<4>(line); break;
+        case 5: DrawScanlineBGMode<5>(line); break;
+        case 6: DrawScanlineBGMode6(line); break;
+        case 7: DrawScanlineBGMode7(line); break;
+        }
+
+        if (!GPU.GPU3D.IsRendererAccelerated())
+        {
+            for (int i = 0; i < 256; i++)
+            {
+                u32 val1 = BGOBJLine[i];
+                u32 val2 = BGOBJLine[256+i];
+
+                BGOBJLine[i] = ColorComposite(i, val1, val2);
+            }
+        }
+        else
+        {
+            if (CurUnit->Num == 0)
+            {
+                for (int i = 0; i < 256; i++)
+                {
+                    u32 val1 = BGOBJLine[i];
+                    u32 val2 = BGOBJLine[256+i];
+                    u32 val3 = BGOBJLine[512+i];
+
+                    u32 flag1 = val1 >> 24;
+                    u32 flag2 = val2 >> 24;
+
+                    u32 bldcnteffect = (CurUnit->BlendCnt >> 6) & 0x3;
+
+                    u32 target1;
+                    if      (flag1 & 0x80) target1 = 0x0010;
+                    else if (flag1 & 0x40) target1 = 0x0001;
+                    else                   target1 = flag1;
+
+                    u32 target2;
+                    if      (flag2 & 0x80) target2 = 0x1000;
+                    else if (flag2 & 0x40) target2 = 0x0100;
+                    else                   target2 = flag2 << 8;
+
+                    if (((flag1 & 0xC0) == 0x40) && (CurUnit->BlendCnt & target2))
+                    {
+                        BGOBJLine[i]     = val2;
+                        BGOBJLine[256+i] = ColorComposite(i, val2, val3);
+                        BGOBJLine[512+i] = 0x04000000;
+                    }
+                    else if ((flag1 & 0xC0) == 0x40)
+                    {
+                        if (bldcnteffect == 1)             bldcnteffect = 0;
+                        if (!(CurUnit->BlendCnt & 0x0001)) bldcnteffect = 0;
+                        if (!(WindowMask[i] & 0x20))       bldcnteffect = 0;
+
+                        BGOBJLine[i]     = val2;
+                        BGOBJLine[256+i] = ColorComposite(i, val2, val3);
+                        BGOBJLine[512+i] = (bldcnteffect << 24) | (CurUnit->EVY << 8);
+                    }
+                    else if (((flag2 & 0xC0) == 0x40) && ((CurUnit->BlendCnt & 0x01C0) == 0x0140))
+                    {
+                        u32 eva, evb;
+                        if ((flag1 & 0xC0) == 0xC0)
+                        {
+                            eva = flag1 & 0x1F;
+                            evb = 16 - eva;
+                        }
+                        else if (((CurUnit->BlendCnt & target1) && (WindowMask[i] & 0x20)) ||
+                                ((flag1 & 0xC0) == 0x80))
+                        {
+                            eva = CurUnit->EVA;
+                            evb = CurUnit->EVB;
+                        }
+                        else
+                            bldcnteffect = 7;
+
+                        BGOBJLine[i]     = val1;
+                        BGOBJLine[256+i] = ColorComposite(i, val1, val3);
+                        BGOBJLine[512+i] = (bldcnteffect << 24) | (CurUnit->EVB << 16) | (CurUnit->EVA << 8);
+                    }
+                    else
+                    {
+                        BGOBJLine[i]     = ColorComposite(i, val1, val2);
+                        BGOBJLine[256+i] = 0;
+                        BGOBJLine[512+i] = 0x07000000;
+                    }
+                }
+            }
+            else
+            {
+                for (int i = 0; i < 256; i++)
+                {
+                    u32 val1 = BGOBJLine[i];
+                    u32 val2 = BGOBJLine[256+i];
+
+                    BGOBJLine[i]     = ColorComposite(i, val1, val2);
+                    BGOBJLine[256+i] = 0;
+                    BGOBJLine[512+i] = 0x07000000;
+                }
+            }
+        }
+
+        if (CurUnit->BGMosaicY >= CurUnit->BGMosaicYMax)
+        {
+            CurUnit->BGMosaicY = 0;
+            CurUnit->BGMosaicYMax = CurUnit->BGMosaicSize[1];
+        }
+        else
+            CurUnit->BGMosaicY++;
+
+        return;
+    }
+
     struct CaptureSamplePoint
     {
         const char* label;
@@ -1990,6 +2336,7 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         {"hud_lawn",    5u, 65u},
     };
     const bool logCaptureSamples = MelonDSAndroid::areRendererDebugBgObjLogsEnabled();
+    const bool useStructuredVulkan2D = UseStructuredVulkan2D();
 
     auto logHudStageAfterBGMode =
         [&]() {
@@ -2042,8 +2389,11 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         for (int i = 0; i < 256; i+=2)
         {
             *(u64*)&BGOBJLine[i] = backdrop;
-            *(u64*)&BGOBJLine[256 + i] = 0;
-            *(u64*)&BGOBJLine[512 + i] = 0;
+            if (useStructuredVulkan2D)
+            {
+                *(u64*)&BGOBJLine[256 + i] = 0;
+                *(u64*)&BGOBJLine[512 + i] = 0;
+            }
         }
     }
 
@@ -2092,7 +2442,7 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
         const u32 displayMode =
             (CurUnit->DispCnt >> 16u) & (CurUnit->Num ? 0x1u : 0x3u);
         const bool captureBacked3DLine =
-            UseStructuredVulkan2D()
+            useStructuredVulkan2D
             &&
             CurUnit->Num == 1
             && displayMode == 1u
@@ -2219,7 +2569,7 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
                     // no potential 3D pixel involved
 
                     const u32 flag3 = originalVal3 >> 24;
-                    const bool overlayOver3d = (flag3 & 0x40u) != 0;
+                    const bool overlayOver3d = useStructuredVulkan2D && (flag3 & 0x40u) != 0;
 
                     BGOBJLine[i]     = ColorComposite(i, val1, val2);
                     BGOBJLine[256+i] = 0;
@@ -2275,7 +2625,7 @@ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
                 u32 val2 = originalVal2;
 
                 const u32 flag3 = originalVal3 >> 24;
-                const bool overlayOver3d = (flag3 & 0x40u) != 0;
+                const bool overlayOver3d = useStructuredVulkan2D && (flag3 & 0x40u) != 0;
 
                 BGOBJLine[i]     = ColorComposite(i, val1, val2);
                 BGOBJLine[256+i] = 0;
