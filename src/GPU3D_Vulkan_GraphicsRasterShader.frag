@@ -319,12 +319,23 @@ Color6A5 sampleTexture()
 
 #endif
 
-    int sampleS = int(floor(texcoord.x));
-    int sampleT = int(floor(texcoord.y));
     bool repeatS = (texParam & (1u << 16u)) != 0u;
     bool repeatT = (texParam & (1u << 17u)) != 0u;
     bool mirrorS = (texParam & (1u << 18u)) != 0u;
     bool mirrorT = (texParam & (1u << 19u)) != 0u;
+
+#if MELONDS_FAST_OPAQUE_MODULATE == 0
+    if ((flags & TRI_FLAG_LINEAR) != 0u && (repeatS || repeatT || mirrorS || mirrorT))
+    {
+        vec2 renderScale = max(vec2(float(pc.width) * (1.0 / 256.0), float(pc.height) * (1.0 / 192.0)), vec2(1.0));
+        vec2 subpixelOffset = mod(gl_FragCoord.xy - vec2(0.5), renderScale);
+        texcoord += dFdx(fTexcoord) * -subpixelOffset.x + dFdy(fTexcoord) * -subpixelOffset.y;
+        texcoord -= vec2(LINEAR_TEXEL_COORD_BIAS);
+    }
+#endif
+
+    int sampleS = int(floor(texcoord.x));
+    int sampleT = int(floor(texcoord.y));
 
     sampleS = wrapTexelCoord(sampleS, int(texWidth), repeatS, mirrorS);
     sampleT = wrapTexelCoord(sampleT, int(texHeight), repeatT, mirrorT);
