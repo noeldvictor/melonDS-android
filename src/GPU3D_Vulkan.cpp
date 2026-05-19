@@ -18,6 +18,8 @@
 
 #include "GPU3D_Vulkan.h"
 
+#include "VulkanDispatch.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

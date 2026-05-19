@@ -5,6 +5,7 @@
 
 #include "Platform.h"
 #include "VulkanContext.h"
+#include "VulkanDispatch.h"
 
 namespace melonDS
 {

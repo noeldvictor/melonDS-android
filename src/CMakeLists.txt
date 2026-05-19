@@ -40,6 +40,7 @@ add_library(core STATIC
     GPU3D_AcceleratedFrontend.cpp
     GPU3D_Soft.cpp
     GPU3D_Vulkan.cpp
+    VulkanDispatch.cpp
     VulkanContext.cpp
     GPU3D_Texcache.cpp
     GPU3D_TexcacheVulkan.cpp

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "Platform.h"
+#include "VulkanDispatch.h"
 
 namespace melonDS
 {
@@ -182,6 +183,12 @@ bool VulkanContext::initializeLocked()
     ForceDisableTimelineSemaphores = gForceDisableTimelineSemaphores.load(std::memory_order_relaxed);
     ForceDisableDynamicTextureIndexing = gForceDisableDynamicTextureIndexing.load(std::memory_order_relaxed);
 
+    if (!VulkanDispatch::Initialize())
+    {
+        Platform::Log(Platform::LogLevel::Error, "VulkanContext: failed to initialize Vulkan dispatch");
+        return false;
+    }
+
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "melonDS-android";
@@ -269,6 +276,7 @@ bool VulkanContext::initializeLocked()
         shutdownLocked();
         return false;
     }
+    VulkanDispatch::LoadInstance(Instance);
 
     if (enableValidationLayers)
     {
@@ -617,6 +625,7 @@ bool VulkanContext::initializeLocked()
         }
 
         PhysicalDevice = candidate;
+        VulkanDispatch::LoadDevice(Device);
         QueueFamilyIndex = static_cast<u32>(selectedQueueFamily);
         vkGetDeviceQueue(Device, QueueFamilyIndex, 0, &Queue);
         TimestampPeriod = deviceProperties.limits.timestampPeriod;
