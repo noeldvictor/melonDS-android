@@ -140,7 +140,33 @@ AcceleratedCoverageFixState ResolveAcceleratedCoverageFix(
 
     const bool wrapS = (polygon.TexParam & (1u << 16)) != 0u;
     const bool wrapT = (polygon.TexParam & (1u << 17)) != 0u;
+    const bool mirrorS = (polygon.TexParam & (1u << 18)) != 0u;
+    const bool mirrorT = (polygon.TexParam & (1u << 19)) != 0u;
     const bool isRepeat = wrapS || wrapT;
+    const bool textureColor0Transparent = (polygon.TexParam & (1u << 29)) != 0u;
+    const u32 textureFormat = (polygon.TexParam >> 26u) & 0x7u;
+    const u32 alpha5 = (polygon.Attr >> 16u) & 0x1Fu;
+    const u32 blendMode = (polygon.Attr >> 4u) & 0x3u;
+    const bool depthWriteDisabled = (polygon.Attr & (1u << 11u)) == 0u;
+    bool linearW = polygon.NumVertices > 0u;
+    const s32 firstW = linearW ? std::max<s32>(1, polygon.FinalW[0]) : 1;
+    for (u32 vertexIndex = 1; vertexIndex < polygon.NumVertices && linearW; vertexIndex++)
+        linearW = std::max<s32>(1, polygon.FinalW[vertexIndex]) == firstW;
+    linearW = linearW && ((static_cast<u32>(firstW) & 0x7Fu) == 0u);
+    const bool paletteUiClamp =
+        config.PaletteUiClampEnabled
+        && polygon.Translucent
+        && linearW
+        && textureFormat == 3u
+        && textureColor0Transparent
+        && depthWriteDisabled
+        && blendMode == 0u
+        && alpha5 > 0u
+        && alpha5 < 31u
+        && !wrapS
+        && !wrapT
+        && !mirrorS
+        && !mirrorT;
 
     if (config.Enabled && config.UserPx > 0.0f)
     {
@@ -153,6 +179,12 @@ AcceleratedCoverageFixState ResolveAcceleratedCoverageFix(
     {
         state.ApplyPassiveFix = true;
         state.EffectivePx += config.PassiveRepeatPx;
+    }
+
+    if (paletteUiClamp && config.PaletteUiClampPx > 0.0f)
+    {
+        state.ApplyPassiveFix = true;
+        state.EffectivePx += config.PaletteUiClampPx;
     }
 
     state.Apply = state.EffectivePx > 0.0f;

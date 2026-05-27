@@ -18,6 +18,8 @@ struct AcceleratedCoverageFixConfig
     bool ApplyClamp = false;
     float PassiveRepeatPx = 0.0f;
     bool DisablePassiveRepeat = false;
+    bool PaletteUiClampEnabled = false;
+    float PaletteUiClampPx = 0.0f;
 };
 
 struct AcceleratedCoverageFixState
