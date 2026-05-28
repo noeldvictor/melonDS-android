@@ -9911,6 +9911,14 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
             && !mirrorS
             && !mirrorT;
     };
+    const auto isCompactPaletteUiReplayTriangle = [&](const TriangleGpu& tri) -> bool {
+        if (!isClampPaletteUiTriangle(tri))
+            return false;
+
+        const u32 texturePage = tri.texParam & 0xFFFFu;
+        return texturePage == 0x05C0u
+            || texturePage == 0x85C0u;
+    };
     const auto isCompactTopStatusGlyphTriangle = [&](const TriangleGpu& tri) -> bool {
         const u32 texParam = tri.texParam;
         const u32 textureFormat = (texParam >> 26u) & 0x7u;
@@ -10019,7 +10027,7 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
             && (draw.polyAttr & (1u << 11u)) == 0u
             && texParam != 0x68C01B10u
             && texParam != 0x6A5016D0u
-            && isClampPaletteUiTriangle(Triangles[draw.firstTriangle]);
+            && isCompactPaletteUiReplayTriangle(Triangles[draw.firstTriangle]);
         if (!compactStatusGlyph && !paletteUiReplay)
         {
             return false;
