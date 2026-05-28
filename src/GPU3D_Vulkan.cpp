@@ -2807,7 +2807,7 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
         );
         Log(
             LogLevel::Warn,
-            "VulkanPerf[GPU3DPasses]: sceneBuild cpu avg=%.3fms p95=%.3fms opaque cpu avg=%.3fms p95=%.3fms opaque gpu avg=%.3fms p95=%.3fms opaqueDraw gpu avg=%.3fms p95=%.3fms edge gpu avg=%.3fms p95=%.3fms alphaShadow cpu avg=%.3fms p95=%.3fms alphaShadow gpu avg=%.3fms p95=%.3fms final cpu avg=%.3fms p95=%.3fms final gpu avg=%.3fms p95=%.3fms captureExport cpu avg=%.3fms p95=%.3fms captureExport gpu avg=%.3fms p95=%.3fms opaqueDraws=%u needOpaqueDraws=%u alphaShadowDraws=%u opaqueW=%u opaqueZ=%u opaqueTex=%u opaqueNoTex=%u opaqueMod=%u opaqueDecal=%u opaqueToon=%u opaqueHighlight=%u opaqueLinear=%u opaqueRepeat=%u opaqueMirror=%u opaqueRepeatS=%u opaqueRepeatT=%u opaqueMirrorS=%u opaqueMirrorT=%u opaqueClampS=%u opaqueClampT=%u opaqueFullAlpha=%u activeTextures=%u triangles=%zu pipelines=%u",
+            "VulkanPerf[GPU3DPasses]: sceneBuild cpu avg=%.3fms p95=%.3fms opaque cpu avg=%.3fms p95=%.3fms opaque gpu avg=%.3fms p95=%.3fms opaqueDraw gpu avg=%.3fms p95=%.3fms edge gpu avg=%.3fms p95=%.3fms alphaShadow cpu avg=%.3fms p95=%.3fms alphaShadow gpu avg=%.3fms p95=%.3fms final cpu avg=%.3fms p95=%.3fms final gpu avg=%.3fms p95=%.3fms captureExport cpu avg=%.3fms p95=%.3fms captureExport gpu avg=%.3fms p95=%.3fms opaqueDraws=%u needOpaqueDraws=%u alphaShadowDraws=%u opaqueW=%u opaqueZ=%u opaqueTex=%u opaqueNoTex=%u opaqueMod=%u opaqueDecal=%u opaqueToon=%u opaqueHighlight=%u opaqueLinear=%u opaqueRepeat=%u opaqueMirror=%u opaqueRepeatS=%u opaqueRepeatT=%u opaqueMirrorS=%u opaqueMirrorT=%u opaqueClampS=%u opaqueClampT=%u opaqueFullAlpha=%u highresRepeatModel=%u activeTextures=%u triangles=%zu pipelines=%u",
             PerfNsToMs(graphicsSceneBuildCpuSummary.MeanNs),
             PerfNsToMs(graphicsSceneBuildCpuSummary.P95Ns),
             PerfNsToMs(graphicsMainCpuSummary.MeanNs),
@@ -2851,6 +2851,7 @@ void VulkanRenderer3D::logPerformanceIfNeeded()
             LastGraphicsOpaqueClampSDrawCount,
             LastGraphicsOpaqueClampTDrawCount,
             LastGraphicsOpaqueFullAlphaDrawCount,
+            LastGraphicsOpaqueHighresRepeatModelDrawCount,
             ActiveTextureDescriptorCount,
             Triangles.size(),
             static_cast<u32>(
@@ -9981,6 +9982,12 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         const auto [bTop, bBottom] = drawYBounds(b);
         return aBottom > bTop && bBottom > aTop;
     };
+    const auto drawTopDs = [&](const GraphicsPolygonDraw& draw) -> float {
+        const auto [top, bottom] = drawYBounds(draw);
+        (void)bottom;
+        const float scale = std::max(1.0f, static_cast<float>(ScaleFactor));
+        return static_cast<float>(top) / scale;
+    };
     const auto drawXBounds = [&](const GraphicsPolygonDraw& draw) -> std::pair<float, float> {
         if (draw.firstTriangle >= Triangles.size() || draw.triangleCount == 0u)
             return {0.0f, 0.0f};
@@ -10024,6 +10031,13 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         const u32 texturePage = tri.texParam & 0xFFFFu;
         return texturePage == 0x05C0u
             || texturePage == 0x85C0u;
+    };
+    const auto isFlatDsUiPlaneTriangle = [&](const TriangleGpu& tri) -> bool {
+        constexpr float kUiPlaneW = 25600.0f;
+        constexpr float kUiPlaneTolerance = 0.5f;
+        return std::abs(tri.w0 - kUiPlaneW) <= kUiPlaneTolerance
+            && std::abs(tri.w1 - kUiPlaneW) <= kUiPlaneTolerance
+            && std::abs(tri.w2 - kUiPlaneW) <= kUiPlaneTolerance;
     };
     const auto isCompactTopStatusGlyphTriangle = [&](const TriangleGpu& tri) -> bool {
         const u32 texParam = tri.texParam;
@@ -10114,6 +10128,22 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
             && polyId == 11u
             && texParam == 0x6DC00200u;
     };
+    const bool hasLowAlphaPaletteUiOverlay = [&]() -> bool {
+        for (u32 alphaDrawIndex : GraphicsAlphaDrawIndices)
+        {
+            if (alphaDrawIndex >= GraphicsPolygons.size())
+                continue;
+
+            const GraphicsPolygonDraw& alphaDraw = GraphicsPolygons[alphaDrawIndex];
+            if (!isTranslucentPaletteUiOverlay(alphaDraw))
+                continue;
+
+            const u32 alpha5 = (alphaDraw.polyAttr >> 16u) & 0x1Fu;
+            if (alpha5 < 27u)
+                return true;
+        }
+        return false;
+    }();
     const auto shouldReplayOpaquePaletteUiDraw = [&](const GraphicsPolygonDraw& draw) -> bool {
         if (!clearPlaneAlphaZero
             || !alphaBlendEnabled
@@ -10133,8 +10163,15 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
             && (draw.polyAttr & (1u << 11u)) == 0u
             && texParam != 0x68C01B10u
             && texParam != 0x6A5016D0u
-            && isCompactPaletteUiReplayTriangle(Triangles[draw.firstTriangle]);
+            && isClampPaletteUiTriangle(Triangles[draw.firstTriangle])
+            && isFlatDsUiPlaneTriangle(Triangles[draw.firstTriangle]);
         if (!compactStatusGlyph && !paletteUiReplay)
+        {
+            return false;
+        }
+        if (paletteUiReplay
+            && !hasLowAlphaPaletteUiOverlay
+            && ((draw.polyAttr >> 24u) & 0x3Fu) != 0u)
         {
             return false;
         }
@@ -10164,6 +10201,11 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
 
             if (isPaletteUiHelpPanelOverlay(alphaDraw)
                 && xBoundsOverlap(draw, alphaDraw))
+            {
+                return false;
+            }
+            const u32 alpha5 = (alphaDraw.polyAttr >> 16u) & 0x1Fu;
+            if (!hasLowAlphaPaletteUiOverlay && alpha5 >= 27u && drawTopDs(draw) >= 18.0f)
             {
                 return false;
             }
@@ -12429,6 +12471,7 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
     LastGraphicsOpaqueClampSDrawCount = 0;
     LastGraphicsOpaqueClampTDrawCount = 0;
     LastGraphicsOpaqueFullAlphaDrawCount = 0;
+    LastGraphicsOpaqueHighresRepeatModelDrawCount = 0;
     for (u32 drawIndex : GraphicsOpaqueDrawIndices)
     {
         if (drawIndex >= GraphicsPolygons.size())
@@ -12457,6 +12500,10 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                 LastGraphicsOpaqueModulateDrawCount++;
 
             const u32 texParam = Triangles[draw.firstTriangle].texParam;
+            const u32 textureFormat = (texParam >> 26u) & 0x7u;
+            const u32 alpha5 = (draw.polyAttr >> 16u) & 0x1Fu;
+            const u32 blendMode = (draw.polyAttr >> 4u) & 0x3u;
+            const bool color0Transparent = (texParam & (1u << 29u)) != 0u;
             const bool repeatS = (texParam & (1u << 16u)) != 0u;
             const bool repeatT = (texParam & (1u << 17u)) != 0u;
             const bool mirrorS = (texParam & (1u << 18u)) != 0u;
@@ -12477,6 +12524,15 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                 LastGraphicsOpaqueMirrorSDrawCount++;
             if (mirrorT)
                 LastGraphicsOpaqueMirrorTDrawCount++;
+            if ((firstTriangleFlags & kTriangleFlagLinear) != 0u
+                && (textureFormat == 4u || textureFormat == 5u)
+                && !color0Transparent
+                && alpha5 == 31u
+                && blendMode == 0u
+                && (repeatS || repeatT || mirrorS || mirrorT))
+            {
+                LastGraphicsOpaqueHighresRepeatModelDrawCount++;
+            }
         }
         else
             LastGraphicsOpaqueUntexturedDrawCount++;

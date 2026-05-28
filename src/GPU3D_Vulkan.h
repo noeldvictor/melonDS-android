@@ -813,6 +813,7 @@ private:
     u32 LastGraphicsOpaqueClampSDrawCount = 0;
     u32 LastGraphicsOpaqueClampTDrawCount = 0;
     u32 LastGraphicsOpaqueFullAlphaDrawCount = 0;
+    u32 LastGraphicsOpaqueHighresRepeatModelDrawCount = 0;
     u64 ContextMissCount = 0;
     u64 LateFrameCount = 0;
     u64 DroppedFrameCount = 0;
