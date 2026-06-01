@@ -581,6 +581,15 @@ void ARMJIT_Memory::RemapDTCM(u32 newBase, u32 newSize) noexcept
     Mappings[memregion_DTCM].Clear();
 }
 
+void ARMJIT_Memory::RemapMainRAM() noexcept
+{
+    for (int i = 0; i < Mappings[memregion_MainRAM].Length; i++)
+    {
+        Mappings[memregion_MainRAM][i].Unmap(memregion_MainRAM, NDS);
+    }
+    Mappings[memregion_MainRAM].Clear();
+}
+
 void ARMJIT_Memory::RemapNWRAM(int num) noexcept
 {
     if (NDS.ConsoleType == 0)

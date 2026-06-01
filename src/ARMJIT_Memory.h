@@ -106,6 +106,7 @@ public:
     ARMJIT_Memory& operator=(ARMJIT_Memory&&) = delete;
     void Reset() noexcept;
     void RemapDTCM(u32 newBase, u32 newSize) noexcept;
+    void RemapMainRAM() noexcept;
     void RemapSWRAM() noexcept;
     void RemapNWRAM(int num) noexcept;
     void SetCodeProtection(int region, u32 offset, bool protect) noexcept;
@@ -207,6 +208,7 @@ public:
 
     void Reset() noexcept {}
     void RemapDTCM(u32 newBase, u32 newSize) noexcept {}
+    void RemapMainRAM() noexcept {}
     void RemapSWRAM() noexcept {}
     void RemapNWRAM(int num) noexcept {}
     void SetCodeProtection(int region, u32 offset, bool protect) noexcept {}

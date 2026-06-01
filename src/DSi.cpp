@@ -1298,6 +1298,8 @@ void DSi::UpdateVRAMTimings()
 
 void DSi::ApplyNewRAMSize(u32 size)
 {
+    JIT.Memory.RemapMainRAM();
+
     switch (size)
     {
     case 0:
