@@ -53,6 +53,11 @@ public:
 
     void Section(const char* magic);
 
+    [[nodiscard]] bool HasSection(const char* magic) const
+    {
+        return FindSection(magic) != NO_SECTION;
+    }
+
     void Var8(u8* var)
     {
         VarArray(var, sizeof(*var));
