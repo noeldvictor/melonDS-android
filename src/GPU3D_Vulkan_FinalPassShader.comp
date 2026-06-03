@@ -59,6 +59,13 @@ bool depthEquivalent(uint a, uint b, bool wBuffer)
     return (a - b + 0x200u) <= 0x400u;
 }
 
+uint edgeColorForPolyId(uint polyId)
+{
+    if ((pc.variantKey & 0x80000000u) != 0u && polyId == (pc.variantKey & 0x3Fu))
+        return pc.triangleBase;
+    return pc.edgeColorPacked[polyId >> 3u];
+}
+
 uint unpackAlpha5(uint packedColor)
 {
     return (packedColor >> 24u) & 0x1Fu;
@@ -347,7 +354,7 @@ void main()
             || (polyIdMismatch.z && nearer.z)
             || (polyIdMismatch.w && nearer.w))
         {
-            uint edgeColor = pc.edgeColorPacked[polyId >> 3u];
+            uint edgeColor = edgeColorForPolyId(polyId);
             colorTop = (edgeColor & 0x00FFFFFFu) | (colorTop & 0xFF000000u);
             attrTop = (attrTop & 0xFFFFE0FFu) | 0x00001000u;
         }

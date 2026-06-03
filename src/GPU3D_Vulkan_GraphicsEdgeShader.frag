@@ -47,6 +47,13 @@ vec3 unpackEdgeColor(uint packedColor)
     return vec3(r, g, b);
 }
 
+vec3 edgeColorForPolyId(int polyid)
+{
+    if ((pc.variantKey & 0x80000000u) != 0u && uint(polyid) == (pc.variantKey & 0x3Fu))
+        return unpackEdgeColor(pc.triangleBase);
+    return unpackEdgeColor(pc.edgeColorPacked[uint(polyid) >> 3u]);
+}
+
 void main()
 {
     ivec2 coord = ivec2(gl_FragCoord.xy);
@@ -73,7 +80,7 @@ void main()
             || isgood(attrL, depthL.r, polyid, depth.r)
             || isgood(attrR, depthR.r, polyid, depth.r))
         {
-            ret.rgb = unpackEdgeColor(pc.edgeColorPacked[polyid >> 3u]);
+            ret.rgb = edgeColorForPolyId(polyid);
             ret.a = ((pc.dispCnt & (1u << 4u)) != 0u) ? 0.5 : 1.0;
         }
     }

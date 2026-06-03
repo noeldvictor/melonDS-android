@@ -348,6 +348,8 @@ private:
         u32 vertexCount = 0;
         u32 firstEdgeIndex = 0;
         u32 edgeIndexCount = 0;
+        u32 edgeColorOverrideMask = 0;
+        u32 edgeColorOverridePacked = 0;
     };
 
     bool ensureInitialized();
@@ -748,6 +750,8 @@ private:
     std::vector<u32> GraphicsAlphaDrawIndices;
     std::vector<u32> GraphicsShadowMaskDrawIndices;
     std::vector<u32> GraphicsShadowDrawIndices;
+    u32 GraphicsHiddenAlphaZeroFinalEdgePolyIdOverride = 0xFFFFFFFFu;
+    u32 GraphicsHiddenAlphaZeroFinalEdgeColorOverride = 0;
     std::vector<u32> RawReadbackRgba;
     std::vector<u32> RawResultReadback;
     std::array<u32, 256 * 192> LineCache{};

@@ -9951,7 +9951,26 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         pushConstants.depthBlendMode = wMode;
         pushConstants.triangleBase = draw.firstTriangle;
         pushConstants.triangleCount = draw.triangleCount;
+        u32 savedEdgeColorPacked[8]{};
+        if (draw.edgeColorOverrideMask != 0u)
+        {
+            for (u32 i = 0; i < 8u; i++)
+            {
+                if ((draw.edgeColorOverrideMask & (1u << i)) == 0u)
+                    continue;
+                savedEdgeColorPacked[i] = pushConstants.edgeColorPacked[i];
+                pushConstants.edgeColorPacked[i] = draw.edgeColorOverridePacked;
+            }
+        }
         vkCmdPushConstants(commandBuffer, GraphicsPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushConstants), &pushConstants);
+        if (draw.edgeColorOverrideMask != 0u)
+        {
+            for (u32 i = 0; i < 8u; i++)
+            {
+                if ((draw.edgeColorOverrideMask & (1u << i)) != 0u)
+                    pushConstants.edgeColorPacked[i] = savedEdgeColorPacked[i];
+            }
+        }
         vkCmdDrawIndexed(commandBuffer, draw.edgeIndexCount, 1u, draw.firstEdgeIndex, 0, 0u);
         drawCount++;
         return true;
@@ -10608,6 +10627,18 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
     const bool runEdgePass = (dispCnt & (1u << 5u)) != 0u;
     const bool runFogPass = (dispCnt & (1u << 7u)) != 0u;
     const u64 finalCpuStartNs = PerfNowNs();
+    const u32 savedFinalVariantKey = pushConstants.variantKey;
+    const u32 savedFinalTriangleBase = pushConstants.triangleBase;
+    if (GraphicsHiddenAlphaZeroFinalEdgePolyIdOverride < 64u)
+    {
+        pushConstants.variantKey = 0x80000000u | GraphicsHiddenAlphaZeroFinalEdgePolyIdOverride;
+        pushConstants.triangleBase = GraphicsHiddenAlphaZeroFinalEdgeColorOverride;
+    }
+    else
+    {
+        pushConstants.variantKey = 0u;
+        pushConstants.triangleBase = 0u;
+    }
 
     VkRenderPassBeginInfo finalBeginInfo{};
     finalBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -10652,6 +10683,8 @@ bool VulkanRenderer3D::dispatchGraphicsRasterAndReadback(
         vkCmdDraw(commandBuffer, 3u, 1u, 0u, 0u);
     }
 
+    pushConstants.variantKey = savedFinalVariantKey;
+    pushConstants.triangleBase = savedFinalTriangleBase;
     vkCmdEndRenderPass(commandBuffer);
     FinalCpuWindow.Add(PerfNowNs() - finalCpuStartNs);
 
@@ -11900,6 +11933,8 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
     GraphicsAlphaDrawIndices.reserve(std::max(GraphicsAlphaDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
     GraphicsShadowMaskDrawIndices.reserve(std::max(GraphicsShadowMaskDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
     GraphicsShadowDrawIndices.reserve(std::max(GraphicsShadowDrawIndices.capacity(), SharedGraphicsScene.Draws.size()));
+    GraphicsHiddenAlphaZeroFinalEdgePolyIdOverride = 0xFFFFFFFFu;
+    GraphicsHiddenAlphaZeroFinalEdgeColorOverride = 0u;
 
     std::unordered_map<TextureLookupKey, TextureFrameData, TextureLookupHasher> textureLookup{};
     textureLookup.reserve(SharedGraphicsScene.Draws.size());
@@ -12152,7 +12187,10 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
             GraphicsSceneVertices[sceneVertexIndex] = makeSceneGraphicsVertex(SharedGraphicsScene.Vertices[sceneVertexIndex]);
         }
 
-        const auto makeTriangleVertex = [&](const AcceleratedSceneVertex& vertex, float x, float y) -> TriangleVertexData {
+        const auto makeTriangleVertex = [&](const AcceleratedSceneVertex& vertex,
+                                            float x,
+                                            float y,
+                                            std::optional<u32> colorOverride = std::nullopt) -> TriangleVertexData {
             TriangleVertexData triangleVertex{};
             triangleVertex.x = x;
             triangleVertex.y = y;
@@ -12163,7 +12201,7 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                 triangleVertex.z = std::max(0.0f, triangleVertex.z - effectiveCoverageDepthBias);
             triangleVertex.u = static_cast<float>(vertex.TexCoordS);
             triangleVertex.v = static_cast<float>(vertex.TexCoordT);
-            triangleVertex.colorRgba8 = makeColor(vertex);
+            triangleVertex.colorRgba8 = colorOverride.value_or(makeColor(vertex));
             return triangleVertex;
         };
 
@@ -12307,7 +12345,72 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
             appendGraphicsVertex(vertex2);
         };
 
-        const auto enqueueGraphicsDraw = [&](size_t polygonTriangleCount) {
+        const auto appendLineSegment = [&](u16 vertexIndex0,
+                                           u16 vertexIndex1,
+                                           std::optional<u32> colorOverride = std::nullopt,
+                                           float endpointExtend = 0.0f) {
+            if (vertexIndex0 >= SharedGraphicsScene.Vertices.size() || vertexIndex1 >= SharedGraphicsScene.Vertices.size())
+                return;
+
+            const AcceleratedSceneVertex& lineVertex0 = SharedGraphicsScene.Vertices[vertexIndex0];
+            const AcceleratedSceneVertex& lineVertex1 = SharedGraphicsScene.Vertices[vertexIndex1];
+            const float lineX0 = lineVertex0.X;
+            const float lineY0 = lineVertex0.Y;
+            const float lineX1 = lineVertex1.X;
+            const float lineY1 = lineVertex1.Y;
+
+            const float deltaX = lineX1 - lineX0;
+            const float deltaY = lineY1 - lineY0;
+            const float lineLengthSquared = (deltaX * deltaX) + (deltaY * deltaY);
+            if (lineLengthSquared <= 0.000001f)
+                return;
+
+            const float inverseLineLength = 1.0f / std::sqrt(lineLengthSquared);
+            const float lineDirX = deltaX * inverseLineLength;
+            const float lineDirY = deltaY * inverseLineLength;
+            const float halfLineWidth = 0.5f;
+            const float perpX = -deltaY * inverseLineLength * halfLineWidth;
+            const float perpY = deltaX * inverseLineLength * halfLineWidth;
+            const float startX = lineX0 - (lineDirX * endpointExtend);
+            const float startY = lineY0 - (lineDirY * endpointExtend);
+            const float endX = lineX1 + (lineDirX * endpointExtend);
+            const float endY = lineY1 + (lineDirY * endpointExtend);
+
+            const float quadPositionsX[4] = {
+                startX + perpX,
+                startX - perpX,
+                endX - perpX,
+                endX + perpX,
+            };
+            const float quadPositionsY[4] = {
+                startY + perpY,
+                startY - perpY,
+                endY - perpY,
+                endY + perpY,
+            };
+
+            const std::optional<u32> packedLineYBounds = packYBounds(quadPositionsY, 4u);
+            if (!packedLineYBounds.has_value())
+                return;
+
+            appendTriangle(
+                makeTriangleVertex(lineVertex0, quadPositionsX[0], quadPositionsY[0], colorOverride),
+                makeTriangleVertex(lineVertex0, quadPositionsX[1], quadPositionsY[1], colorOverride),
+                makeTriangleVertex(lineVertex1, quadPositionsX[2], quadPositionsY[2], colorOverride),
+                kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge2,
+                *packedLineYBounds);
+            appendTriangle(
+                makeTriangleVertex(lineVertex0, quadPositionsX[0], quadPositionsY[0], colorOverride),
+                makeTriangleVertex(lineVertex1, quadPositionsX[2], quadPositionsY[2], colorOverride),
+                makeTriangleVertex(lineVertex1, quadPositionsX[3], quadPositionsY[3], colorOverride),
+                kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge1,
+                *packedLineYBounds);
+        };
+
+        const auto enqueueGraphicsDraw = [&](size_t polygonTriangleCount,
+                                             bool suppressEdgeMarkIndices = false,
+                                             u32 edgeColorOverrideMask = 0u,
+                                             u32 edgeColorOverridePacked = 0u) {
             if (polygonTriangleCount == 0u)
                 return;
 
@@ -12319,7 +12422,9 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
             draw.firstVertex = sceneDraw.FirstVertex;
             draw.vertexCount = sceneDraw.VertexCount;
             draw.firstEdgeIndex = sceneDraw.FirstEdgeIndex;
-            draw.edgeIndexCount = sceneDraw.EdgeIndexCount;
+            draw.edgeIndexCount = suppressEdgeMarkIndices ? 0u : sceneDraw.EdgeIndexCount;
+            draw.edgeColorOverrideMask = edgeColorOverrideMask;
+            draw.edgeColorOverridePacked = edgeColorOverridePacked;
 
             const u32 drawIndex = static_cast<u32>(GraphicsPolygons.size());
             GraphicsPolygons.push_back(draw);
@@ -12358,54 +12463,97 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
             if (vertexIndex0 >= SharedGraphicsScene.Vertices.size() || vertexIndex1 >= SharedGraphicsScene.Vertices.size())
                 continue;
 
-            const AcceleratedSceneVertex& lineVertex0 = SharedGraphicsScene.Vertices[vertexIndex0];
-            const AcceleratedSceneVertex& lineVertex1 = SharedGraphicsScene.Vertices[vertexIndex1];
-            const float lineX0 = lineVertex0.X;
-            const float lineY0 = lineVertex0.Y;
-            const float lineX1 = lineVertex1.X;
-            const float lineY1 = lineVertex1.Y;
-
-            const float deltaX = lineX1 - lineX0;
-            const float deltaY = lineY1 - lineY0;
-            const float lineLengthSquared = (deltaX * deltaX) + (deltaY * deltaY);
-            if (lineLengthSquared <= 0.000001f)
-                continue;
-
-            const float inverseLineLength = 1.0f / std::sqrt(lineLengthSquared);
-            const float halfLineWidth = 0.5f;
-            const float perpX = -deltaY * inverseLineLength * halfLineWidth;
-            const float perpY = deltaX * inverseLineLength * halfLineWidth;
-
-            const float quadPositionsX[4] = {
-                lineX0 + perpX,
-                lineX0 - perpX,
-                lineX1 - perpX,
-                lineX1 + perpX,
-            };
-            const float quadPositionsY[4] = {
-                lineY0 + perpY,
-                lineY0 - perpY,
-                lineY1 - perpY,
-                lineY1 + perpY,
-            };
-
-            const std::optional<u32> packedLineYBounds = packYBounds(quadPositionsY, 4u);
-            if (!packedLineYBounds.has_value())
-                continue;
-
-            appendTriangle(
-                makeTriangleVertex(lineVertex0, quadPositionsX[0], quadPositionsY[0]),
-                makeTriangleVertex(lineVertex0, quadPositionsX[1], quadPositionsY[1]),
-                makeTriangleVertex(lineVertex1, quadPositionsX[2], quadPositionsY[2]),
-                kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge2,
-                *packedLineYBounds);
-            appendTriangle(
-                makeTriangleVertex(lineVertex0, quadPositionsX[0], quadPositionsY[0]),
-                makeTriangleVertex(lineVertex1, quadPositionsX[2], quadPositionsY[2]),
-                makeTriangleVertex(lineVertex1, quadPositionsX[3], quadPositionsY[3]),
-                kTriangleFlagBoundaryEdge0 | kTriangleFlagBoundaryEdge1,
-                *packedLineYBounds);
+            appendLineSegment(vertexIndex0, vertexIndex1);
             enqueueGraphicsDraw(Triangles.size() - polygonTriangleBase);
+            continue;
+        }
+
+        if (alpha5 == 0u)
+        {
+            const bool hiddenLayerAlphaZero =
+                !hasTexture
+                && blendMode == 0u
+                && polygonMeta.Flags == 0u;
+            const std::optional<u32> wireframeLineColor =
+                hiddenLayerAlphaZero ? std::optional<u32>(0xFFFFFFFFu) : std::nullopt;
+            const float wireframeEndpointExtend = 0.0f;
+            const u32 wireframeEdgeColorOverrideMask = hiddenLayerAlphaZero
+                ? (1u << ((polygonMeta.PolyId >> 3u) & 0x7u))
+                : 0u;
+            const u32 wireframeEdgeColorOverridePacked = hiddenLayerAlphaZero ? 0x00FFFFFFu : 0u;
+            if (hiddenLayerAlphaZero && polygonMeta.PolyId == 56u)
+            {
+                GraphicsHiddenAlphaZeroFinalEdgePolyIdOverride = 56u;
+                GraphicsHiddenAlphaZeroFinalEdgeColorOverride = 0x00FFFFFFu;
+            }
+
+            u32 emittedBoundaryEdgeCount = 0u;
+            for (u32 triangleIndex = sceneDraw.FirstTriangle;
+                 triangleIndex < sceneDraw.FirstTriangle + sceneDraw.TriangleCount;
+                 triangleIndex++)
+            {
+                if (triangleIndex >= SharedGraphicsScene.Triangles.size())
+                    break;
+
+                const AcceleratedSceneTriangle& sceneTriangle = SharedGraphicsScene.Triangles[triangleIndex];
+                const u16 vertexIndex0 = sceneTriangle.Indices[0];
+                const u16 vertexIndex1 = sceneTriangle.Indices[1];
+                const u16 vertexIndex2 = sceneTriangle.Indices[2];
+                if (vertexIndex0 >= SharedGraphicsScene.Vertices.size()
+                    || vertexIndex1 >= SharedGraphicsScene.Vertices.size()
+                    || vertexIndex2 >= SharedGraphicsScene.Vertices.size())
+                {
+                    continue;
+                }
+
+                if ((sceneTriangle.BoundaryFlags & AcceleratedTriangleBoundaryEdge0) != 0u)
+                {
+                    appendLineSegment(vertexIndex1, vertexIndex2, wireframeLineColor, wireframeEndpointExtend);
+                    emittedBoundaryEdgeCount++;
+                }
+                if ((sceneTriangle.BoundaryFlags & AcceleratedTriangleBoundaryEdge1) != 0u)
+                {
+                    appendLineSegment(vertexIndex2, vertexIndex0, wireframeLineColor, wireframeEndpointExtend);
+                    emittedBoundaryEdgeCount++;
+                }
+                if ((sceneTriangle.BoundaryFlags & AcceleratedTriangleBoundaryEdge2) != 0u)
+                {
+                    appendLineSegment(vertexIndex0, vertexIndex1, wireframeLineColor, wireframeEndpointExtend);
+                    emittedBoundaryEdgeCount++;
+                }
+            }
+
+            static u32 loggedWireframePolygonCount = 0u;
+            if (loggedWireframePolygonCount < 24u && MelonDSAndroid::areRendererDebugToolsEnabled())
+            {
+                const u32 yBounds = debugYBounds.value_or(0u);
+                Log(
+                    LogLevel::Warn,
+                    "VulkanGraphics[AlphaZeroWireframe]: sample=%u polyId=%u blend=%u flags=%#x hasTexture=%u texParam=%#x vertexCount=%u edgeIndexCount=%u originalTriCount=%u emittedBoundaryEdgeCount=%u hiddenLayerAlphaZero=%u lineColor=%#x edgeColorOverrideMask=%#x finalEdgePolyIdOverride=%u y=%u..%u",
+                    loggedWireframePolygonCount,
+                    polygonMeta.PolyId,
+                    (polygonMeta.PolyAttr >> 4u) & 0x3u,
+                    polygonMeta.Flags,
+                    hasTexture ? 1u : 0u,
+                    polygon->TexParam,
+                    sceneDraw.VertexCount,
+                    sceneDraw.EdgeIndexCount,
+                    sceneDraw.TriangleCount,
+                    emittedBoundaryEdgeCount,
+                    hiddenLayerAlphaZero ? 1u : 0u,
+                    wireframeLineColor.value_or(0u),
+                    wireframeEdgeColorOverrideMask,
+                    GraphicsHiddenAlphaZeroFinalEdgePolyIdOverride < 64u ? GraphicsHiddenAlphaZeroFinalEdgePolyIdOverride : 0xFFFFFFFFu,
+                    yBounds & 0xFFFFu,
+                    (yBounds >> 16u) & 0xFFFFu);
+                loggedWireframePolygonCount++;
+            }
+
+            enqueueGraphicsDraw(
+                Triangles.size() - polygonTriangleBase,
+                false,
+                wireframeEdgeColorOverrideMask,
+                wireframeEdgeColorOverridePacked);
             continue;
         }
 
@@ -12615,7 +12763,7 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                     const TriangleGpu& tri = Triangles[draw.firstTriangle];
                     Log(
                         LogLevel::Warn,
-                        "VulkanGraphics[%sDetail]: draw=%u triFlags=%#x texDesc=%u texLayer=%u texSize=%ux%u texParam=%#x pos=(%.3f,%.3f)->(%.3f,%.3f)->(%.3f,%.3f) uv=(%.3f,%.3f)->(%.3f,%.3f)->(%.3f,%.3f) w=(%.3f,%.3f,%.3f) yBounds=%#x",
+                        "VulkanGraphics[%sDetail]: draw=%u triFlags=%#x texDesc=%u texLayer=%u texSize=%ux%u texParam=%#x color=%#x,%#x,%#x pos=(%.3f,%.3f)->(%.3f,%.3f)->(%.3f,%.3f) uv=(%.3f,%.3f)->(%.3f,%.3f)->(%.3f,%.3f) w=(%.3f,%.3f,%.3f) yBounds=%#x",
                         label,
                         drawIndex,
                         tri.flags,
@@ -12624,6 +12772,9 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                         tri.texWidth,
                         tri.texHeight,
                         tri.texParam,
+                        tri.color0Rgba8,
+                        tri.color1Rgba8,
+                        tri.color2Rgba8,
                         tri.x0, tri.y0,
                         tri.x1, tri.y1,
                         tri.x2, tri.y2,
