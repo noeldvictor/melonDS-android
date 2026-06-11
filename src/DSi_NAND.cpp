@@ -732,6 +732,96 @@ bool NANDMount::ExportFile(const char* path, const char* out)
     return true;
 }
 
+bool NANDMount::ExportFile(const char* path, std::vector<u8>& out)
+{
+    FF_FIL file;
+    FRESULT res;
+
+    res = f_open(&file, path, FA_OPEN_EXISTING | FA_READ);
+    if (res != FR_OK)
+        return false;
+
+    u32 len = f_size(&file);
+    out.resize(len);
+
+    u8 buf[0x1000];
+    for (u32 i = 0; i < len; i += sizeof(buf))
+    {
+        u32 blocklen;
+        if ((i + sizeof(buf)) > len)
+            blocklen = len - i;
+        else
+            blocklen = sizeof(buf);
+
+        u32 nread;
+        f_read(&file, buf, blocklen, &nread);
+        if (nread != blocklen)
+        {
+            f_close(&file);
+            out.clear();
+            return false;
+        }
+        memcpy(out.data() + i, buf, blocklen);
+    }
+
+    f_close(&file);
+
+    Log(LogLevel::Debug, "Exported file from %s to memory\n", path);
+
+    return true;
+}
+
+u32 NANDMount::GetClusterSizeBytes() const
+{
+    if (!CurFS)
+        return 0;
+
+    return static_cast<u32>(CurFS->csize) * 512;
+}
+
+static u64 RoundUpToBlock(u64 value, u32 blockSize)
+{
+    if (blockSize == 0 || value == 0)
+        return value;
+
+    const u64 block = static_cast<u64>(blockSize);
+    return ((value + block - 1) / block) * block;
+}
+
+u64 NANDMount::GetDirectorySizeOnDisk(const char* path, u32 blockSize)
+{
+    if (!path)
+        return 0;
+
+    FF_DIR dir;
+    FF_FILINFO info;
+    FRESULT res = f_opendir(&dir, path);
+    if (res != FR_OK)
+        return 0;
+
+    u64 size = 0;
+    for (;;)
+    {
+        res = f_readdir(&dir, &info);
+        if (res != FR_OK || !info.fname[0])
+            break;
+
+        if (strcmp(info.fname, ".") == 0 || strcmp(info.fname, "..") == 0)
+            continue;
+
+        char fullPath[512];
+        snprintf(fullPath, sizeof(fullPath), "%s/%s", path, info.fname);
+
+        if (info.fattrib & AM_DIR)
+            size += GetDirectorySizeOnDisk(fullPath, blockSize);
+        else
+            size += RoundUpToBlock(static_cast<u64>(info.fsize), blockSize);
+    }
+
+    f_closedir(&dir);
+    return size;
+}
+
 void NANDMount::RemoveFile(const char* path)
 {
     FF_FILINFO info;

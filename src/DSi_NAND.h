@@ -116,7 +116,10 @@ public:
 
     bool ImportFile(const char* path, const u8* data, size_t len);
     bool ImportFile(const char* path, const char* in);
+    bool ExportFile(const char* path, std::vector<u8>& out);
     bool ExportFile(const char* path, const char* out);
+    u32 GetClusterSizeBytes() const;
+    u64 GetDirectorySizeOnDisk(const char* path, u32 blockSize);
     void RemoveFile(const char* path);
     void RemoveDir(const char* path);
 
