@@ -408,7 +408,14 @@ CartRetail::CartRetail(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, bool ba
         256*1024, 512*1024, 1024*1024,
         8192*1024, 16384*1024, 65536*1024
     };
-    SRAMLength = sramlengths[savememtype];
+    if (Header.IsDSiWare() && sram && sramlen != 0)
+    {
+        SRAMLength = sramlen;
+    }
+    else
+    {
+        SRAMLength = sramlengths[savememtype];
+    }
 
     if (SRAMLength)
     { // If this cart should have any save data...
