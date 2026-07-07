@@ -16,6 +16,8 @@
 #include "renderer/ScreenshotRenderer.h"
 #include "renderer/VulkanOutput.h"
 #include "renderer/VulkanSurfacePresenter.h"
+
+namespace melonDS { class HDTexPack; }
 #include "retroachievements/RetroAchievementsManager.h"
 #include "net/Net.h"
 
@@ -23,6 +25,8 @@ using namespace melonDS;
 
 namespace MelonDSAndroid
 {
+
+
 
 class MelonInstance
 {
@@ -191,6 +195,7 @@ private:
     };
 
     void updateRenderer();
+    void applyTexturePack();
     void updateVulkanFastForwardRenderScale();
     void handleVulkanRuntimeFailure(const char* reason);
     bool updateVulkanScreenshot(Frame* frame, int scale, bool clearOnFailure);
@@ -219,6 +224,8 @@ private:
     std::shared_ptr<Net> net;
 
     std::unique_ptr<RetroAchievements::RetroAchievementsManager> retroAchievementsManager;
+    std::unique_ptr<melonDS::HDTexPack> hdTexPack;
+    std::string hdTexPackState;
     std::unique_ptr<SaveManager> ndsSave;
     std::unique_ptr<SaveManager> gbaSave;
     std::unique_ptr<SaveManager> firmwareSave;

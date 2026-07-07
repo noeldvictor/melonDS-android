@@ -18,6 +18,7 @@
 #include "GPU3D_OpenGL.h"
 #include "GPU3D_Soft.h"
 #include "GPU3D_Vulkan.h"
+#include "HDTexPack.h"
 #include "MelonDS.h"
 #include "MelonInstance.h"
 #include "NDS.h"
@@ -4186,6 +4187,54 @@ std::vector<long> MelonInstance::getRuntimeSubsetIds()
         return { };
 }
 
+
+void MelonInstance::applyTexturePack()
+{
+    // Texture packs live under the app's internal files dir:
+    //   texturepacks/<GAMECODE>/textures/*.png  -> replacements (native size)
+    //   texturedumps/                           -> create this dir to enable dumping
+    // Content-hash naming matches the desktop melonDS HD pack format.
+    melonDS::HDTexPack* pack = nullptr;
+
+    auto cart = nds->NDSCartSlot.GetCart();
+    if (cart)
+    {
+        std::string gameCode(cart->GetHeader().GameCode, 4);
+        for (char& ch : gameCode)
+            if (ch < 0x21 || ch > 0x7E || ch == '/' || ch == '\\' || ch == ':') ch = '_';
+
+        std::string base = MelonDSAndroid::internalFilesDir;
+        std::string packDir = base + "/texturepacks/" + gameCode;
+        std::string dumpDir = base + "/texturedumps/" + gameCode;
+
+        std::error_code ec;
+        bool loadEnabled = std::filesystem::is_directory(std::filesystem::u8path(packDir), ec);
+        bool dumpEnabled = std::filesystem::is_directory(std::filesystem::u8path(base + "/texturedumps"), ec);
+
+        if (loadEnabled || dumpEnabled)
+        {
+            std::string state = packDir + "|" + (loadEnabled ? "L" : "-") + (dumpEnabled ? "D" : "-");
+            if (!hdTexPack || hdTexPackState != state)
+            {
+                hdTexPack = std::make_unique<melonDS::HDTexPack>(packDir, dumpDir, loadEnabled, dumpEnabled);
+                hdTexPackState = state;
+            }
+            pack = hdTexPack.get();
+        }
+        else if (hdTexPack)
+        {
+            hdTexPack.reset();
+            hdTexPackState.clear();
+        }
+    }
+
+    auto& renderer3d = nds->GPU.GetRenderer3D();
+    if (auto* vulkan = dynamic_cast<VulkanRenderer3D*>(&renderer3d))
+        vulkan->SetTexPack(pack);
+    else if (auto* compute = dynamic_cast<ComputeRenderer*>(&renderer3d))
+        compute->SetTexPack(pack);
+}
+
 void MelonInstance::updateRenderer()
 {
     Renderer newRenderer = currentConfiguration->renderer;
@@ -4297,6 +4346,8 @@ void MelonInstance::updateRenderer()
         nds->GPU.SetRenderer3D(std::move(nextRenderer));
         currentRenderer = newRenderer;
     }
+
+    applyTexturePack();
 
     switch (newRenderer)
     {
