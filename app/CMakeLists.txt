@@ -107,9 +107,21 @@ set(VULKAN_SHADER_HEADERS
         "${ANDROID_CPP_DIR}/renderer/VulkanSurfacePresenterFragmentShaderData.h"
 )
 
+if (CMAKE_HOST_WIN32)
+    # System32 bash.exe is the WSL stub and cannot run repo scripts by Windows path
+    find_program(REPO_BASH_EXECUTABLE bash
+            HINTS "C:/Program Files/Git/bin" "C:/Program Files/Git/usr/bin" "C:/msys64/usr/bin"
+            NO_SYSTEM_ENVIRONMENT_PATH)
+    if (NOT REPO_BASH_EXECUTABLE)
+        set(REPO_BASH_EXECUTABLE bash)
+    endif ()
+else ()
+    set(REPO_BASH_EXECUTABLE bash)
+endif ()
+
 add_custom_command(
         OUTPUT ${VULKAN_SHADER_HEADERS}
-        COMMAND bash "${VULKAN_SPIRV_REGEN_SCRIPT}"
+        COMMAND "${REPO_BASH_EXECUTABLE}" "${VULKAN_SPIRV_REGEN_SCRIPT}"
         DEPENDS "${VULKAN_SPIRV_REGEN_SCRIPT}" ${VULKAN_SHADER_SOURCES}
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
         COMMENT "Regenerating Vulkan SPIR-V headers"

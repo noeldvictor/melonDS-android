@@ -194,10 +194,23 @@ val vulkanShaderHeaders = listOf(
     rootProject.file("app/src/main/cpp/renderer/VulkanSurfacePresenterFragmentShaderData.h"),
 )
 
+fun resolveBashExecutable(): String {
+    val osName = System.getProperty("os.name").lowercase()
+    if (!osName.contains("windows")) return "bash"
+    System.getenv("BASH")?.let { if (File(it).isFile) return it }
+    val candidates = listOf(
+        "C:/Program Files/Git/bin/bash.exe",
+        "C:/Program Files/Git/usr/bin/bash.exe",
+        "C:/msys64/usr/bin/bash.exe",
+    )
+    // System32 bash.exe is the WSL stub and cannot run repo scripts by Windows path
+    return candidates.firstOrNull { File(it).isFile } ?: "bash"
+}
+
 val regenerateVulkanSpirv by tasks.registering(Exec::class) {
     group = "build"
     description = "Regenerates embedded Vulkan SPIR-V headers from Vulkan GLSL sources."
-    executable = "bash"
+    executable = resolveBashExecutable()
     args(rootProject.file("scripts/regenerate_vulkan_spirv.sh").absolutePath)
     workingDir = rootProject.projectDir
 
@@ -209,7 +222,7 @@ val regenerateVulkanSpirv by tasks.registering(Exec::class) {
 val checkVulkanSpirv by tasks.registering(Exec::class) {
     group = "verification"
     description = "Checks whether embedded Vulkan SPIR-V headers are synchronized with GLSL sources."
-    executable = "bash"
+    executable = resolveBashExecutable()
     args(rootProject.file("scripts/regenerate_vulkan_spirv.sh").absolutePath, "--check")
     workingDir = rootProject.projectDir
 
@@ -340,6 +353,7 @@ fun androidNdkHostTag(): String {
     return when {
         osName.contains("linux") -> "linux-x86_64"
         osName.contains("mac") -> "darwin-x86_64"
+        osName.contains("windows") -> "windows-x86_64"
         else -> error("Unsupported Android NDK host OS: ${System.getProperty("os.name")}")
     }
 }
@@ -417,9 +431,10 @@ val copyLibrashaderAbiArtifacts = librashaderAbiTargets.map { abiTarget ->
         val targetEnvKey = rustTargetEnvKey(abiTarget.rustTarget)
         val ndkHome = resolveAndroidNdkHome()
         val toolchain = ndkHome.resolve("toolchains/llvm/prebuilt/${hostTag}/bin")
-        val clang = toolchain.resolve("${abiTarget.clangPrefix}${AppConfig.minSdkVersion}-clang")
-        val clangCpp = toolchain.resolve("${abiTarget.clangPrefix}${AppConfig.minSdkVersion}-clang++")
-        val llvmAr = toolchain.resolve("llvm-ar")
+        val isWindowsHost = hostTag == "windows-x86_64"
+        val clang = toolchain.resolve("${abiTarget.clangPrefix}${AppConfig.minSdkVersion}-clang" + if (isWindowsHost) ".cmd" else "")
+        val clangCpp = toolchain.resolve("${abiTarget.clangPrefix}${AppConfig.minSdkVersion}-clang++" + if (isWindowsHost) ".cmd" else "")
+        val llvmAr = toolchain.resolve("llvm-ar" + if (isWindowsHost) ".exe" else "")
 
         inputs.property("librashaderPinnedRevision", librashaderPinnedRevision)
         outputs.file(librashaderSourceDir.map {

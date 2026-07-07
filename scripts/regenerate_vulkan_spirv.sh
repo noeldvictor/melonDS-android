@@ -129,7 +129,15 @@ generate_header() {
   {
     echo "#pragma once"
     echo "#include <cstddef>"
-    xxd -i -n "$symbol_name" "$tmp_spv"
+    if xxd -n test -i /dev/null >/dev/null 2>&1; then
+      xxd -i -n "$symbol_name" "$tmp_spv"
+    else
+      # older xxd without -n: derive the symbol from the input file name
+      tmp_named_dir="$(mktemp -d)"
+      cp "$tmp_spv" "$tmp_named_dir/$symbol_name"
+      (cd "$tmp_named_dir" && xxd -i "$symbol_name")
+      rm -rf "$tmp_named_dir"
+    fi
   } > "$tmp_header"
 
   if [[ "$MODE" == "check" ]]; then
