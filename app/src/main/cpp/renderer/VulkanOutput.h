@@ -554,6 +554,7 @@ private:
 
     u32 objFilterMode{0};
     u32 bgFilterMode{0};
+    u32 emptyPackedComposeLogBudget{16};
 
     static constexpr u32 kPlaneFilterModeCount = 14;
     VkDescriptorSetLayout planeFilterDescriptorSetLayout{VK_NULL_HANDLE};

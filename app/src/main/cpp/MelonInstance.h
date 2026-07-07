@@ -72,7 +72,7 @@ public:
     bool presentVulkanFrame(
         std::optional<std::chrono::time_point<std::chrono::steady_clock>> deadline,
         std::optional<std::chrono::time_point<std::chrono::steady_clock>> budgetDeadline);
-    void requestVulkanPresentationResync();
+    void requestVulkanPresentationResync(const char* reason);
     void requestVulkanFastForwardPresentationTransition();
     std::vector<u32> captureCurrentFrameForDebug();
     std::vector<u32> captureCurrentPackedTopPrimaryForDebug();

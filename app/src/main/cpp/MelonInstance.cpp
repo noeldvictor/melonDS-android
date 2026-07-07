@@ -1414,7 +1414,7 @@ void MelonInstance::reset()
     retroAchievementsManager->Reset();
     nds->Start();
     if (currentRenderer == Renderer::Vulkan)
-        requestVulkanPresentationResync();
+        requestVulkanPresentationResync("nds-start");
     vulkanRuntimeFailureHandled = false;
     vulkanPrepareFailureCount = 0;
 }
@@ -1683,7 +1683,7 @@ u32 MelonInstance::runFrame()
                     "VulkanOutput: prepare/present failed, requesting resync (%d/4)",
                     vulkanPrepareFailureCount
                 );
-                requestVulkanPresentationResync();
+                requestVulkanPresentationResync("prepare-failed");
                 if (vulkanPrepareFailureCount >= 4)
                     handleVulkanRuntimeFailure("prepare/present");
             }
@@ -1976,7 +1976,7 @@ int MelonInstance::attachVulkanSurface(ANativeWindow* window, u32 width, u32 hei
 
     const int surfaceId = vulkanSurfacePresenter->attachSurface(window, width, height);
     if (surfaceId != 0)
-        requestVulkanPresentationResync();
+        requestVulkanPresentationResync("surface-attach");
     return surfaceId;
 }
 
@@ -1987,7 +1987,7 @@ bool MelonInstance::resizeVulkanSurface(int surfaceId, u32 width, u32 height)
 
     const bool resized = vulkanSurfacePresenter->resizeSurface(surfaceId, width, height);
     if (resized)
-        requestVulkanPresentationResync();
+        requestVulkanPresentationResync("surface-resize");
     return resized;
 }
 
@@ -2236,10 +2236,15 @@ bool MelonInstance::presentVulkanFrame(
     return false;
 }
 
-void MelonInstance::requestVulkanPresentationResync()
+void MelonInstance::requestVulkanPresentationResync(const char* reason)
 {
     if (currentRenderer != Renderer::Vulkan)
         return;
+
+    Platform::Log(
+        Platform::LogLevel::Warn,
+        "VulkanRuntime[Resync]: reason=%s",
+        reason != nullptr ? reason : "unknown");
 
     frameQueue.requestPresentationResync();
     if (vulkanOutput)
@@ -4022,13 +4027,13 @@ bool MelonInstance::saveState(Savestate* state, bool refreshScreenshot)
     if (!retroAchievementsManager->DoSavestate(state))
     {
         if (refreshedVulkanScreenshot)
-            requestVulkanPresentationResync();
+            requestVulkanPresentationResync("savestate-screenshot");
         return false;
     }
 
     const bool saved = nds->DoSavestate(state);
     if (refreshedVulkanScreenshot)
-        requestVulkanPresentationResync();
+        requestVulkanPresentationResync("savestate-screenshot");
     return saved;
 }
 
@@ -4043,7 +4048,7 @@ bool MelonInstance::loadState(Savestate* state)
         setBatteryLevels();
         setDateTime();
         if (currentRenderer == Renderer::Vulkan)
-            requestVulkanPresentationResync();
+            requestVulkanPresentationResync("state-load");
     }
     return loaded;
 }
@@ -4419,7 +4424,7 @@ void MelonInstance::updateRenderer()
                 );
                 vulkanRuntimeConfigLogged = true;
             }
-            requestVulkanPresentationResync();
+            requestVulkanPresentationResync("renderer-settings");
             break;
         }
         case Renderer::Compute:

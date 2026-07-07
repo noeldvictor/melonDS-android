@@ -5181,6 +5181,19 @@ bool VulkanOutput::dispatchCompositor(
     if (!beginFrameCommand(resource))
         return false;
 
+    // a compose without a packed plane upload produces a blank frame; log
+    // the first few occurrences so presentation gaps can be traced
+    if (resource.softPackedFrameId == 0 && emptyPackedComposeLogBudget > 0)
+    {
+        emptyPackedComposeLogBudget--;
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "VulkanOutput: composing %ux%u frame without a packed plane upload",
+            resource.width,
+            resource.height
+        );
+    }
+
     if (resource.timestampQueryPool != VK_NULL_HANDLE)
         vkCmdWriteTimestamp(resource.commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, resource.timestampQueryPool, 0);
 

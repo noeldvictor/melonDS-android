@@ -42,6 +42,7 @@ constexpr const char* kOptionalExternalMemoryExtension = VK_KHR_EXTERNAL_MEMORY_
 constexpr const char* kOptionalAndroidHardwareBufferExtension = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
 std::atomic<bool> gForceDisableTimelineSemaphores{false};
 std::atomic<bool> gForceDisableDynamicTextureIndexing{false};
+std::atomic<bool> gVulkanRendererValidated{false};
 
 std::string jStringToString(JNIEnv* env, jstring value)
 {
@@ -74,6 +75,8 @@ void configureVulkanDriver(
     vulkanDriverConfiguration.CustomDriverName = jStringToString(env, customVulkanDriverName);
     vulkanDriverConfiguration.DisplayName = jStringToString(env, customVulkanDriverDisplayName);
     melonDS::VulkanDispatch::ConfigureDriver(vulkanDriverConfiguration);
+    // a different driver may change the verdict, so probe again next time
+    gVulkanRendererValidated.store(false, std::memory_order_release);
 }
 
 bool hasExtension(const char* extensionName, const std::vector<VkExtensionProperties>& extensions)
@@ -413,6 +416,13 @@ bool isVulkanRendererSupported()
 
 bool canInitializeVulkanRenderer()
 {
+    // the probe spins up a full VulkanOutput on the shared device, which
+    // waits the device idle and compiles pipelines; re-running it while an
+    // emulation session is presenting stalls the GPU mid-frame, so cache the
+    // verdict until the driver configuration changes
+    if (gVulkanRendererValidated.load(std::memory_order_acquire))
+        return true;
+
     constexpr u64 kQuickValidationWaitTimeoutNs = 1'000'000'000ull;
     if (!isVulkanRendererSupported())
     {
@@ -446,6 +456,7 @@ bool canInitializeVulkanRenderer()
         return false;
     }
 
+    gVulkanRendererValidated.store(true, std::memory_order_release);
     return true;
 }
 
@@ -453,6 +464,7 @@ void setVulkanCompatibilityOverrides(bool disableTimelineSemaphores, bool disabl
 {
     gForceDisableTimelineSemaphores.store(disableTimelineSemaphores, std::memory_order_relaxed);
     gForceDisableDynamicTextureIndexing.store(disableDynamicTextureIndexing, std::memory_order_relaxed);
+    gVulkanRendererValidated.store(false, std::memory_order_release);
     melonDS::VulkanContext::SetCompatibilityOverrides(disableTimelineSemaphores, disableDynamicTextureIndexing);
     melonDS::Platform::Log(
         melonDS::Platform::LogLevel::Warn,

@@ -688,10 +688,10 @@ namespace MelonDSAndroid
         return instance->presentVulkanFrame(deadline, budgetDeadline);
     }
 
-    void requestVulkanPresentationResync()
+    void requestVulkanPresentationResync(const char* reason)
     {
         if (instance)
-            instance->requestVulkanPresentationResync();
+            instance->requestVulkanPresentationResync(reason);
     }
 
     void requestVulkanFastForwardPresentationTransition()
@@ -770,7 +770,7 @@ namespace MelonDSAndroid
         renderer2dDisabledMainObjOrderMask.store(disabledMainObjOrderMask & 0xFu, std::memory_order_relaxed);
         renderer2dDisabledSubObjOrderMask.store(disabledSubObjOrderMask & 0xFu, std::memory_order_relaxed);
         renderer2dFeatureMask.store(featureMask & kRenderer2DDebugAllFeatures, std::memory_order_relaxed);
-        requestVulkanPresentationResync();
+        requestVulkanPresentationResync("debug-2d-controls");
     }
 
     Renderer3DDebugControlState getRenderer3DDebugControls()
@@ -789,7 +789,7 @@ namespace MelonDSAndroid
         }
 
         renderer3dFeatureMask.store(featureMask & kRenderer3DDebugAllFeatures, std::memory_order_relaxed);
-        requestVulkanPresentationResync();
+        requestVulkanPresentationResync("debug-3d-controls");
     }
 
     int getRenderer2DDebugForcedMode(u32 unit)
@@ -1350,7 +1350,7 @@ namespace MelonDSAndroid
 
             return false;
         }
-        requestVulkanPresentationResync();
+        requestVulkanPresentationResync("state-load");
         return true;
     }
 

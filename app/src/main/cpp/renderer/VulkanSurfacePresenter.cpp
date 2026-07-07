@@ -1018,6 +1018,28 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
             fallbackReasonSurfaceCount++;
     }
 
+    // one line per direct<->compose transition (bounded) so path flapping is
+    // visible in logs together with the source-validity flags that drive it
+    const int presentPath = directPresentRequested ? 1 : 0;
+    if (presentPath != lastLoggedPresentPath && presentPathTransitionLogBudget > 0)
+    {
+        presentPathTransitionLogBudget--;
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "VulkanPresenter[Path]: direct=%d surfaces=%zu dualRect=%d postFilter=%d planeFilter=%d capture=%d prevTop=%d prevBottom=%d readback=%d",
+            presentPath,
+            surfaces.size(),
+            hasDualScreenSurface ? 1 : 0,
+            postProcessFilterRequested ? 1 : 0,
+            inputs.planeFilterRequested ? 1 : 0,
+            inputs.capture3dSourceValid ? 1 : 0,
+            inputs.previousTopSourceValid ? 1 : 0,
+            inputs.previousBottomSourceValid ? 1 : 0,
+            inputs.needsReadback ? 1 : 0
+        );
+        lastLoggedPresentPath = presentPath;
+    }
+
     VkImage frameImage = VK_NULL_HANDLE;
     VkImageView frameImageView = VK_NULL_HANDLE;
     if (!directPresentRequested)

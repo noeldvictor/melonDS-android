@@ -154,7 +154,7 @@ namespace MelonDSAndroid {
     extern bool presentVulkanFrame(
         std::optional<std::chrono::time_point<std::chrono::steady_clock>> deadline,
         std::optional<std::chrono::time_point<std::chrono::steady_clock>> budgetDeadline);
-    extern void requestVulkanPresentationResync();
+    extern void requestVulkanPresentationResync(const char* reason);
     extern void requestVulkanFastForwardPresentationTransition();
     extern bool areRendererDebugToolsEnabled();
     extern bool areRendererDebugBgObjLogsEnabled();

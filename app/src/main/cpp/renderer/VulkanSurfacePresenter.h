@@ -409,6 +409,8 @@ private:
     u64 fallbackReasonValidationMode = 0;
     u64 fallbackReasonMissingHandles = 0;
     u64 fallbackReasonSurfaceCount = 0;
+    int lastLoggedPresentPath = -1;
+    u32 presentPathTransitionLogBudget = 64;
     std::unordered_set<u64> failedSwapchainConfigs;
     std::unordered_set<u64> loggedFailedSwapchainConfigs;
     bool lastPresentedDirect = true;
