@@ -47,6 +47,8 @@ add_library(core STATIC
     GPU3D_Texcache.h
     HDTexPack.cpp
     HDTexPack.h
+    HDTextureFilter.cpp
+    HDTextureFilter.h
     melonDLDI.h
     Mic.cpp
     NDS.cpp
