@@ -140,6 +140,8 @@ struct VulkanCompositionInputs
     u32 rendererWidth{};
     u32 rendererHeight{};
     VulkanFilterMode filtering{VulkanFilterMode::Nearest};
+    u32 objFilterMode{};
+    u32 bgFilterMode{};
     bool previousTopSourceValid{};
     bool previousBottomSourceValid{};
     bool capture3dSourceValid{};
@@ -228,6 +230,11 @@ public:
     [[nodiscard]] bool isInitialized() const { return initialized; }
 
     bool ensureFrameResources(Frame* frame, u32 width, u32 height);
+    void setPacked2DFilterModes(u32 objMode, u32 bgMode)
+    {
+        objFilterMode = objMode;
+        bgFilterMode = bgMode;
+    }
     void invalidateTemporalHistory();
     void clearStructuredCaptureHistory();
     void releaseTemporalFrameReferences();
@@ -312,6 +319,8 @@ private:
         u32 bottomStructuredHandoffNoCurrent3d;
         u32 topStructuredHandoffSuppress3d;
         u32 bottomStructuredHandoffSuppress3d;
+        u32 objFilterMode;
+        u32 bgFilterMode;
     };
 
     struct AccumulatePushConstants
@@ -522,6 +531,9 @@ private:
     bool accumulateBottomDescriptorReady{false};
     VkImageView cachedAccumulateTopSourceView{VK_NULL_HANDLE};
     VkImageView cachedAccumulateBottomSourceView{VK_NULL_HANDLE};
+
+    u32 objFilterMode{0};
+    u32 bgFilterMode{0};
 
     std::unordered_map<Frame*, FrameResource> resources;
     std::mutex commandPoolLock;

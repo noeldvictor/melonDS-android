@@ -4119,6 +4119,8 @@ bool VulkanOutput::buildCompositionInputs(
     outInputs.screenSwap = resource.screenSwap ? 1u : 0u;
     outInputs.scale = static_cast<u32>(scale);
     outInputs.filtering = filtering;
+    outInputs.objFilterMode = objFilterMode;
+    outInputs.bgFilterMode = bgFilterMode;
     outInputs.capture3dSourceValid = resource.hasPreparedCapture3dSource && resource.capture3dBuffer != VK_NULL_HANDLE;
     const bool topUsesCurrentCapture3d = topUsesRegularCapture3d || topUsesVramCapture3d;
     const bool bottomUsesCurrentCapture3d = bottomUsesRegularCapture3d || bottomUsesVramCapture3d;
@@ -4735,6 +4737,8 @@ bool VulkanOutput::dispatchCompositor(
     pushConstants.bottomStructuredHandoffNoCurrent3d = inputs.bottomStructuredHandoffNoCurrent3d ? 1u : 0u;
     pushConstants.topStructuredHandoffSuppress3d = inputs.topStructuredHandoffSuppress3d ? 1u : 0u;
     pushConstants.bottomStructuredHandoffSuppress3d = inputs.bottomStructuredHandoffSuppress3d ? 1u : 0u;
+    pushConstants.objFilterMode = inputs.objFilterMode;
+    pushConstants.bgFilterMode = inputs.bgFilterMode;
 
     vkCmdPushConstants(
         resource.commandBuffer,
