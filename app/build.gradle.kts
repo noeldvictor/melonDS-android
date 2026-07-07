@@ -69,7 +69,9 @@ android {
             applicationIdSuffix = ".dev"
             externalNativeBuild {
                 cmake {
-                    arguments("-DMELONDS_ANDROID_DEBUG_BUILD=1")
+                    // debuggable APK, but optimized native code: the interpreter
+                    // and renderers are unusably slow at -O0 on device
+                    arguments("-DMELONDS_ANDROID_DEBUG_BUILD=1", "-DCMAKE_BUILD_TYPE=RelWithDebInfo")
                 }
             }
         }
