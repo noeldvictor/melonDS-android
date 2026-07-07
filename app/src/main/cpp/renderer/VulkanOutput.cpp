@@ -861,21 +861,44 @@ bool VulkanOutput::refreshCompositorPipelineIfNeeded()
     if (!compositorPipelineDirty)
         return compositorPipeline != VK_NULL_HANDLE;
 
-    // wait until no submitted frame can still reference the old pipeline
+    // one-shot: the rebuild is attempted once per mode change so a failure
+    // can never turn into a per-dispatch pipeline compile loop
+    compositorPipelineDirty = false;
+
+    // wait until no submitted frame can still reference the old pipeline;
+    // a frame whose submission failed leaves its fence unsignaled forever,
+    // so the wait must stay bounded
+    constexpr u64 kPipelineRebuildFenceTimeoutNs = 5'000'000'000ull;
     for (auto& [frame, frameResource] : resources)
     {
         (void)frame;
-        if (frameResource.submitFence != VK_NULL_HANDLE)
-            (void)vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, UINT64_MAX);
+        if (frameResource.submitFence == VK_NULL_HANDLE)
+            continue;
+        if (vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kPipelineRebuildFenceTimeoutNs) != VK_SUCCESS)
+        {
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Warn,
+                "VulkanOutput: frame fence wait timed out; keeping current compositor pipeline"
+            );
+            return compositorPipeline != VK_NULL_HANDLE;
+        }
     }
 
-    if (compositorPipeline != VK_NULL_HANDLE)
+    VkPipeline previousPipeline = compositorPipeline;
+    compositorPipeline = VK_NULL_HANDLE;
+    if (!createCompositorPipeline())
     {
-        vkDestroyPipeline(device, compositorPipeline, nullptr);
-        compositorPipeline = VK_NULL_HANDLE;
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Error,
+            "VulkanOutput: compositor pipeline respecialization failed; keeping current pipeline"
+        );
+        compositorPipeline = previousPipeline;
+        return compositorPipeline != VK_NULL_HANDLE;
     }
 
-    return createCompositorPipeline();
+    if (previousPipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(device, previousPipeline, nullptr);
+    return true;
 }
 
 void VulkanOutput::destroyCompositorResources()
