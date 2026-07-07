@@ -365,10 +365,13 @@ void FrameQueue::validateRenderFrame(Frame* frame, int requiredWidth, int requir
             frame->frameTexture = 0;
         }
 
+        // keep the frame id: it identifies the acquisition that just handed
+        // this frame out. Zeroing it here gave the first frames after a
+        // backend switch id 0, which downstream flowed into the packed plane
+        // snapshots and made unrelated frames compare as identical.
         frame->backend = backend;
         frame->width = 0;
         frame->height = 0;
-        frame->frameId = 0;
         frame->renderTimelineValue = 0;
         frame->presentTimelineValue = 0;
         frame->queuedAtNs = 0;

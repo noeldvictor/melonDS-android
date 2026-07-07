@@ -1021,9 +1021,11 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
     // one line per direct<->compose transition (bounded) so path flapping is
     // visible in logs together with the source-validity flags that drive it
     const int presentPath = directPresentRequested ? 1 : 0;
-    if (presentPath != lastLoggedPresentPath && presentPathTransitionLogBudget > 0)
+    const u64 pathLogNowNs = PerfNowNs();
+    if (presentPath != lastLoggedPresentPath
+        && pathLogNowNs - lastPresentPathLogNs >= 1'000'000'000ull)
     {
-        presentPathTransitionLogBudget--;
+        lastPresentPathLogNs = pathLogNowNs;
         melonDS::Platform::Log(
             melonDS::Platform::LogLevel::Warn,
             "VulkanPresenter[Path]: direct=%d surfaces=%zu dualRect=%d postFilter=%d planeFilter=%d capture=%d prevTop=%d prevBottom=%d readback=%d",

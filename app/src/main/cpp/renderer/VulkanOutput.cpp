@@ -2766,6 +2766,7 @@ bool VulkanOutput::updateCompositorPackedBuffers(
     }
 
     resource.softPackedFrameId = softPackedSnapshot.frameId;
+    resource.hasPackedUpload = true;
     resource.frontBufferLatched = softPackedSnapshot.frontBufferLatched;
     resource.captureBackedClass4Only = softPackedSnapshot.captureBackedClass4Only;
     resource.hasSoftPackedDebugData = true;
@@ -5178,21 +5179,47 @@ bool VulkanOutput::dispatchCompositor(
 {
     std::scoped_lock commandLock(commandPoolLock);
 
+    // never composite without valid packed planes: that shows up as blank
+    // panels. Reuse the last valid planes when available, otherwise skip the
+    // compose so the presenter keeps the previous image. Validation runs
+    // compose deliberately over cleared planes and is exempt.
+    bool packedFallbackApplied = false;
+    if (!resource.hasPackedUpload && !inputs.validationMode)
+    {
+        const bool canReuseLastValid =
+            lastValidTopPackedAvailable
+            && lastValidBottomPackedAvailable
+            && resource.topPackedMapped != nullptr
+            && resource.bottomPackedMapped != nullptr
+            && lastValidTopPacked.size() * sizeof(u32) <= static_cast<size_t>(resource.packedBufferSize)
+            && lastValidBottomPacked.size() * sizeof(u32) <= static_cast<size_t>(resource.packedBufferSize);
+        const u64 nowNs = PerfNowNs();
+        if (nowNs - lastEmptyPackedComposeLogNs >= 1'000'000'000ull)
+        {
+            lastEmptyPackedComposeLogNs = nowNs;
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Warn,
+                "VulkanOutput: %s compose without a packed plane upload (frame=%llu prepared=%d content=%d %ux%u)",
+                canReuseLastValid ? "recovering" : "skipping",
+                static_cast<unsigned long long>(frame != nullptr ? frame->frameId : 0u),
+                resource.hasPreparedInputs ? 1 : 0,
+                resource.hasContent ? 1 : 0,
+                resource.width,
+                resource.height
+            );
+        }
+        if (!canReuseLastValid)
+            return false;
+
+        std::memcpy(resource.topPackedMapped, lastValidTopPacked.data(), lastValidTopPacked.size() * sizeof(u32));
+        std::memcpy(resource.bottomPackedMapped, lastValidBottomPacked.data(), lastValidBottomPacked.size() * sizeof(u32));
+        if (lastPackedScreenSwapValid)
+            resource.screenSwap = lastPackedScreenSwap;
+        packedFallbackApplied = true;
+    }
+
     if (!beginFrameCommand(resource))
         return false;
-
-    // a compose without a packed plane upload produces a blank frame; log
-    // the first few occurrences so presentation gaps can be traced
-    if (resource.softPackedFrameId == 0 && emptyPackedComposeLogBudget > 0)
-    {
-        emptyPackedComposeLogBudget--;
-        melonDS::Platform::Log(
-            melonDS::Platform::LogLevel::Warn,
-            "VulkanOutput: composing %ux%u frame without a packed plane upload",
-            resource.width,
-            resource.height
-        );
-    }
 
     if (resource.timestampQueryPool != VK_NULL_HANDLE)
         vkCmdWriteTimestamp(resource.commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, resource.timestampQueryPool, 0);
@@ -5450,7 +5477,7 @@ bool VulkanOutput::dispatchCompositor(
     pushConstants.rendererWidth = inputs.rendererWidth;
     pushConstants.rendererHeight = inputs.rendererHeight;
     pushConstants.packedStride = inputs.packedStride;
-    pushConstants.screenSwap = inputs.screenSwap;
+    pushConstants.screenSwap = packedFallbackApplied ? (resource.screenSwap ? 1u : 0u) : inputs.screenSwap;
     pushConstants.filtering = static_cast<u32>(inputs.filtering);
     pushConstants.previousTopSourceValid = inputs.previousTopSourceValid ? 1u : 0u;
     pushConstants.previousBottomSourceValid = inputs.previousBottomSourceValid ? 1u : 0u;

@@ -381,6 +381,7 @@ private:
         Frame* previousBottomSourceFrame{};
         bool previousBottomSourcePending{};
         u64 softPackedFrameId{};
+        bool hasPackedUpload{};
         int frontBufferLatched{-1};
         bool captureBackedClass4Only{};
         bool class4NoAboveVramStructuredPair{};
@@ -554,7 +555,7 @@ private:
 
     u32 objFilterMode{0};
     u32 bgFilterMode{0};
-    u32 emptyPackedComposeLogBudget{16};
+    u64 lastEmptyPackedComposeLogNs{0};
 
     static constexpr u32 kPlaneFilterModeCount = 14;
     VkDescriptorSetLayout planeFilterDescriptorSetLayout{VK_NULL_HANDLE};
