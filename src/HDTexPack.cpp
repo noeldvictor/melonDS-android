@@ -120,6 +120,7 @@ HDTexPack::HDTexPack(const std::string& packDir, const std::string& dumpDir,
     {
         LoadDir(PackDir + "/textures", "tex1");
         LoadDir(PackDir + "/sprites", "obj1");
+        LoadDir(PackDir + "/bgtiles", "bg1");
         if (EntryCount > 0)
             Platform::Log(Platform::LogLevel::Info,
                           "HDTexPack: loaded %u entries from %s (scale %ux)\n",
@@ -130,6 +131,7 @@ HDTexPack::HDTexPack(const std::string& packDir, const std::string& dumpDir,
         std::error_code ec;
         fs::create_directories(fs::u8path(DumpDir + "/textures"), ec);
         fs::create_directories(fs::u8path(DumpDir + "/sprites"), ec);
+        fs::create_directories(fs::u8path(DumpDir + "/bgtiles"), ec);
         Platform::Log(Platform::LogLevel::Info,
                       "HDTexPack: dumping to %s\n", DumpDir.c_str());
     }
@@ -172,10 +174,18 @@ bool HDTexPack::AddEntry(const std::string& path, const std::string& name, const
 
     u32 disc;
     bool isTex = !strcmp(kind, "tex1");
+    bool isBG = !strcmp(kind, "bg1");
     if (isTex)
     {
         if (parts[4].size() != 1 || parts[4][0] < '1' || parts[4][0] > '7') return false;
         disc = parts[4][0] - '0';
+    }
+    else if (isBG)
+    {
+        if (w != 8 || h != 8) return false;
+        if (parts[4] == "4") disc = 4;
+        else if (parts[4] == "8") disc = 8;
+        else return false;
     }
     else
     {
@@ -215,8 +225,8 @@ bool HDTexPack::AddEntry(const std::string& path, const std::string& name, const
 
     bool hasPal = !nonePal;
     u64 key = MapKey(w, h, hash1, wcPal ? 0 : palHash, disc, hasPal && !wcPal);
-    auto& exact = isTex ? TexEntries : SpriteEntries;
-    auto& wild = isTex ? TexWildcard : SpriteWildcard;
+    auto& exact = isTex ? TexEntries : isBG ? BGEntries : SpriteEntries;
+    auto& wild = isTex ? TexWildcard : isBG ? BGWildcard : SpriteWildcard;
     (wcPal ? wild : exact)[key] = std::move(img);
     EntryCount++;
     return true;
@@ -250,6 +260,14 @@ const HDTexPackImage* HDTexPack::LookupSprite(u32 width, u32 height, u64 tileHas
     return Find(SpriteEntries, SpriteWildcard,
                 MapKey(width, height, tileHash, hasPal ? palHash : 0, disc, hasPal),
                 MapKey(width, height, tileHash, 0, disc, false));
+}
+
+const HDTexPackImage* HDTexPack::LookupBGTile(u64 tileHash, u64 palHash, bool hasPal, u32 bpp) const
+{
+    if (!LoadActive()) return nullptr;
+    return Find(BGEntries, BGWildcard,
+                MapKey(8, 8, tileHash, hasPal ? palHash : 0, bpp, hasPal),
+                MapKey(8, 8, tileHash, 0, bpp, false));
 }
 
 void HDTexPack::WriteDumpPNG(const char* subdir, const std::string& name,
@@ -339,6 +357,43 @@ void HDTexPack::DumpSprite(u32 width, u32 height, u64 tileHash,
              hasPal ? "\"" : "", hasPal ? palStr.c_str() : "null", hasPal ? "\"" : "",
              bppTag, frame, screen, oamSlot, x, y);
     AppendManifest("sprites", line);
+}
+
+void HDTexPack::DumpBGTile(u64 tileHash, u64 palHash, bool hasPal, u32 bpp, const u32* rgba8,
+                           u32 frame, char screen, int layer, int x, int y)
+{
+    if (!DumpEnabled) return;
+
+    bool anyOpaque = false;
+    for (size_t i = 0; i < 64; i++)
+        if (rgba8[i] & 0xFF000000u) { anyOpaque = true; break; }
+    if (!anyOpaque)
+        return;
+
+    u64 key = MapKey(8, 8, tileHash, hasPal ? palHash : 0, bpp, hasPal);
+    std::string palStr = hasPal ? Hash16(palHash) : "none";
+
+    if (DumpedKeys.insert(key).second)
+    {
+        char nameBuf[96];
+        snprintf(nameBuf, sizeof(nameBuf), "bg1_8x8_%s_%s_%u",
+                 Hash16(tileHash).c_str(), palStr.c_str(), bpp);
+        WriteDumpPNG("bgtiles", nameBuf, 8, 8, rgba8);
+    }
+
+    // one manifest line per distinct (key, screen, layer, tilemap position)
+    u64 inst[4] = { key, ((u64)(u8)screen << 8) | (u64)(u8)layer, (u64)(u32)x, (u64)(u32)y };
+    if (!LoggedSpriteInstances.insert(XXH64(inst, sizeof(inst), 1)).second)
+        return;
+
+    char line[320];
+    snprintf(line, sizeof(line),
+             "{\"kind\":\"bg1\",\"w\":8,\"h\":8,\"tilehash\":\"%s\",\"palhash\":%s%s%s,"
+             "\"bpp\":\"%u\",\"frame\":%u,\"screen\":\"%c\",\"layer\":%d,\"x\":%d,\"y\":%d}",
+             Hash16(tileHash).c_str(),
+             hasPal ? "\"" : "", hasPal ? palStr.c_str() : "null", hasPal ? "\"" : "",
+             bpp, frame, screen, layer, x, y);
+    AppendManifest("bgtiles", line);
 }
 
 }

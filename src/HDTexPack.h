@@ -35,6 +35,7 @@ namespace melonDS
 // docs/HD_TEXTURE_PACK_DESIGN.md. Filenames are the database:
 //   tex1_<W>x<H>_<texhash16>_<palhash16|none|$>_<fmt>.png
 //   obj1_<W>x<H>_<tilehash16>_<palhash16|none|$>_<4|8|bmp>.png
+//   bg1_8x8_<tilehash16>_<palhash16|none|$>_<4|8>.png
 // All methods are intended for use from the render thread only.
 
 struct HDTexPackImage
@@ -55,6 +56,11 @@ public:
     bool LoadActive() const { return LoadEnabled && EntryCount > 0; }
     bool DumpActive() const { return DumpEnabled; }
     u32 Scale() const { return PackScale; }
+    bool Has2DEntries() const
+    {
+        return !SpriteEntries.empty() || !SpriteWildcard.empty()
+            || !BGEntries.empty() || !BGWildcard.empty();
+    }
 
     // 3D textures. hasPal is false for fmt 7 (direct bitmap).
     const HDTexPackImage* LookupTexture(u32 width, u32 height, u64 texHash,
@@ -70,6 +76,12 @@ public:
     void DumpSprite(u32 width, u32 height, u64 tileHash,
                     u64 palHash, bool hasPal, const char* bppTag, const u32* rgba8,
                     u32 frame, char screen, int oamSlot, int x, int y);
+
+    // 2D BG tiles, always 8x8, pre-flip. bpp: 4 or 8.
+    const HDTexPackImage* LookupBGTile(u64 tileHash, u64 palHash, bool hasPal, u32 bpp) const;
+    // rgba8: decoded unflipped tile pixels; x/y are tilemap coordinates.
+    void DumpBGTile(u64 tileHash, u64 palHash, bool hasPal, u32 bpp, const u32* rgba8,
+                    u32 frame, char screen, int layer, int x, int y);
 
     static u32 RGB6A5ToRGBA8(u32 texel);
     static u32 RGBA8ToRGB6A5(u32 pixel);
@@ -100,6 +112,7 @@ private:
     // keyed by XXH64 over the canonical key fields; wildcard maps ignore the palette hash
     std::unordered_map<u64, HDTexPackImage> TexEntries, TexWildcard;
     std::unordered_map<u64, HDTexPackImage> SpriteEntries, SpriteWildcard;
+    std::unordered_map<u64, HDTexPackImage> BGEntries, BGWildcard;
 
     std::unordered_set<u64> DumpedKeys;
     std::unordered_set<u64> LoggedSpriteInstances;
