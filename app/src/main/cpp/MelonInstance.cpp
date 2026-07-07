@@ -1596,6 +1596,13 @@ u32 MelonInstance::runFrame()
     }
     retroAchievementsManager->FrameUpdate();
 
+    // 2D sprite/BG tile dumping and replacement lookup ride the frame the
+    // core just produced; the walker throttles its own dump cadence
+    if (hdTexPack)
+        hdPack2D.ProcessFrame(nds->GPU, hdTexPack.get());
+    else if (!hdPack2D.Instances.empty())
+        hdPack2D.Instances.clear();
+
     bool hasValidFrame = false;
     int frontbuf = nds->GPU.FrontBuffer;
     const bool preparedFrameScreenSwap = nds->GPU.GPU3D.RenderScreenSwapAt3D;
@@ -4225,6 +4232,11 @@ void MelonInstance::applyTexturePack()
             std::string state = packDir + "|" + (loadEnabled ? "L" : "-") + (dumpEnabled ? "D" : "-");
             if (!hdTexPack || hdTexPackState != state)
             {
+                // in-flight composes may still read replacement art from the
+                // pack that is being torn down
+                if (hdTexPack && vulkanOutput)
+                    vulkanOutput->flushInFlightFrames();
+                hdPack2D.Instances.clear();
                 hdTexPack = std::make_unique<melonDS::HDTexPack>(packDir, dumpDir, loadEnabled, dumpEnabled);
                 hdTexPackState = state;
             }
@@ -4232,6 +4244,9 @@ void MelonInstance::applyTexturePack()
         }
         else if (hdTexPack)
         {
+            if (vulkanOutput)
+                vulkanOutput->flushInFlightFrames();
+            hdPack2D.Instances.clear();
             hdTexPack.reset();
             hdTexPackState.clear();
         }
@@ -4242,6 +4257,9 @@ void MelonInstance::applyTexturePack()
         vulkan->SetTexPack(pack);
     else if (auto* compute = dynamic_cast<ComputeRenderer*>(&renderer3d))
         compute->SetTexPack(pack);
+
+    if (vulkanOutput)
+        vulkanOutput->setReplacement2DActive(pack != nullptr && pack->LoadActive() && pack->Has2DEntries());
 }
 
 void MelonInstance::updateRenderer()
@@ -4911,6 +4929,7 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
     lastSoftPackedFrameSnapshot.frameId = frame->frameId;
     lastSoftPackedFrameSnapshot.frontBufferLatched = frontBuffer;
     lastSoftPackedFrameSnapshot.screenSwapLatched = screenSwap;
+    lastSoftPackedFrameSnapshot.replacementInstances = hdPack2D.Instances;
     const bool renderer2dDebugControlsActive = areRenderer2DDebugControlsActive();
     if (renderer2dDebugControlsActive)
     {

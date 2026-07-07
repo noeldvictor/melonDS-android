@@ -361,6 +361,12 @@ for plane_filter_mode in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
 done
 
 generate_header \
+  "$ROOT_DIR/app/src/main/cpp/renderer/VulkanPlaneOverlayShader.comp" \
+  "comp" \
+  "melonDS_android_vulkan_plane_overlay_comp_spv" \
+  "$ROOT_DIR/app/src/main/cpp/renderer/VulkanPlaneOverlayShaderData.h"
+
+generate_header \
   "$ROOT_DIR/app/src/main/cpp/renderer/VulkanSurfacePresenter.vert" \
   "vert" \
   "melonDS_android_vulkan_surface_presenter_vert_spv" \

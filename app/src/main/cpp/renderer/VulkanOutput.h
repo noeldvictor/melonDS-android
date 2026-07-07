@@ -11,6 +11,7 @@
 
 #include "renderer/FrameQueue.h"
 #include "renderer/VulkanFilterMode.h"
+#include "GPU2D_HDPack.h"
 #include "types.h"
 #include "VulkanPerfStats.h"
 
@@ -78,9 +79,11 @@ struct SoftPackedFrameSnapshot
     std::array<u32, kPixelCount> comp4BottomPlaceholder{};
     SoftPackedScreenStats topScreenStats{};
     SoftPackedScreenStats bottomScreenStats{};
+    std::vector<melonDS::HDPack2DInstance> replacementInstances;
 
     void clear()
     {
+        replacementInstances.clear();
         frameId = 0;
         frontBufferLatched = -1;
         screenSwapLatched = false;
@@ -238,6 +241,13 @@ public:
         objFilterMode = objMode;
         bgFilterMode = bgMode;
     }
+    // Enables the HD 2D replacement overlay (sprites/BG tiles from a texture
+    // pack). Resets the replacement atlas cache: the pack that backs the
+    // cached images may have been rebuilt, so stale slots must not survive.
+    void setReplacement2DActive(bool active);
+    // Bounded wait for every in-flight frame submission; used before the
+    // texture pack backing replacement instances is destroyed.
+    void flushInFlightFrames();
     void invalidateTemporalHistory();
     void clearStructuredCaptureHistory();
     void releaseTemporalFrameReferences();
@@ -341,6 +351,28 @@ private:
         u32 writeOthers;
     };
 
+    struct PlaneOverlayPushConstants
+    {
+        u32 scale;
+        u32 instanceIndex;
+    };
+
+    // std430 mirror of the overlay shader's OverlayInstance struct
+    struct PlaneOverlayGpuInstance
+    {
+        s32 destX, destY;
+        u32 nativeW, nativeH;
+        u32 atlasX, atlasY;
+        u32 masks;  // bits 0-7 require, bits 8-15 reject
+        u32 flags;  // bit 0 flipH, bit 1 flipV
+    };
+
+    struct OverlayAtlasSlot
+    {
+        u32 x{}, y{}, w{}, h{};
+        bool uploaded{};
+    };
+
     struct FrameResource
     {
         VkImage image{VK_NULL_HANDLE};
@@ -431,6 +463,17 @@ private:
         VkImageView cachedBottomFilteredPlaneView{VK_NULL_HANDLE};
         std::array<VkDescriptorSet, 2> planeFilterDescriptorSets{};
         bool planeFilterDescriptorsReady{};
+        std::vector<melonDS::HDPack2DInstance> replacementInstances;
+        VkBuffer overlayInstanceBuffer{VK_NULL_HANDLE};
+        VkDeviceMemory overlayInstanceMemory{VK_NULL_HANDLE};
+        void* overlayInstanceMapped{};
+        VkBuffer overlayStagingBuffer{VK_NULL_HANDLE};
+        VkDeviceMemory overlayStagingMemory{VK_NULL_HANDLE};
+        void* overlayStagingMapped{};
+        VkImageView cachedOverlayTopPlaneView{VK_NULL_HANDLE};
+        VkImageView cachedOverlayBottomPlaneView{VK_NULL_HANDLE};
+        std::array<VkDescriptorSet, 2> overlayDescriptorSets{};
+        bool overlayDescriptorsReady{};
         std::array<u32, 256 * 192> preparedCapture3dSource{};
     };
 
@@ -443,6 +486,15 @@ private:
     void destroyPlaneFilterResources();
     VkPipeline getPlaneFilterPipeline(u32 mode);
     bool recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs);
+    bool ensurePlaneOverlayResources(FrameResource& resource);
+    void destroyPlaneOverlayResources();
+    VkPipeline getPlaneOverlayPipeline();
+    bool acquireOverlayAtlasSlot(const melonDS::HDTexPackImage* image, u32 scale,
+                                 u32 nativeW, u32 nativeH, FrameResource& resource,
+                                 VkDeviceSize& stagingUsed,
+                                 std::vector<VkBufferImageCopy>& pendingCopies,
+                                 OverlayAtlasSlot& outSlot);
+    void recordPlaneOverlayPasses(FrameResource& resource, const VulkanCompositionInputs& inputs);
     bool createTimestampQueryPool(VkQueryPool& queryPool);
     void destroyTimestampQueryPool(VkQueryPool& queryPool);
     void destroyCompositorResources();
@@ -576,6 +628,30 @@ private:
     VkImageView placeholderPlaneView{VK_NULL_HANDLE};
     VkDeviceMemory placeholderPlaneMemory{VK_NULL_HANDLE};
     bool placeholderPlaneLayoutReady{false};
+
+    // HD 2D replacement overlay: instances land on the filtered plane images
+    // through a small compute pass sampling a shared replacement atlas
+    static constexpr u32 kOverlayAtlasSize = 2048;
+    static constexpr size_t kOverlayMaxInstances = 4096;
+    static constexpr VkDeviceSize kOverlayStagingSize = 1024 * 1024;
+    bool replacement2DActive{false};
+    VkDescriptorSetLayout overlayDescriptorSetLayout{VK_NULL_HANDLE};
+    VkDescriptorPool overlayDescriptorPool{VK_NULL_HANDLE};
+    VkPipelineLayout overlayPipelineLayout{VK_NULL_HANDLE};
+    VkPipeline overlayPipeline{VK_NULL_HANDLE};
+    bool overlayPipelineFailed{false};
+    VkImage overlayAtlasImage{VK_NULL_HANDLE};
+    VkImageView overlayAtlasView{VK_NULL_HANDLE};
+    VkDeviceMemory overlayAtlasMemory{VK_NULL_HANDLE};
+    bool overlayAtlasLayoutReady{false};
+    std::unordered_map<const void*, OverlayAtlasSlot> overlayAtlasSlots;
+    u32 overlayAtlasShelfX{0};
+    u32 overlayAtlasShelfY{0};
+    u32 overlayAtlasShelfHeight{0};
+    u32 overlayAtlasScale{0};
+    bool overlayAtlasFull{false};
+    u64 lastOverlayAtlasFullLogNs{0};
+    std::vector<u32> overlayResampleScratch;
 
     std::unordered_map<Frame*, FrameResource> resources;
     std::mutex commandPoolLock;

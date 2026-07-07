@@ -1,0 +1,77 @@
+#version 450
+
+// HD replacement overlay pass.
+//
+// Runs after the plane filter pre-pass and composites HD replacement art
+// from a packed atlas over the filtered plane images. Each instance covers
+// one replaced OBJ or BG tile at its native screen position; the packed
+// alpha byte (carried in the plane image alpha channel) gates writes so a
+// replacement only lands on pixels its producer actually won during 2D
+// composition — occlusion and priority survive unchanged. Both stacked
+// plane halves are checked per invocation.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct OverlayInstance
+{
+    ivec2 destPos;      // native screen coords, may be negative
+    uvec2 nativeSize;   // native pixel size
+    uvec2 atlasPos;     // scaled atlas texel origin
+    uint masks;         // bits 0-7 required flag bits, bits 8-15 rejected bits
+    uint flags;         // bit 0 flipH, bit 1 flipV
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer InstanceBuffer
+{
+    OverlayInstance instances[];
+};
+
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D hdAtlas;
+layout(set = 0, binding = 2, rgba8) uniform image2D planes;
+
+layout(push_constant) uniform PushConsts
+{
+    uint scale;
+    uint instanceIndex;
+} pc;
+
+void main()
+{
+    OverlayInstance inst = instances[pc.instanceIndex];
+
+    uvec2 local = gl_GlobalInvocationID.xy;
+    uvec2 scaledSize = inst.nativeSize * pc.scale;
+    if (local.x >= scaledSize.x || local.y >= scaledSize.y)
+        return;
+
+    int px = inst.destPos.x * int(pc.scale) + int(local.x);
+    int py = inst.destPos.y * int(pc.scale) + int(local.y);
+    int planeWidth = 256 * int(pc.scale);
+    int planeHeight = 192 * int(pc.scale);
+    if (px < 0 || px >= planeWidth || py < 0 || py >= planeHeight)
+        return;
+
+    uvec2 srcTexel = local;
+    if ((inst.flags & 1u) != 0u)
+        srcTexel.x = scaledSize.x - 1u - srcTexel.x;
+    if ((inst.flags & 2u) != 0u)
+        srcTexel.y = scaledSize.y - 1u - srcTexel.y;
+    vec4 hd = imageLoad(hdAtlas, ivec2(inst.atlasPos + srcTexel));
+    if (hd.a <= 0.0)
+        return;
+
+    uint requireMask = inst.masks & 0xFFu;
+    uint rejectMask = (inst.masks >> 8u) & 0xFFu;
+    for (int plane = 0; plane < 2; plane++)
+    {
+        ivec2 coord = ivec2(px, py + plane * planeHeight);
+        vec4 existing = imageLoad(planes, coord);
+        uint producer = uint(existing.a * 255.0 + 0.5);
+        if ((producer & 0xC0u) == 0x40u)
+            continue;
+        if ((producer & requireMask) == 0u || (producer & rejectMask) != 0u)
+            continue;
+        vec3 blended = mix(existing.rgb, hd.rgb, hd.a);
+        imageStore(planes, coord, vec4(blended, existing.a));
+    }
+}
