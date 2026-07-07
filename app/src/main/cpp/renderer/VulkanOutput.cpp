@@ -4781,6 +4781,8 @@ bool VulkanOutput::buildCompositionInputs(
     outInputs.screenSwap = resource.screenSwap ? 1u : 0u;
     outInputs.scale = static_cast<u32>(scale);
     outInputs.filtering = filtering;
+    outInputs.planeFilterRequested =
+        (objFilterMode != 0u || bgFilterMode != 0u) && outInputs.scale > 1u;
     outInputs.capture3dSourceValid = resource.hasPreparedCapture3dSource && resource.capture3dBuffer != VK_NULL_HANDLE;
     const bool topUsesCurrentCapture3d = topUsesRegularCapture3d || topUsesVramCapture3d;
     const bool bottomUsesCurrentCapture3d = bottomUsesRegularCapture3d || bottomUsesVramCapture3d;

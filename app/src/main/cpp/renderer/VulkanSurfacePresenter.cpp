@@ -991,9 +991,14 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
             return surfaceState.configured
                 && IsVulkanPostProcessFilter(surfaceState.config.filtering);
         });
+    // per-producer 2D filtering lives in the compositor pre-pass, so frames
+    // must consistently take the compose path while it is requested; mixing
+    // direct and composed frames would alternate between filtered and
+    // unfiltered output
     const bool directPresentRequested = !inputs.needsReadback
         && !inputs.validationMode
         && !postProcessFilterRequested
+        && !inputs.planeFilterRequested
         && surfaces.size() == 1
         && !hasDualScreenSurface
         && hasRequiredDirectHandles

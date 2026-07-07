@@ -59,12 +59,13 @@ bool packedTapIsUnsafe(uint packedValue)
 }
 
 // The packed alpha byte carries the winning producer of each pixel:
-// bits 0..3 BG0..BG3, bit 4 OBJ, bit 5 backdrop, bit 6 the 3D layer slot
-// and bit 7 semi-transparent OBJ. 3D pixels are never filtered here.
+// bits 0..3 BG0..BG3, bit 4 OBJ, bit 5 backdrop, bit 6 alone the 3D layer
+// slot, bit 7 semi-transparent OBJ and bits 6+7 together bitmap OBJ.
+// 3D pixels are never filtered here.
 bool pixelSelectedForThisPass(uint packedValue)
 {
     uint flags = (packedValue >> 24u) & 0xFFu;
-    if ((flags & 0x40u) != 0u)
+    if ((flags & 0xC0u) == 0x40u)
         return false;
     if (isPacked3dPlaceholder(packedValue))
         return false;

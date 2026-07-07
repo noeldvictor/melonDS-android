@@ -157,6 +157,9 @@ struct VulkanCompositionInputs
     bool needsReadback{};
     bool multiSurface{};
     bool validationMode{};
+    // per-producer 2D filtering only happens in the compositor, so the
+    // presenter must not take its direct path while a filter mode is active
+    bool planeFilterRequested{};
 };
 
 struct VulkanOutputTemporalStats
