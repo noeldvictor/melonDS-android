@@ -37,6 +37,47 @@
             android:entryValues="@array/video_filtering_values"
             android:defaultValue="none"/>
 
+    <ListPreference
+            android:key="video_hd_texture_filter"
+            android:title="@string/hd_texture_filter"
+            android:summary="%s"
+            app:iconSpaceReserved="false"
+            android:entries="@array/hd_filter_mode_options"
+            android:entryValues="@array/hd_filter_mode_values"
+            android:defaultValue="0"/>
+
+    <ListPreference
+            android:key="video_obj_sprite_filter"
+            android:title="@string/obj_sprite_filter"
+            android:summary="%s"
+            app:iconSpaceReserved="false"
+            android:entries="@array/hd_filter_mode_options"
+            android:entryValues="@array/hd_filter_mode_values"
+            android:defaultValue="0"/>
+
+    <ListPreference
+            android:key="video_bg_layer_filter"
+            android:title="@string/bg_layer_filter"
+            android:summary="%s"
+            app:iconSpaceReserved="false"
+            android:entries="@array/hd_filter_mode_options"
+            android:entryValues="@array/hd_filter_mode_values"
+            android:defaultValue="0"/>
+
+    <SwitchPreference
+            android:key="enable_texture_packs"
+            android:title="@string/load_texture_packs"
+            android:summary="@string/load_texture_packs_summary"
+            app:iconSpaceReserved="false"
+            android:defaultValue="false" />
+
+    <SwitchPreference
+            android:key="enable_texture_dumping"
+            android:title="@string/dump_textures"
+            android:summary="@string/dump_textures_summary"
+            app:iconSpaceReserved="false"
+            android:defaultValue="false" />
+
     <me.magnum.melonds.ui.settings.preferences.StoragePickerPreference
             android:key="video_retroarch_shader_root"
             android:title="@string/video_retroarch_shader_root_title"

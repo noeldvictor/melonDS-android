@@ -210,6 +210,8 @@ MelonDSAndroid::EmulatorConfiguration MelonDSAndroidConfiguration::buildEmulator
     jint micSource = env->GetIntField(micSourceEnum, env->GetFieldID(micSourceEnumClass, "sourceValue", "I"));
     jobject videoRendererEnum = env->GetObjectField(rendererConfigurationObject, env->GetFieldID(renderConfigurationClass, "renderer", "Lme/magnum/melonds/domain/model/VideoRenderer;"));
     MelonDSAndroid::Renderer videoRenderer = static_cast<MelonDSAndroid::Renderer>(env->GetIntField(videoRendererEnum, env->GetFieldID(videoRendererEnumClass, "renderer", "I")));
+    jboolean loadTexturePacks = env->GetBooleanField(rendererConfigurationObject, env->GetFieldID(renderConfigurationClass, "loadTexturePacks", "Z"));
+    jboolean dumpTextures = env->GetBooleanField(rendererConfigurationObject, env->GetFieldID(renderConfigurationClass, "dumpTextures", "Z"));
     jstring dsBios7String = dsBios7Uri ? (jstring) env->CallObjectMethod(dsBios7Uri, uriToStringMethod) : nullptr;
     jstring dsBios9String = dsBios9Uri ? (jstring) env->CallObjectMethod(dsBios9Uri, uriToStringMethod) : nullptr;
     jstring dsFirmwareString = dsFirmwareUri ? (jstring) env->CallObjectMethod(dsFirmwareUri, uriToStringMethod) : nullptr;
@@ -241,6 +243,8 @@ MelonDSAndroid::EmulatorConfiguration MelonDSAndroidConfiguration::buildEmulator
     finalEmulatorConfiguration.showBootScreen = showBootScreen;
     finalEmulatorConfiguration.useJit = useJit;
     finalEmulatorConfiguration.hgEngineFixEnabled = hgEngineFixEnabled;
+    finalEmulatorConfiguration.loadTexturePacks = loadTexturePacks;
+    finalEmulatorConfiguration.dumpTextures = dumpTextures;
     finalEmulatorConfiguration.consoleType = consoleType;
     finalEmulatorConfiguration.audioSettings = MelonDSAndroid::AudioSettings {
         .soundEnabled = (bool) soundEnabled,
@@ -329,6 +333,9 @@ std::unique_ptr<MelonDSAndroid::RenderSettings> MelonDSAndroidConfiguration::bui
     if (videoFilteringObject != nullptr)
         env->DeleteLocalRef(videoFilteringObject);
     jint internalResolutionScaling = env->CallIntMethod(renderSettings, getResolutionScalingMethod);
+    jint hdTextureFilterMode = env->GetIntField(renderSettings, env->GetFieldID(renderSettingsClass, "hdTextureFilterMode", "I"));
+    jint objSpriteFilterMode = env->GetIntField(renderSettings, env->GetFieldID(renderSettingsClass, "objSpriteFilterMode", "I"));
+    jint bgLayerFilterMode = env->GetIntField(renderSettings, env->GetFieldID(renderSettingsClass, "bgLayerFilterMode", "I"));
 
     std::unique_ptr<MelonDSAndroid::RenderSettings> settings;
     if (renderer == MelonDSAndroid::Renderer::OpenGl)
@@ -367,6 +374,9 @@ std::unique_ptr<MelonDSAndroid::RenderSettings> MelonDSAndroidConfiguration::bui
                 .conservativeCoverageApplyClamp = conservativeCoverageApplyClamp != 0,
                 .debug3dClearMagenta = debug3dClearMagenta != 0,
                 .videoFiltering = mapVulkanFilterMode(videoFilteringOrdinal),
+                .hdTextureFilterMode = hdTextureFilterMode,
+                .objFilterMode = objSpriteFilterMode,
+                .bgFilterMode = bgLayerFilterMode,
             }
         );
     }
@@ -376,6 +386,7 @@ std::unique_ptr<MelonDSAndroid::RenderSettings> MelonDSAndroidConfiguration::bui
             MelonDSAndroid::ComputeRenderSettings {
                 .scale = internalResolutionScaling,
                 .highResCoordinates = true,
+                .hdTextureFilterMode = hdTextureFilterMode,
             }
         );
     }

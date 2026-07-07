@@ -172,9 +172,17 @@ class SharedPreferencesSettingsRepository(
         val applyClamp: Boolean,
         val debugClearMagenta: Boolean,
     )
+    private data class HdFilterConfigurationInputs(
+        val hdTextureFilterMode: Int,
+        val objSpriteFilterMode: Int,
+        val bgLayerFilterMode: Int,
+        val loadTexturePacks: Boolean,
+        val dumpTextures: Boolean,
+    )
     private data class RenderConfigurationInputs(
         val core: CoreRenderConfigurationInputs,
         val coverageFix: CoverageFixConfigurationInputs,
+        val hdFilter: HdFilterConfigurationInputs,
     )
 
     init {
@@ -240,8 +248,24 @@ class SharedPreferencesSettingsRepository(
             inputs.copy(debugClearMagenta = debugClearMagenta)
         }
 
-        val renderInputsFlow = combine(fullCoreRenderInputsFlow, coverageFixInputsFlow) { core, coverageFix ->
-            RenderConfigurationInputs(core, coverageFix)
+        val hdFilterInputsFlow = combine(
+            getHdTextureFilterMode(),
+            getObjSpriteFilterMode(),
+            getBgLayerFilterMode(),
+            isTexturePackLoadEnabled(),
+            isTextureDumpEnabled(),
+        ) { hdTextureFilterMode, objSpriteFilterMode, bgLayerFilterMode, loadTexturePacks, dumpTextures ->
+            HdFilterConfigurationInputs(
+                hdTextureFilterMode,
+                objSpriteFilterMode,
+                bgLayerFilterMode,
+                loadTexturePacks,
+                dumpTextures,
+            )
+        }
+
+        val renderInputsFlow = combine(fullCoreRenderInputsFlow, coverageFixInputsFlow, hdFilterInputsFlow) { core, coverageFix, hdFilter ->
+            RenderConfigurationInputs(core, coverageFix, hdFilter)
         }
 
         renderConfigurationFlow = combine(
@@ -273,6 +297,11 @@ class SharedPreferencesSettingsRepository(
                 renderInputs.coverageFix.applyRepeat,
                 renderInputs.coverageFix.applyClamp,
                 renderInputs.coverageFix.debugClearMagenta,
+                renderInputs.hdFilter.hdTextureFilterMode,
+                renderInputs.hdFilter.objSpriteFilterMode,
+                renderInputs.hdFilter.bgLayerFilterMode,
+                renderInputs.hdFilter.loadTexturePacks,
+                renderInputs.hdFilter.dumpTextures,
                 if (effectiveFiltering == VideoFiltering.RETROARCH) retroArchShader else EmptyRetroArchShaderConfiguration,
             )
         }.conflate().shareIn(preferencesCoroutineScope, SharingStarted.Lazily, replay = 1)
@@ -1109,6 +1138,36 @@ class SharedPreferencesSettingsRepository(
 
     override fun observeRetroArchShaderParametersText(): Flow<String?> {
         return observeRetroArchShaderParameterText()
+    }
+
+    private fun getHdTextureFilterMode(): Flow<Int> {
+        return getOrCreatePreferenceSharedFlow("video_hd_texture_filter") {
+            preferences.getString("video_hd_texture_filter", "0")?.toIntOrNull() ?: 0
+        }
+    }
+
+    private fun getObjSpriteFilterMode(): Flow<Int> {
+        return getOrCreatePreferenceSharedFlow("video_obj_sprite_filter") {
+            preferences.getString("video_obj_sprite_filter", "0")?.toIntOrNull() ?: 0
+        }
+    }
+
+    private fun getBgLayerFilterMode(): Flow<Int> {
+        return getOrCreatePreferenceSharedFlow("video_bg_layer_filter") {
+            preferences.getString("video_bg_layer_filter", "0")?.toIntOrNull() ?: 0
+        }
+    }
+
+    private fun isTexturePackLoadEnabled(): Flow<Boolean> {
+        return getOrCreatePreferenceSharedFlow("enable_texture_packs") {
+            preferences.getBoolean("enable_texture_packs", false)
+        }
+    }
+
+    private fun isTextureDumpEnabled(): Flow<Boolean> {
+        return getOrCreatePreferenceSharedFlow("enable_texture_dumping") {
+            preferences.getBoolean("enable_texture_dumping", false)
+        }
     }
 
     private fun isConservativeCoverageEnabled(): Flow<Boolean> {

@@ -4191,9 +4191,11 @@ std::vector<long> MelonInstance::getRuntimeSubsetIds()
 void MelonInstance::applyTexturePack()
 {
     // Texture packs live under the app's internal files dir:
-    //   texturepacks/<GAMECODE>/textures/*.png  -> replacements (native size)
-    //   texturedumps/                           -> create this dir to enable dumping
-    // Content-hash naming matches the desktop melonDS HD pack format.
+    //   texturepacks/<GAMECODE>/textures/*.png  -> replacements
+    //   texturedumps/<GAMECODE>/                -> dumped textures
+    // Content-hash naming matches the desktop melonDS HD pack format. The
+    // settings toggles enable loading/dumping; a pre-existing directory keeps
+    // working as an opt-in fallback.
     melonDS::HDTexPack* pack = nullptr;
 
     auto cart = nds->NDSCartSlot.GetCart();
@@ -4208,8 +4210,10 @@ void MelonInstance::applyTexturePack()
         std::string dumpDir = base + "/texturedumps/" + gameCode;
 
         std::error_code ec;
-        bool loadEnabled = std::filesystem::is_directory(std::filesystem::u8path(packDir), ec);
-        bool dumpEnabled = std::filesystem::is_directory(std::filesystem::u8path(base + "/texturedumps"), ec);
+        bool loadEnabled = currentConfiguration->loadTexturePacks
+            || std::filesystem::is_directory(std::filesystem::u8path(packDir), ec);
+        bool dumpEnabled = currentConfiguration->dumpTextures
+            || std::filesystem::is_directory(std::filesystem::u8path(base + "/texturedumps"), ec);
 
         if (loadEnabled || dumpEnabled)
         {
@@ -4388,6 +4392,15 @@ void MelonInstance::updateRenderer()
                 vulkanRenderSettings.conservativeCoverageApplyClamp,
                 vulkanRenderSettings.debug3dClearMagenta,
                 nds->GPU);
+            renderer3d.SetHDTextureFilter(
+                getConfiguredVulkanScale(vulkanRenderSettings),
+                vulkanRenderSettings.hdTextureFilterMode);
+            if (vulkanOutput)
+            {
+                vulkanOutput->setPacked2DFilterModes(
+                    static_cast<u32>(std::max(vulkanRenderSettings.objFilterMode, 0)),
+                    static_cast<u32>(std::max(vulkanRenderSettings.bgFilterMode, 0)));
+            }
             if (!vulkanRuntimeConfigLogged)
             {
                 Platform::Log(
@@ -4412,7 +4425,9 @@ void MelonInstance::updateRenderer()
         case Renderer::Compute:
         {
             auto computeRenderSettings = static_cast<ComputeRenderSettings&>(*currentConfiguration->renderSettings);
-            static_cast<ComputeRenderer&>(nds->GPU.GetRenderer3D()).SetRenderSettings(computeRenderSettings.scale,computeRenderSettings.highResCoordinates);
+            auto& renderer3d = static_cast<ComputeRenderer&>(nds->GPU.GetRenderer3D());
+            renderer3d.SetRenderSettings(computeRenderSettings.scale,computeRenderSettings.highResCoordinates);
+            renderer3d.SetHDTextureFilter(computeRenderSettings.scale, computeRenderSettings.hdTextureFilterMode);
             break;
         }
         default: __builtin_unreachable();

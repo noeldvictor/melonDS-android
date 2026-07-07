@@ -352,6 +352,13 @@
     <string name="category_video">Video</string>
     <string name="category_video_summary">Filter, threaded rendering, FPS counter</string>
     <string name="filter">Filter</string>
+    <string name="hd_texture_filter">3D texture filter</string>
+    <string name="obj_sprite_filter">Sprite (OBJ) filter</string>
+    <string name="bg_layer_filter">Background layer filter</string>
+    <string name="load_texture_packs">Load texture packs</string>
+    <string name="load_texture_packs_summary">Replace textures using packs placed in texturepacks/&lt;GAMECODE&gt; in the app directory.</string>
+    <string name="dump_textures">Dump textures</string>
+    <string name="dump_textures_summary">Write the textures used by the game to texturedumps/&lt;GAMECODE&gt; in the app directory.</string>
     <string name="internal_resolution">Internal resolution</string>
     <string name="renderer">Renderer</string>
     <string name="dsi_camera_source">DSi camera source</string>
@@ -878,6 +885,23 @@
         <item>LCD</item>
         <item>Scanlines</item>
         <item>RetroArch (.slangp)</item>
+    </string-array>
+
+    <string-array name="hd_filter_mode_options">
+        <item>Off</item>
+        <item>Linear</item>
+        <item>Smoothstep</item>
+        <item>Scale2x</item>
+        <item>HQ2x lite</item>
+        <item>2xSaI lite</item>
+        <item>SuperEagle lite</item>
+        <item>MMPX lite</item>
+        <item>Anime4K lite</item>
+        <item>Super2xSaI strong</item>
+        <item>SuperEagle smooth</item>
+        <item>Crisp gradient</item>
+        <item>Crisp edge AA</item>
+        <item>ScaleFX</item>
     </string-array>
 
     <string-array name="video_vulkan_driver_mode_options">

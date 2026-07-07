@@ -40,6 +40,7 @@ struct ComputeRenderSettings : public RenderSettings
 {
     int scale;
     bool highResCoordinates;
+    int hdTextureFilterMode = 0;
 };
 
 struct VulkanRenderSettings : public RenderSettings
@@ -58,6 +59,9 @@ struct VulkanRenderSettings : public RenderSettings
 	    bool conservativeCoverageApplyClamp;
 	    bool debug3dClearMagenta;
 	    VulkanFilterMode videoFiltering = VulkanFilterMode::Nearest;
+	    int hdTextureFilterMode = 0;
+	    int objFilterMode = 0;
+	    int bgFilterMode = 0;
 	};
 
 struct AudioSettings
@@ -108,6 +112,8 @@ typedef struct
     bool showBootScreen;
     bool useJit;
     bool hgEngineFixEnabled;
+    bool loadTexturePacks;
+    bool dumpTextures;
     int consoleType;
     AudioSettings audioSettings;
     int rewindEnabled;

@@ -14,6 +14,11 @@ data class RendererConfiguration(
     val conservativeCoverageApplyRepeat: Boolean,
     val conservativeCoverageApplyClamp: Boolean,
     val debug3dClearMagenta: Boolean,
+    val hdTextureFilterMode: Int,
+    val objSpriteFilterMode: Int,
+    val bgLayerFilterMode: Int,
+    val loadTexturePacks: Boolean,
+    val dumpTextures: Boolean,
     val retroArchShader: RetroArchShaderConfiguration,
 ) {
 

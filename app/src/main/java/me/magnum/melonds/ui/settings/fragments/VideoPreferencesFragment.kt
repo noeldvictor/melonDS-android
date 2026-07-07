@@ -72,6 +72,7 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
     private val threadedRendererPreferences = mutableListOf<Preference>()
     private val highResRendererPreferences = mutableListOf<Preference>()
     private val vulkanRendererPreferences = mutableListOf<Preference>()
+    private val hdTexturePreferences = mutableListOf<Preference>()
     private val rendererDebugPreferences = mutableListOf<Preference>()
     private val coverageFixPreferences = mutableListOf<Preference>()
 
@@ -118,6 +119,17 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
             add(findPreference("video_conservative_coverage_apply_repeat")!!)
             add(findPreference("video_conservative_coverage_apply_clamp")!!)
             add(findPreference("video_conservative_coverage_depth_bias")!!)
+        }
+
+        vulkanRendererPreferences.apply {
+            add(findPreference("video_obj_sprite_filter")!!)
+            add(findPreference("video_bg_layer_filter")!!)
+        }
+
+        hdTexturePreferences.apply {
+            add(findPreference("video_hd_texture_filter")!!)
+            add(findPreference("enable_texture_packs")!!)
+            add(findPreference("enable_texture_dumping")!!)
         }
 
         val videoFilteringPreference = findPreference<InGameLockedListPreference>("video_filtering")!!
@@ -664,6 +676,9 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
                 vulkanRendererPreferences.forEach {
                     it.isVisible = false
                 }
+                hdTexturePreferences.forEach {
+                    it.isVisible = false
+                }
             }
             VideoRenderer.OPENGL -> {
                 threadedRendererPreferences.forEach {
@@ -679,6 +694,9 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
                     it.isVisible = true
                 }
                 vulkanRendererPreferences.forEach {
+                    it.isVisible = false
+                }
+                hdTexturePreferences.forEach {
                     it.isVisible = false
                 }
             }
@@ -698,6 +716,9 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
                 vulkanRendererPreferences.forEach {
                     it.isVisible = false
                 }
+                hdTexturePreferences.forEach {
+                    it.isVisible = true
+                }
             }
             VideoRenderer.VULKAN -> {
                 threadedRendererPreferences.forEach {
@@ -713,6 +734,9 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
                     it.isVisible = true
                 }
                 vulkanRendererPreferences.forEach {
+                    it.isVisible = true
+                }
+                hdTexturePreferences.forEach {
                     it.isVisible = true
                 }
             }
