@@ -1512,6 +1512,11 @@ void VulkanRenderer3D::refreshHDTextureSampling()
 
     // respecialize the raster pipelines; layouts, render passes and targets
     // remain valid so only the pipelines themselves are rebuilt
+    Log(
+        LogLevel::Warn,
+        "VulkanRenderer3D: respecializing raster pipelines (hdTextureSampling=%d)",
+        hdSampling ? 1 : 0
+    );
     (void)waitForDeviceIdle("hd texture sampling change");
     destroyTriRasterPipelines();
     destroyGraphicsRasterPipelines();
