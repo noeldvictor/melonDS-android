@@ -28,6 +28,9 @@ layout(constant_id = 1) const uint PIPELINE_EXPECT_WBUFFER_MODE = WBUFFER_MODE_A
 layout(constant_id = 2) const uint PIPELINE_EXPECT_SHADE_MODE = SHADE_MODE_ANY;
 layout(constant_id = 3) const uint PIPELINE_EXPECT_TEXTURE_MODE = TEXTURE_MODE_ANY;
 layout(constant_id = 4) const uint PIPELINE_EXPECT_TRANSLUCENCY_MODE = TRANSLUCENCY_MODE_ANY;
+// HD texture sampling is opt-in per pipeline so drivers can prune the
+// scaled sampling path entirely while it is unused.
+layout(constant_id = 5) const uint PIPELINE_HD_TEXTURE_SAMPLING = 0u;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -490,7 +493,7 @@ Color6A5 sampleTexture(in Triangle tri, in vec3 bary)
     bool mirrorS = (tri.texParam & (1u << 18u)) != 0u;
     bool mirrorT = (tri.texParam & (1u << 19u)) != 0u;
 
-    if (texelScale > 1u)
+    if (PIPELINE_HD_TEXTURE_SAMPLING != 0u && texelScale > 1u)
     {
         int scale = int(texelScale);
         int fixedX = (int(floor(interpU)) * scale) - 8;

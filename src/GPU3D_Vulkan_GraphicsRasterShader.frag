@@ -29,6 +29,9 @@ const uint MAX_TEXTURE_DESCRIPTORS = 128u;
 layout(constant_id = 0) const uint DEPTH_INTERPOLATION_MODE = 0u;
 layout(constant_id = 1) const uint TRANSLUCENT_PASS = 0u;
 layout(constant_id = 2) const uint EDGE_MARK_PASS = 0u;
+// HD texture sampling is opt-in per pipeline so drivers can prune the
+// scaled sampling path entirely while it is unused.
+layout(constant_id = 3) const uint HD_TEXTURE_SAMPLING = 0u;
 
 layout(set = 0, binding = 1) uniform usampler2DArray texArrays[MAX_TEXTURE_DESCRIPTORS];
 
@@ -518,7 +521,7 @@ Color6A5 sampleTexture(uint polyAttr)
     }
 #endif
 
-    if (texelScale > 1u)
+    if (HD_TEXTURE_SAMPLING != 0u && texelScale > 1u)
     {
         int scale = int(texelScale);
         vec2 hdCoord = (texcoord * float(scale)) - vec2(0.5);

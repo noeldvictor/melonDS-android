@@ -55,8 +55,8 @@ public:
     void SetupAccelFrame() override;
     void PrepareCaptureFrame() override;
     void BeginCaptureFrame() override;
-    void SetTexPack(HDTexPack* pack) { Texcache.SetTexPack(pack); }
-    void SetHDTextureFilter(int scale, int mode) { Texcache.SetHDTextureFilter(scale, mode); }
+    void SetTexPack(HDTexPack* pack);
+    void SetHDTextureFilter(int scale, int mode);
     void SetCaptureScreenSwapHint(bool screenSwap) override;
     [[nodiscard]] bool UsesStructured2DMetadata() const noexcept override { return ActiveBackendMode == BackendMode::GraphicsHardware; }
     void Blit(const GPU& gpu) override;
@@ -365,7 +365,17 @@ private:
     bool createDescriptorObjects();
     bool createGraphicsDescriptorObjects();
     bool createComputePipeline();
+    bool createComputePipelineFromSpirv(
+        const unsigned char* spirvBytes,
+        size_t spirvLength,
+        const char* pipelineName,
+        const VkSpecializationInfo* specializationInfo,
+        VkPipeline* outPipeline);
+    bool createTriRasterPipelines();
+    void destroyTriRasterPipelines();
     bool createGraphicsPipelines();
+    void destroyGraphicsRasterPipelines();
+    void refreshHDTextureSampling();
     bool createPipelineCache(TextureSamplingPath samplingPath);
     void savePipelineCache();
     std::string buildPipelineCacheFileName(TextureSamplingPath samplingPath) const;
@@ -560,6 +570,9 @@ private:
     VkDescriptorSet GraphicsDescriptorSet = VK_NULL_HANDLE;
     GraphicsDescriptorSetCache GraphicsDescriptorCache{};
     TextureSamplingPath ActiveTextureSamplingPath = TextureSamplingPath::CompatDynamicUniform;
+    // whether the current raster pipelines were specialized with HD texture
+    // sampling; flips (rarely) with the filter setting or texture pack scale
+    bool PipelinesUseHDSampling = false;
     BackendMode RequestedBackendMode = BackendMode::GraphicsHardware;
     BackendMode ActiveBackendMode = BackendMode::GraphicsHardware;
     bool UseSimplePipeline = true;

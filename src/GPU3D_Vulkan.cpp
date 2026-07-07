@@ -1488,6 +1488,42 @@ void VulkanRenderer3D::SetBackendMode(BackendMode mode) noexcept
     }
 }
 
+void VulkanRenderer3D::SetTexPack(HDTexPack* pack)
+{
+    Texcache.SetTexPack(pack);
+    refreshHDTextureSampling();
+}
+
+void VulkanRenderer3D::SetHDTextureFilter(int scale, int mode)
+{
+    Texcache.SetHDTextureFilter(scale, mode);
+    refreshHDTextureSampling();
+}
+
+void VulkanRenderer3D::refreshHDTextureSampling()
+{
+    const bool hdSampling = Texcache.GetHDTextureScale() > 1;
+    if (hdSampling == PipelinesUseHDSampling)
+        return;
+
+    PipelinesUseHDSampling = hdSampling;
+    if (!Initialized)
+        return;
+
+    // respecialize the raster pipelines; layouts, render passes and targets
+    // remain valid so only the pipelines themselves are rebuilt
+    (void)waitForDeviceIdle("hd texture sampling change");
+    destroyTriRasterPipelines();
+    destroyGraphicsRasterPipelines();
+    if (!createTriRasterPipelines() || !createGraphicsPipelines())
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to rebuild raster pipelines for HD texture sampling");
+        destroyVulkan();
+        Initialized = false;
+        InitFailed = true;
+    }
+}
+
 bool VulkanRenderer3D::IsThreaded() const noexcept
 {
     return Threaded;
@@ -1743,14 +1779,7 @@ void VulkanRenderer3D::destroyVulkan()
         DepthBlendPipeline = VK_NULL_HANDLE;
     }
 
-    for (VkPipeline& rasterPipeline : RasterPipelines)
-    {
-        if (rasterPipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, rasterPipeline, nullptr);
-            rasterPipeline = VK_NULL_HANDLE;
-        }
-    }
+    destroyTriRasterPipelines();
 
     for (VkPipeline& finalPipeline : FinalPipelines)
     {
@@ -1767,178 +1796,7 @@ void VulkanRenderer3D::destroyVulkan()
         CaptureLineExportPipeline = VK_NULL_HANDLE;
     }
 
-    if (GraphicsFinalFogPipeline != VK_NULL_HANDLE)
-    {
-        vkDestroyPipeline(Device, GraphicsFinalFogPipeline, nullptr);
-        GraphicsFinalFogPipeline = VK_NULL_HANDLE;
-    }
-
-    if (GraphicsFinalEdgePipeline != VK_NULL_HANDLE)
-    {
-        vkDestroyPipeline(Device, GraphicsFinalEdgePipeline, nullptr);
-        GraphicsFinalEdgePipeline = VK_NULL_HANDLE;
-    }
-    if (GraphicsFinalEdgeFogPipeline != VK_NULL_HANDLE)
-    {
-        vkDestroyPipeline(Device, GraphicsFinalEdgeFogPipeline, nullptr);
-        GraphicsFinalEdgeFogPipeline = VK_NULL_HANDLE;
-    }
-
-    if (GraphicsClearPipeline != VK_NULL_HANDLE)
-    {
-        vkDestroyPipeline(Device, GraphicsClearPipeline, nullptr);
-        GraphicsClearPipeline = VK_NULL_HANDLE;
-    }
-
-    if (GraphicsStencilBitClearPipeline != VK_NULL_HANDLE)
-    {
-        vkDestroyPipeline(Device, GraphicsStencilBitClearPipeline, nullptr);
-        GraphicsStencilBitClearPipeline = VK_NULL_HANDLE;
-    }
-
-    for (VkPipeline& pipeline : GraphicsShadowBlendBgZeroPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsShadowBlendPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsEdgeMarkPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsShadowClearPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsShadowMaskBgZeroPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsShadowMaskPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsTranslucentPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsBgZeroTranslucentPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaquePipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaqueFragmentDepthPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaqueUiOverlayPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaqueFastModulatePipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateToonPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaqueFastModulatePlainPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateOpaqueAlphaToonPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
-
-    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateOpaqueAlphaPlainPipelines)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(Device, pipeline, nullptr);
-            pipeline = VK_NULL_HANDLE;
-        }
-    }
+    destroyGraphicsRasterPipelines();
 
     savePipelineCache();
     if (ComputePipelineCache != VK_NULL_HANDLE)
@@ -3675,151 +3533,63 @@ void VulkanRenderer3D::savePipelineCache()
     );
 }
 
-bool VulkanRenderer3D::createComputePipeline()
+bool VulkanRenderer3D::createComputePipelineFromSpirv(
+    const unsigned char* spirvBytes,
+    size_t spirvLength,
+    const char* pipelineName,
+    const VkSpecializationInfo* specializationInfo,
+    VkPipeline* outPipeline)
 {
-    if (melonDS_gpu3d_vulkan_interp_spans_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_bin_combined_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_calc_work_offsets_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_sort_work_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_tri_raster_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_tri_raster_base_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_tri_raster_compat_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_depth_blend_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_final_pass_comp_spv_len == 0
-        || melonDS_gpu3d_vulkan_capture_line_export_comp_spv_len == 0)
+    std::vector<u32> shaderWords((spirvLength + sizeof(u32) - 1u) / sizeof(u32));
+    std::memcpy(shaderWords.data(), spirvBytes, spirvLength);
+
+    VkShaderModuleCreateInfo shaderCreateInfo{};
+    shaderCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderCreateInfo.codeSize = spirvLength;
+    shaderCreateInfo.pCode = shaderWords.data();
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(Device, &shaderCreateInfo, nullptr, &shaderModule) != VK_SUCCESS)
     {
-        Log(LogLevel::Error, "VulkanRenderer3D: empty SPIR-V blob(s)");
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create %s shader module", pipelineName);
         return false;
     }
 
+    VkPipelineShaderStageCreateInfo shaderStage{};
+    shaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    shaderStage.module = shaderModule;
+    shaderStage.pName = "main";
+    shaderStage.pSpecializationInfo = specializationInfo;
+
+    VkComputePipelineCreateInfo pipelineCreateInfo{};
+    pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineCreateInfo.stage = shaderStage;
+    pipelineCreateInfo.layout = PipelineLayout;
+
+    const VkResult pipelineResult = vkCreateComputePipelines(
+        Device,
+        ComputePipelineCache,
+        1,
+        &pipelineCreateInfo,
+        nullptr,
+        outPipeline
+    );
+
+    vkDestroyShaderModule(Device, shaderModule, nullptr);
+
+    if (pipelineResult != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create %s compute pipeline (%d)", pipelineName, static_cast<int>(pipelineResult));
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanRenderer3D::createTriRasterPipelines()
+{
     const TextureSamplingPath samplingPath = ActiveTextureSamplingPath;
-    if (!createPipelineCache(samplingPath))
-    {
-        Log(
-            LogLevel::Warn,
-            "VulkanRenderer3D: pipeline cache unavailable, continuing without persistent cache"
-        );
-    }
-
-    VkPushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(RasterPushConstants);
-
-    VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{};
-    pipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutCreateInfo.setLayoutCount = 1;
-    pipelineLayoutCreateInfo.pSetLayouts = &DescriptorSetLayout;
-    pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
-    pipelineLayoutCreateInfo.pPushConstantRanges = &pushConstantRange;
-
-    if (vkCreatePipelineLayout(Device, &pipelineLayoutCreateInfo, nullptr, &PipelineLayout) != VK_SUCCESS)
-    {
-        Log(LogLevel::Error, "VulkanRenderer3D: failed to create pipeline layout");
-        return false;
-    }
-
-    const auto createPipelineFromSpirv = [&](const unsigned char* spirvBytes,
-                                             size_t spirvLength,
-                                             const char* pipelineName,
-                                             const VkSpecializationInfo* specializationInfo,
-                                             VkPipeline* outPipeline) -> bool {
-        std::vector<u32> shaderWords((spirvLength + sizeof(u32) - 1u) / sizeof(u32));
-        std::memcpy(shaderWords.data(), spirvBytes, spirvLength);
-
-        VkShaderModuleCreateInfo shaderCreateInfo{};
-        shaderCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        shaderCreateInfo.codeSize = spirvLength;
-        shaderCreateInfo.pCode = shaderWords.data();
-
-        VkShaderModule shaderModule = VK_NULL_HANDLE;
-        if (vkCreateShaderModule(Device, &shaderCreateInfo, nullptr, &shaderModule) != VK_SUCCESS)
-        {
-            Log(LogLevel::Error, "VulkanRenderer3D: failed to create %s shader module", pipelineName);
-            return false;
-        }
-
-        VkPipelineShaderStageCreateInfo shaderStage{};
-        shaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        shaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        shaderStage.module = shaderModule;
-        shaderStage.pName = "main";
-        shaderStage.pSpecializationInfo = specializationInfo;
-
-        VkComputePipelineCreateInfo pipelineCreateInfo{};
-        pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipelineCreateInfo.stage = shaderStage;
-        pipelineCreateInfo.layout = PipelineLayout;
-
-        const VkResult pipelineResult = vkCreateComputePipelines(
-            Device,
-            ComputePipelineCache,
-            1,
-            &pipelineCreateInfo,
-            nullptr,
-            outPipeline
-        );
-
-        vkDestroyShaderModule(Device, shaderModule, nullptr);
-
-        if (pipelineResult != VK_SUCCESS)
-        {
-            Log(LogLevel::Error, "VulkanRenderer3D: failed to create %s compute pipeline (%d)", pipelineName, static_cast<int>(pipelineResult));
-            return false;
-        }
-
-        return true;
-    };
-
-    if (!createPipelineFromSpirv(
-            melonDS_gpu3d_vulkan_interp_spans_comp_spv,
-            melonDS_gpu3d_vulkan_interp_spans_comp_spv_len,
-            "interp_spans",
-            nullptr,
-            &InterpPipeline))
-    {
-        return false;
-    }
-
-    if (!createPipelineFromSpirv(
-            melonDS_gpu3d_vulkan_bin_combined_comp_spv,
-            melonDS_gpu3d_vulkan_bin_combined_comp_spv_len,
-            "bin",
-            nullptr,
-            &BinPipeline))
-    {
-        return false;
-    }
-
-    if (!createPipelineFromSpirv(
-            melonDS_gpu3d_vulkan_calc_work_offsets_comp_spv,
-            melonDS_gpu3d_vulkan_calc_work_offsets_comp_spv_len,
-            "work_offsets",
-            nullptr,
-            &WorkOffsetsPipeline))
-    {
-        return false;
-    }
-
-    if (!createPipelineFromSpirv(
-            melonDS_gpu3d_vulkan_sort_work_comp_spv,
-            melonDS_gpu3d_vulkan_sort_work_comp_spv_len,
-            "sort",
-            nullptr,
-            &SortPipeline))
-    {
-        return false;
-    }
-
-    if (!createPipelineFromSpirv(
-            melonDS_gpu3d_vulkan_depth_blend_comp_spv,
-            melonDS_gpu3d_vulkan_depth_blend_comp_spv_len,
-            "depth_blend",
-            nullptr,
-            &DepthBlendPipeline))
-    {
-        return false;
-    }
 
     struct RasterSpecializationData
     {
@@ -3828,9 +3598,10 @@ bool VulkanRenderer3D::createComputePipeline()
         u32 expectShadeMode;
         u32 expectTextureMode;
         u32 expectTranslucencyMode;
+        u32 hdTextureSampling;
     };
 
-    std::array<VkSpecializationMapEntry, 5> rasterSpecializationEntries{};
+    std::array<VkSpecializationMapEntry, 6> rasterSpecializationEntries{};
     rasterSpecializationEntries[0].constantID = 0;
     rasterSpecializationEntries[0].offset = offsetof(RasterSpecializationData, sceneMode);
     rasterSpecializationEntries[0].size = sizeof(u32);
@@ -3846,6 +3617,9 @@ bool VulkanRenderer3D::createComputePipeline()
     rasterSpecializationEntries[4].constantID = 4;
     rasterSpecializationEntries[4].offset = offsetof(RasterSpecializationData, expectTranslucencyMode);
     rasterSpecializationEntries[4].size = sizeof(u32);
+    rasterSpecializationEntries[5].constantID = 5;
+    rasterSpecializationEntries[5].offset = offsetof(RasterSpecializationData, hdTextureSampling);
+    rasterSpecializationEntries[5].size = sizeof(u32);
 
     const char* rasterSceneModeNames[] = {"dense_no_boundary", "dense_boundary", "sparse_active"};
     const char* rasterWModeNames[] = {"z", "w", "any"};
@@ -3911,6 +3685,7 @@ bool VulkanRenderer3D::createComputePipeline()
             rasterSpecializationData.expectShadeMode = rasterShadeMode;
             rasterSpecializationData.expectTextureMode = rasterTextureMode;
             rasterSpecializationData.expectTranslucencyMode = rasterTranslucencyMode;
+            rasterSpecializationData.hdTextureSampling = PipelinesUseHDSampling ? 1u : 0u;
 
             VkSpecializationInfo rasterSpecializationInfo{};
             rasterSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
@@ -3937,7 +3712,7 @@ bool VulkanRenderer3D::createComputePipeline()
                 rasterTranslucencyModeNames[rasterTranslucencyMode]
             );
 
-            if (!createPipelineFromSpirv(
+            if (!createComputePipelineFromSpirv(
                     triRasterSpirv,
                     triRasterSpirvLen,
                     rasterPipelineName,
@@ -3948,6 +3723,118 @@ bool VulkanRenderer3D::createComputePipeline()
             }
         }
     }
+
+    return true;
+}
+
+void VulkanRenderer3D::destroyTriRasterPipelines()
+{
+    for (VkPipeline& rasterPipeline : RasterPipelines)
+    {
+        if (rasterPipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, rasterPipeline, nullptr);
+            rasterPipeline = VK_NULL_HANDLE;
+        }
+    }
+}
+
+bool VulkanRenderer3D::createComputePipeline()
+{
+    if (melonDS_gpu3d_vulkan_interp_spans_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_bin_combined_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_calc_work_offsets_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_sort_work_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_tri_raster_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_tri_raster_base_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_tri_raster_compat_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_depth_blend_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_final_pass_comp_spv_len == 0
+        || melonDS_gpu3d_vulkan_capture_line_export_comp_spv_len == 0)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: empty SPIR-V blob(s)");
+        return false;
+    }
+
+    const TextureSamplingPath samplingPath = ActiveTextureSamplingPath;
+    if (!createPipelineCache(samplingPath))
+    {
+        Log(
+            LogLevel::Warn,
+            "VulkanRenderer3D: pipeline cache unavailable, continuing without persistent cache"
+        );
+    }
+
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(RasterPushConstants);
+
+    VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{};
+    pipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutCreateInfo.setLayoutCount = 1;
+    pipelineLayoutCreateInfo.pSetLayouts = &DescriptorSetLayout;
+    pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
+    pipelineLayoutCreateInfo.pPushConstantRanges = &pushConstantRange;
+
+    if (vkCreatePipelineLayout(Device, &pipelineLayoutCreateInfo, nullptr, &PipelineLayout) != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "VulkanRenderer3D: failed to create pipeline layout");
+        return false;
+    }
+
+    if (!createComputePipelineFromSpirv(
+            melonDS_gpu3d_vulkan_interp_spans_comp_spv,
+            melonDS_gpu3d_vulkan_interp_spans_comp_spv_len,
+            "interp_spans",
+            nullptr,
+            &InterpPipeline))
+    {
+        return false;
+    }
+
+    if (!createComputePipelineFromSpirv(
+            melonDS_gpu3d_vulkan_bin_combined_comp_spv,
+            melonDS_gpu3d_vulkan_bin_combined_comp_spv_len,
+            "bin",
+            nullptr,
+            &BinPipeline))
+    {
+        return false;
+    }
+
+    if (!createComputePipelineFromSpirv(
+            melonDS_gpu3d_vulkan_calc_work_offsets_comp_spv,
+            melonDS_gpu3d_vulkan_calc_work_offsets_comp_spv_len,
+            "work_offsets",
+            nullptr,
+            &WorkOffsetsPipeline))
+    {
+        return false;
+    }
+
+    if (!createComputePipelineFromSpirv(
+            melonDS_gpu3d_vulkan_sort_work_comp_spv,
+            melonDS_gpu3d_vulkan_sort_work_comp_spv_len,
+            "sort",
+            nullptr,
+            &SortPipeline))
+    {
+        return false;
+    }
+
+    if (!createComputePipelineFromSpirv(
+            melonDS_gpu3d_vulkan_depth_blend_comp_spv,
+            melonDS_gpu3d_vulkan_depth_blend_comp_spv_len,
+            "depth_blend",
+            nullptr,
+            &DepthBlendPipeline))
+    {
+        return false;
+    }
+
+    if (!createTriRasterPipelines())
+        return false;
 
     struct FinalSpecializationData
     {
@@ -3982,7 +3869,7 @@ bool VulkanRenderer3D::createComputePipeline()
 
         char finalPipelineName[32]{};
         std::snprintf(finalPipelineName, sizeof(finalPipelineName), "final_%u", finalPipelineIndex);
-        if (!createPipelineFromSpirv(
+        if (!createComputePipelineFromSpirv(
                 melonDS_gpu3d_vulkan_final_pass_comp_spv,
                 melonDS_gpu3d_vulkan_final_pass_comp_spv_len,
                 finalPipelineName,
@@ -3993,7 +3880,7 @@ bool VulkanRenderer3D::createComputePipeline()
         }
     }
 
-    if (!createPipelineFromSpirv(
+    if (!createComputePipelineFromSpirv(
             melonDS_gpu3d_vulkan_capture_line_export_comp_spv,
             melonDS_gpu3d_vulkan_capture_line_export_comp_spv_len,
             "capture_line_export",
@@ -4004,6 +3891,182 @@ bool VulkanRenderer3D::createComputePipeline()
     }
 
     return true;
+}
+
+void VulkanRenderer3D::destroyGraphicsRasterPipelines()
+{
+    if (GraphicsFinalFogPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsFinalFogPipeline, nullptr);
+        GraphicsFinalFogPipeline = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsFinalEdgePipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsFinalEdgePipeline, nullptr);
+        GraphicsFinalEdgePipeline = VK_NULL_HANDLE;
+    }
+    if (GraphicsFinalEdgeFogPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsFinalEdgeFogPipeline, nullptr);
+        GraphicsFinalEdgeFogPipeline = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsClearPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsClearPipeline, nullptr);
+        GraphicsClearPipeline = VK_NULL_HANDLE;
+    }
+
+    if (GraphicsStencilBitClearPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(Device, GraphicsStencilBitClearPipeline, nullptr);
+        GraphicsStencilBitClearPipeline = VK_NULL_HANDLE;
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowBlendBgZeroPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowBlendPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsEdgeMarkPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowClearPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowMaskBgZeroPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsShadowMaskPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsTranslucentPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsBgZeroTranslucentPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaquePipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFragmentDepthPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueUiOverlayPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulatePipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateToonPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulatePlainPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateOpaqueAlphaToonPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+
+    for (VkPipeline& pipeline : GraphicsOpaqueFastModulateOpaqueAlphaPlainPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(Device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
 }
 
 bool VulkanRenderer3D::createGraphicsPipelines()
@@ -4043,7 +4106,8 @@ bool VulkanRenderer3D::createGraphicsPipelines()
     pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
     pipelineLayoutCreateInfo.pPushConstantRanges = &pushConstantRange;
 
-    if (vkCreatePipelineLayout(Device, &pipelineLayoutCreateInfo, nullptr, &GraphicsPipelineLayout) != VK_SUCCESS)
+    if (GraphicsPipelineLayout == VK_NULL_HANDLE
+        && vkCreatePipelineLayout(Device, &pipelineLayoutCreateInfo, nullptr, &GraphicsPipelineLayout) != VK_SUCCESS)
     {
         Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics pipeline layout");
         return false;
@@ -4058,7 +4122,8 @@ bool VulkanRenderer3D::createGraphicsPipelines()
     samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerCreateInfo.maxLod = 0.0f;
-    if (vkCreateSampler(Device, &samplerCreateInfo, nullptr, &GraphicsAttachmentSampler) != VK_SUCCESS)
+    if (GraphicsAttachmentSampler == VK_NULL_HANDLE
+        && vkCreateSampler(Device, &samplerCreateInfo, nullptr, &GraphicsAttachmentSampler) != VK_SUCCESS)
     {
         Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics attachment sampler");
         return false;
@@ -4142,7 +4207,8 @@ bool VulkanRenderer3D::createGraphicsPipelines()
     rasterRenderPassCreateInfo.dependencyCount = static_cast<u32>(rasterDependencies.size());
     rasterRenderPassCreateInfo.pDependencies = rasterDependencies.data();
 
-    if (vkCreateRenderPass(Device, &rasterRenderPassCreateInfo, nullptr, &GraphicsRasterRenderPass) != VK_SUCCESS)
+    if (GraphicsRasterRenderPass == VK_NULL_HANDLE
+        && vkCreateRenderPass(Device, &rasterRenderPassCreateInfo, nullptr, &GraphicsRasterRenderPass) != VK_SUCCESS)
     {
         Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics raster render pass");
         return false;
@@ -4187,7 +4253,8 @@ bool VulkanRenderer3D::createGraphicsPipelines()
     finalRenderPassCreateInfo.dependencyCount = static_cast<u32>(finalDependencies.size());
     finalRenderPassCreateInfo.pDependencies = finalDependencies.data();
 
-    if (vkCreateRenderPass(Device, &finalRenderPassCreateInfo, nullptr, &GraphicsFinalRenderPass) != VK_SUCCESS)
+    if (GraphicsFinalRenderPass == VK_NULL_HANDLE
+        && vkCreateRenderPass(Device, &finalRenderPassCreateInfo, nullptr, &GraphicsFinalRenderPass) != VK_SUCCESS)
     {
         Log(LogLevel::Error, "VulkanRenderer3D: failed to create graphics final render pass");
         return false;
@@ -4554,12 +4621,14 @@ bool VulkanRenderer3D::createGraphicsPipelines()
         u32 depthInterpolationMode;
         u32 translucentPass;
         u32 edgeMarkPass;
+        u32 hdTextureSampling;
     };
 
-    std::array<VkSpecializationMapEntry, 3> rasterSpecializationEntries{};
+    std::array<VkSpecializationMapEntry, 4> rasterSpecializationEntries{};
     rasterSpecializationEntries[0] = {0u, offsetof(RasterFragmentSpecialization, depthInterpolationMode), sizeof(u32)};
     rasterSpecializationEntries[1] = {1u, offsetof(RasterFragmentSpecialization, translucentPass), sizeof(u32)};
     rasterSpecializationEntries[2] = {2u, offsetof(RasterFragmentSpecialization, edgeMarkPass), sizeof(u32)};
+    rasterSpecializationEntries[3] = {3u, offsetof(RasterFragmentSpecialization, hdTextureSampling), sizeof(u32)};
 
     struct NoColorFragmentSpecialization
     {
@@ -4621,6 +4690,7 @@ bool VulkanRenderer3D::createGraphicsPipelines()
             opaqueSpecializationData.depthInterpolationMode = wMode;
             opaqueSpecializationData.translucentPass = 0u;
             opaqueSpecializationData.edgeMarkPass = 0u;
+            opaqueSpecializationData.hdTextureSampling = PipelinesUseHDSampling ? 1u : 0u;
 
             VkSpecializationInfo opaqueSpecializationInfo{};
             opaqueSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
@@ -4782,6 +4852,7 @@ bool VulkanRenderer3D::createGraphicsPipelines()
                     translucentSpecializationData.depthInterpolationMode = wMode;
                     translucentSpecializationData.translucentPass = 1u;
                     translucentSpecializationData.edgeMarkPass = 0u;
+                    translucentSpecializationData.hdTextureSampling = PipelinesUseHDSampling ? 1u : 0u;
 
                     VkSpecializationInfo translucentSpecializationInfo{};
                     translucentSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
@@ -4931,6 +5002,7 @@ bool VulkanRenderer3D::createGraphicsPipelines()
         edgeMarkSpecializationData.depthInterpolationMode = wMode;
         edgeMarkSpecializationData.translucentPass = 0u;
         edgeMarkSpecializationData.edgeMarkPass = 1u;
+        edgeMarkSpecializationData.hdTextureSampling = PipelinesUseHDSampling ? 1u : 0u;
 
         VkSpecializationInfo edgeMarkSpecializationInfo{};
         edgeMarkSpecializationInfo.mapEntryCount = static_cast<u32>(rasterSpecializationEntries.size());
