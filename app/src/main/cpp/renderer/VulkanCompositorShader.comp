@@ -2,6 +2,17 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+// Per-producer 2D filter modes are specialization constants so the
+// driver drops every unused filter path at pipeline creation; some
+// mobile shader compilers cannot hold all fourteen modes live at once.
+layout(constant_id = 0) const uint OBJ_FILTER_MODE = 0u;
+layout(constant_id = 1) const uint BG_FILTER_MODE = 0u;
+
+bool filterModeUsed(uint mode)
+{
+    return OBJ_FILTER_MODE == mode || BG_FILTER_MODE == mode;
+}
+
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outImage;
 layout(set = 0, binding = 1, rgba8) uniform readonly image2D image3dInput;
 layout(set = 0, binding = 4, rgba8) uniform readonly image2D image3dPreviousTopInput;
@@ -46,8 +57,6 @@ layout(push_constant) uniform PushConsts
     uint bottomStructuredHandoffNoCurrent3d;
     uint topStructuredHandoffSuppress3d;
     uint bottomStructuredHandoffSuppress3d;
-    uint objFilterMode;
-    uint bgFilterMode;
 } pc;
 
 const uint kMetaFlagRegularCaptureUses3d = 1u << 21u;
@@ -596,27 +605,29 @@ ivec2 HeavyFilterQuadrant(vec2 subpos)
 
 vec4 HeavyFilterCorner(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel, uint mode)
 {
-    if (mode == 4u)
+    if (filterModeUsed(4u) && mode == 4u)
         return HQ2xLiteTexel(b, d, e, f, h, subpixel);
-    if (mode == 5u)
+    if (filterModeUsed(5u) && mode == 5u)
         return TwoXSaILiteTexel(b, d, e, f, h, subpixel);
-    if (mode == 6u)
+    if (filterModeUsed(6u) && mode == 6u)
         return SuperEagleLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    if (mode == 7u)
+    if (filterModeUsed(7u) && mode == 7u)
         return MMPXLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    if (mode == 8u)
+    if (filterModeUsed(8u) && mode == 8u)
         return Anime4KLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    if (mode == 9u)
+    if (filterModeUsed(9u) && mode == 9u)
         return SuperSAIStrongTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    if (mode == 10u)
+    if (filterModeUsed(10u) && mode == 10u)
         return SuperEagleSmoothTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    if (mode == 11u)
+    if (filterModeUsed(11u) && mode == 11u)
         return CrispGradientTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    if (mode == 12u)
+    if (filterModeUsed(12u) && mode == 12u)
         return CrispEdgeAATexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    if (mode == 13u)
+    if (filterModeUsed(13u) && mode == 13u)
         return ScaleFXLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-    return Scale2xTexel(b, d, e, f, h, subpixel);
+    if (filterModeUsed(3u))
+        return Scale2xTexel(b, d, e, f, h, subpixel);
+    return e;
 }
 
 vec4 HeavyFilterTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, vec2 subpos, uint scale, uint mode)
@@ -645,9 +656,9 @@ uint packedHeavyFilterMode(Rgba6 color)
     if (isPacked3dPlaceholder(color))
         return 0u;
     if ((color.a & 0x90) != 0)
-        return pc.objFilterMode;
+        return OBJ_FILTER_MODE;
     if ((color.a & 0x2F) != 0)
-        return pc.bgFilterMode;
+        return BG_FILTER_MODE;
     return 0u;
 }
 
@@ -830,7 +841,7 @@ Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale, 
     if (safeScale <= 1u) \
         return nearest; \
     uint heavyMode = displayMode == 1 ? packedHeavyFilterMode(nearest) : 0u; \
-    if (heavyMode >= 3u) \
+    if ((OBJ_FILTER_MODE >= 3u || BG_FILTER_MODE >= 3u) && heavyMode >= 3u) \
     { \
         int xm = max(sourceX - 1, 0); \
         int xp = min(sourceX + 1, 255); \
@@ -855,7 +866,8 @@ Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale, 
         vec4 filtered = HeavyFilterTexel(a, b, c, d, e, f, g, h, px_i, subpos, safeScale, heavyMode); \
         return vec3ToColor6(clamp(filtered.rgb, vec3(0.0), vec3(1.0)) * 63.0, nearest.a); \
     } \
-    bool producerSmooth = heavyMode == 1u || heavyMode == 2u; \
+    bool producerSmooth = (filterModeUsed(1u) || filterModeUsed(2u)) \
+        && (heavyMode == 1u || heavyMode == 2u); \
     if (!producerSmooth && pc.filtering != kFilterLinear) \
         return nearest; \
     float dsXFloat = (float(scaledX) + 0.5) / float(safeScale) - 0.5; \
@@ -866,7 +878,7 @@ Rgba6 FUNC_NAME(int sourceX, int dsY, int scaledX, int scaledY, uint safeScale, 
     int y1 = min(y0 + 1, 191); \
     float tx = clamp(dsXFloat - float(x0), 0.0, 1.0); \
     float ty = clamp(dsYFloat - float(y0), 0.0, 1.0); \
-    if (heavyMode == 2u) \
+    if (filterModeUsed(2u) && heavyMode == 2u) \
     { \
         tx = tx * tx * (3.0 - (2.0 * tx)); \
         ty = ty * ty * (3.0 - (2.0 * ty)); \

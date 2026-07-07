@@ -140,8 +140,6 @@ struct VulkanCompositionInputs
     u32 rendererWidth{};
     u32 rendererHeight{};
     VulkanFilterMode filtering{VulkanFilterMode::Nearest};
-    u32 objFilterMode{};
-    u32 bgFilterMode{};
     bool previousTopSourceValid{};
     bool previousBottomSourceValid{};
     bool capture3dSourceValid{};
@@ -230,11 +228,9 @@ public:
     [[nodiscard]] bool isInitialized() const { return initialized; }
 
     bool ensureFrameResources(Frame* frame, u32 width, u32 height);
-    void setPacked2DFilterModes(u32 objMode, u32 bgMode)
-    {
-        objFilterMode = objMode;
-        bgFilterMode = bgMode;
-    }
+    // The modes are pipeline specialization constants; changing them queues a
+    // compositor pipeline rebuild at the next safe frame boundary.
+    void setPacked2DFilterModes(u32 objMode, u32 bgMode);
     void invalidateTemporalHistory();
     void clearStructuredCaptureHistory();
     void releaseTemporalFrameReferences();
@@ -319,8 +315,6 @@ private:
         u32 bottomStructuredHandoffNoCurrent3d;
         u32 topStructuredHandoffSuppress3d;
         u32 bottomStructuredHandoffSuppress3d;
-        u32 objFilterMode;
-        u32 bgFilterMode;
     };
 
     struct AccumulatePushConstants
@@ -422,6 +416,8 @@ private:
     bool createSyncObjects();
     bool createCommandObjects();
     bool createCompositorResources();
+    bool createCompositorPipeline();
+    bool refreshCompositorPipelineIfNeeded();
     bool createTimestampQueryPool(VkQueryPool& queryPool);
     void destroyTimestampQueryPool(VkQueryPool& queryPool);
     void destroyCompositorResources();
@@ -534,6 +530,7 @@ private:
 
     u32 objFilterMode{0};
     u32 bgFilterMode{0};
+    bool compositorPipelineDirty{false};
 
     std::unordered_map<Frame*, FrameResource> resources;
     std::mutex commandPoolLock;

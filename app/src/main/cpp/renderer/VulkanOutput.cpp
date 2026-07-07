@@ -773,6 +773,11 @@ bool VulkanOutput::createCompositorResources()
         return false;
     }
 
+    return createCompositorPipeline();
+}
+
+bool VulkanOutput::createCompositorPipeline()
+{
     if (melonDS_android_vulkan_compositor_comp_spv_len == 0)
     {
         melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: compositor SPIR-V blob is empty");
@@ -794,11 +799,26 @@ bool VulkanOutput::createCompositorResources()
         return false;
     }
 
+    // the 2D filter modes are specialization constants so the driver only
+    // compiles the selected filter paths
+    const std::array<VkSpecializationMapEntry, 2> specializationEntries = {
+        VkSpecializationMapEntry{0u, 0u, sizeof(u32)},
+        VkSpecializationMapEntry{1u, sizeof(u32), sizeof(u32)},
+    };
+    const std::array<u32, 2> specializationData = {objFilterMode, bgFilterMode};
+
+    VkSpecializationInfo specializationInfo{};
+    specializationInfo.mapEntryCount = static_cast<u32>(specializationEntries.size());
+    specializationInfo.pMapEntries = specializationEntries.data();
+    specializationInfo.dataSize = specializationData.size() * sizeof(u32);
+    specializationInfo.pData = specializationData.data();
+
     VkPipelineShaderStageCreateInfo shaderStageCreateInfo{};
     shaderStageCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     shaderStageCreateInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     shaderStageCreateInfo.module = shaderModule;
     shaderStageCreateInfo.pName = "main";
+    shaderStageCreateInfo.pSpecializationInfo = &specializationInfo;
 
     VkComputePipelineCreateInfo computePipelineCreateInfo{};
     computePipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -822,7 +842,40 @@ bool VulkanOutput::createCompositorResources()
         return false;
     }
 
+    compositorPipelineDirty = false;
     return true;
+}
+
+void VulkanOutput::setPacked2DFilterModes(u32 objMode, u32 bgMode)
+{
+    if (objFilterMode == objMode && bgFilterMode == bgMode)
+        return;
+
+    objFilterMode = objMode;
+    bgFilterMode = bgMode;
+    compositorPipelineDirty = true;
+}
+
+bool VulkanOutput::refreshCompositorPipelineIfNeeded()
+{
+    if (!compositorPipelineDirty)
+        return compositorPipeline != VK_NULL_HANDLE;
+
+    // wait until no submitted frame can still reference the old pipeline
+    for (auto& [frame, frameResource] : resources)
+    {
+        (void)frame;
+        if (frameResource.submitFence != VK_NULL_HANDLE)
+            (void)vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, UINT64_MAX);
+    }
+
+    if (compositorPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(device, compositorPipeline, nullptr);
+        compositorPipeline = VK_NULL_HANDLE;
+    }
+
+    return createCompositorPipeline();
 }
 
 void VulkanOutput::destroyCompositorResources()
@@ -4119,8 +4172,6 @@ bool VulkanOutput::buildCompositionInputs(
     outInputs.screenSwap = resource.screenSwap ? 1u : 0u;
     outInputs.scale = static_cast<u32>(scale);
     outInputs.filtering = filtering;
-    outInputs.objFilterMode = objFilterMode;
-    outInputs.bgFilterMode = bgFilterMode;
     outInputs.capture3dSourceValid = resource.hasPreparedCapture3dSource && resource.capture3dBuffer != VK_NULL_HANDLE;
     const bool topUsesCurrentCapture3d = topUsesRegularCapture3d || topUsesVramCapture3d;
     const bool bottomUsesCurrentCapture3d = bottomUsesRegularCapture3d || bottomUsesVramCapture3d;
@@ -4516,6 +4567,9 @@ bool VulkanOutput::dispatchCompositor(
 {
     std::scoped_lock commandLock(commandPoolLock);
 
+    if (!refreshCompositorPipelineIfNeeded())
+        return false;
+
     if (!beginFrameCommand(resource))
         return false;
 
@@ -4737,8 +4791,6 @@ bool VulkanOutput::dispatchCompositor(
     pushConstants.bottomStructuredHandoffNoCurrent3d = inputs.bottomStructuredHandoffNoCurrent3d ? 1u : 0u;
     pushConstants.topStructuredHandoffSuppress3d = inputs.topStructuredHandoffSuppress3d ? 1u : 0u;
     pushConstants.bottomStructuredHandoffSuppress3d = inputs.bottomStructuredHandoffSuppress3d ? 1u : 0u;
-    pushConstants.objFilterMode = inputs.objFilterMode;
-    pushConstants.bgFilterMode = inputs.bgFilterMode;
 
     vkCmdPushConstants(
         resource.commandBuffer,
