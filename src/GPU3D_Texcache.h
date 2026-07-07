@@ -6,6 +6,7 @@
 #include "HDTexPack.h"
 
 #include <assert.h>
+#include <algorithm>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -157,11 +158,33 @@ public:
 
     void SetTexPack(HDTexPack* pack)
     {
-        if (TexPack == pack)
+        u32 packScale = (pack && pack->LoadActive()) ? pack->Scale() : 1;
+        if (TexPack == pack && TexLoader.GetTexPackScale() == packScale)
             return;
 
         TexPack = pack;
+        TexLoader.SetTexPackScale(packScale);
         Reset();
+    }
+
+    bool SetHDTextureFilter(int scale, int mode)
+    {
+        if (!TexLoader.SetHDTextureFilter(scale, mode))
+            return false;
+
+        Reset();
+        return true;
+    }
+
+    u32 GetHDTextureScale() const
+    {
+        // effective stored-texel scale: filter scale and/or texture-pack scale
+        return TexLoader.GetStorageScale();
+    }
+
+    int GetHDTextureFilterMode() const
+    {
+        return TexLoader.GetHDTextureFilterMode();
     }
 
     // Palette hash for compressed 4x4 textures covering only the palette
@@ -297,6 +320,7 @@ public:
         // HD texture pack identity: encoded-bytes texel hash (both VRAM ranges
         // for compressed textures) plus a used-range-only palette hash, so
         // unrelated palette VRAM churn doesn't fork identities.
+        const HDTexPackImage* replacement = nullptr;
         if (TexPack)
         {
             u64 packTexHash = entry.TextureHash[0];
@@ -313,15 +337,7 @@ public:
             if (TexPack->DumpActive())
                 TexPack->DumpTexture(width, height, packTexHash, packPalHash, hasPal, fmt, DecodingBuffer);
 
-            // native-resolution replacements slot straight into the decode
-            // buffer; scaled replacements need renderer-side texel scaling
-            const HDTexPackImage* replacement =
-                TexPack->LookupTexture(width, height, packTexHash, packPalHash, hasPal, fmt);
-            if (replacement && replacement->Width == width && replacement->Height == height)
-            {
-                for (u32 i = 0, n = width * height; i < n; i++)
-                    DecodingBuffer[i] = HDTexPack::RGBA8ToRGB6A5(replacement->RGBA[i]);
-            }
+            replacement = TexPack->LookupTexture(width, height, packTexHash, packPalHash, hasPal, fmt);
         }
 
         auto& texArrays = TexArrays[widthLog2][heightLog2];
@@ -332,7 +348,9 @@ public:
             texArrays.resize(texArrays.size()+1);
             TexHandleT& array = texArrays[texArrays.size()-1];
 
-            u32 layers = std::min<u32>((8*1024*1024) / (width*height*4), 64);
+            const u32 storageScale = TexLoader.GetStorageScale();
+            u32 layers = std::min<u32>((8*1024*1024) / (width*height*4*storageScale*storageScale), 64);
+            layers = std::max<u32>(layers, 1);
 
             // allocate new array texture
             //printf("allocating new layer set for %d %d %d %d\n", width, height, texArrays.size()-1, array.ImageDescriptor);
@@ -349,7 +367,10 @@ public:
 
         entry.Texture = storagePlace;
 
-        TexLoader.UploadTexture(storagePlace.TextureID, width, height, storagePlace.Layer, DecodingBuffer);
+        if (replacement)
+            TexLoader.UploadReplacement(storagePlace.TextureID, width, height, storagePlace.Layer, *replacement);
+        else
+            TexLoader.UploadTexture(storagePlace.TextureID, width, height, storagePlace.Layer, DecodingBuffer);
         //printf("using storage place %d %d | %d %d (%d)\n", width, height, storagePlace.TexArrayIdx, storagePlace.LayerIdx, array.ImageDescriptor);
 
         textureHandle = storagePlace.TextureID;

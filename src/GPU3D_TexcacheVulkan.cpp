@@ -3,6 +3,7 @@
 
 #include "GPU3D_TexcacheVulkan.h"
 
+#include "HDTextureFilter.h"
 #include "Platform.h"
 #include "VulkanContext.h"
 #include "VulkanDispatch.h"
@@ -13,6 +14,29 @@ namespace melonDS
 TexcacheVulkanLoader::TexcacheVulkanLoader()
     : State(std::make_shared<SharedState>())
 {
+}
+
+bool TexcacheVulkanLoader::SetHDTextureFilter(int scale, int mode)
+{
+    const u32 clampedScale = HDTextureFilter::ClampScale(scale);
+    const int clampedMode = HDTextureFilter::ClampMode(mode);
+    if (HDTextureScale == clampedScale && HDTextureFilterMode == clampedMode)
+        return false;
+
+    HDTextureScale = clampedScale;
+    HDTextureFilterMode = clampedMode;
+    UploadBuffer.clear();
+    return true;
+}
+
+void TexcacheVulkanLoader::SetTexPackScale(u32 scale)
+{
+    if (scale < 1) scale = 1;
+    if (scale > 8) scale = 8;
+    if (TexPackScale == scale)
+        return;
+    TexPackScale = scale;
+    UploadBuffer.clear();
 }
 
 TexcacheVulkanLoader::~TexcacheVulkanLoader()
@@ -179,6 +203,7 @@ void TexcacheVulkanLoader::DestroyTextureArray(TextureArray& textureArray)
     textureArray.Width = 0;
     textureArray.Height = 0;
     textureArray.Layers = 0;
+    textureArray.Scale = 1;
 }
 
 TexcacheVulkanLoader::TextureHandle TexcacheVulkanLoader::GenerateTexture(u32 width, u32 height, u32 layers)
@@ -189,18 +214,21 @@ TexcacheVulkanLoader::TextureHandle TexcacheVulkanLoader::GenerateTexture(u32 wi
     if (!EnsureVulkanState())
         return 0;
 
+    const u32 storageScale = GetStorageScale();
+
     TextureArray textureArray{};
     textureArray.Width = width;
     textureArray.Height = height;
     textureArray.Layers = layers;
+    textureArray.Scale = storageScale;
     textureArray.LayerOpaque.assign(layers, 0u);
 
     VkImageCreateInfo imageCreateInfo{};
     imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
     imageCreateInfo.format = VK_FORMAT_R8G8B8A8_UINT;
-    imageCreateInfo.extent.width = width;
-    imageCreateInfo.extent.height = height;
+    imageCreateInfo.extent.width = width * storageScale;
+    imageCreateInfo.extent.height = height * storageScale;
     imageCreateInfo.extent.depth = 1;
     imageCreateInfo.mipLevels = 1;
     imageCreateInfo.arrayLayers = layers;
@@ -277,7 +305,8 @@ TexcacheVulkanLoader::TextureHandle TexcacheVulkanLoader::GenerateTexture(u32 wi
         return 0;
     }
 
-    textureArray.StagingSize = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * sizeof(u32);
+    textureArray.StagingSize = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height)
+        * static_cast<VkDeviceSize>(storageScale) * static_cast<VkDeviceSize>(storageScale) * sizeof(u32);
     VkBufferCreateInfo stagingBufferCreateInfo{};
     stagingBufferCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     stagingBufferCreateInfo.size = textureArray.StagingSize;
@@ -405,12 +434,69 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
     if (textureArray.Width != width || textureArray.Height != height)
         return;
 
-    const size_t layerPixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const u32* texels = static_cast<const u32*>(data);
+    if (textureArray.Scale > 1)
+    {
+        // mode 0 upscales nearest so pack-forced storage scaling stays accurate
+        HDTextureFilter::UpscaleTexture(texels, width, height, textureArray.Scale, HDTextureFilterMode, UploadBuffer);
+        texels = UploadBuffer.data();
+    }
+
+    UploadLayer(textureArray, layer, texels);
+}
+
+void TexcacheVulkanLoader::UploadReplacement(TextureHandle handle, u32 width, u32 height, u32 layer, const HDTexPackImage& img)
+{
+    if (!EnsureVulkanState())
+        return;
+
+    auto it = State->TextureArrays.find(handle);
+    if (it == State->TextureArrays.end())
+        return;
+
+    TextureArray& textureArray = it->second;
+    if (layer >= textureArray.Layers)
+        return;
+    if (textureArray.Width != width || textureArray.Height != height)
+        return;
+
+    const u32 dstW = width * textureArray.Scale;
+    const u32 dstH = height * textureArray.Scale;
+
+    UploadBuffer.resize(static_cast<size_t>(dstW) * dstH);
+    if (img.Width == dstW && img.Height == dstH)
+    {
+        for (size_t i = 0; i < UploadBuffer.size(); i++)
+            UploadBuffer[i] = HDTexPack::RGBA8ToRGB6A5(img.RGBA[i]);
+    }
+    else
+    {
+        // pack scale differs from storage scale: nearest-resample to fit
+        for (u32 y = 0; y < dstH; y++)
+        {
+            const u32 sy = static_cast<u32>(static_cast<u64>(y) * img.Height / dstH);
+            for (u32 x = 0; x < dstW; x++)
+            {
+                const u32 sx = static_cast<u32>(static_cast<u64>(x) * img.Width / dstW);
+                UploadBuffer[x + y * static_cast<size_t>(dstW)] =
+                    HDTexPack::RGBA8ToRGB6A5(img.RGBA[sx + sy * static_cast<size_t>(img.Width)]);
+            }
+        }
+    }
+
+    UploadLayer(textureArray, layer, UploadBuffer.data());
+}
+
+void TexcacheVulkanLoader::UploadLayer(TextureArray& textureArray, u32 layer, const u32* texels)
+{
+    const u32 uploadWidth = textureArray.Width * textureArray.Scale;
+    const u32 uploadHeight = textureArray.Height * textureArray.Scale;
+    const size_t layerPixelCount = static_cast<size_t>(uploadWidth) * static_cast<size_t>(uploadHeight);
+
     bool layerOpaque = true;
-    const u32* sourcePixels = static_cast<const u32*>(data);
     for (size_t pixel = 0; pixel < layerPixelCount; pixel++)
     {
-        if (((sourcePixels[pixel] >> 24u) & 0x1Fu) != 0x1Fu)
+        if (((texels[pixel] >> 24u) & 0x1Fu) != 0x1Fu)
         {
             layerOpaque = false;
             break;
@@ -422,7 +508,7 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
     void* mappedMemory = nullptr;
     if (vkMapMemory(State->Device, textureArray.StagingMemory, 0, textureArray.StagingSize, 0, &mappedMemory) != VK_SUCCESS)
         return;
-    std::memcpy(mappedMemory, data, layerPixelCount * sizeof(u32));
+    std::memcpy(mappedMemory, texels, layerPixelCount * sizeof(u32));
     vkUnmapMemory(State->Device, textureArray.StagingMemory);
 
     if (vkWaitForFences(State->Device, 1, &State->UploadFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS
@@ -475,8 +561,8 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
     copyRegion.imageSubresource.baseArrayLayer = layer;
     copyRegion.imageSubresource.layerCount = 1;
     copyRegion.imageOffset = {0, 0, 0};
-    copyRegion.imageExtent.width = width;
-    copyRegion.imageExtent.height = height;
+    copyRegion.imageExtent.width = uploadWidth;
+    copyRegion.imageExtent.height = uploadHeight;
     copyRegion.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(
         State->CommandBuffer,

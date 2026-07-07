@@ -261,6 +261,72 @@ int wrapTexelCoord(int coord, int size, bool repeat, bool mirror)
     return coord;
 }
 
+// HD texture support: the triangle size fields carry the storage texel scale
+// (texWidth bits 12..14) and the upload filter mode (texHeight bits 12..15).
+// Scaled textures are sampled bilinearly in HD texel space with wrap, mirror
+// and clamp handling that matches the native path.
+int positiveModInt(int value, int modulo)
+{
+    int result = value % modulo;
+    return result < 0 ? result + modulo : result;
+}
+
+int floorDiv16(int value)
+{
+    return value >= 0 ? (value >> 4) : -(((-value) + 15) >> 4);
+}
+
+int wrapHdTexelCoord(int coord, int size, int scale, bool repeat, bool mirror)
+{
+    int hdSize = size * scale;
+    if (repeat)
+    {
+        if (mirror)
+        {
+            int period = hdSize * 2;
+            int wrapped = positiveModInt(coord, period);
+            return wrapped >= hdSize ? (period - 1) - wrapped : wrapped;
+        }
+        return positiveModInt(coord, hdSize);
+    }
+    return clamp(coord, 0, hdSize - 1);
+}
+
+uint hdLinearWeight16(int frac)
+{
+    return uint(clamp((frac * 256 + 8) >> 4, 0, 256));
+}
+
+uint hdSmoothWeight16(int frac)
+{
+    uint weight = hdLinearWeight16(frac);
+    return (weight * weight * (768u - 2u * weight) + 32768u) >> 16u;
+}
+
+uint hdSmootherWeight16(int frac)
+{
+    int weight = int(hdLinearWeight16(frac));
+    int w2 = (weight * weight + 128) >> 8;
+    int w3 = (w2 * weight + 128) >> 8;
+    int w4 = (w2 * w2 + 128) >> 8;
+    int w5 = (w4 * weight + 128) >> 8;
+    return uint(clamp((6 * w5) - (15 * w4) + (10 * w3), 0, 256));
+}
+
+uint hdTextureWeight16(int frac, uint filterMode)
+{
+    if (filterMode == 10u)
+        return hdSmootherWeight16(frac);
+    if (filterMode == 2u)
+        return hdSmoothWeight16(frac);
+    return hdLinearWeight16(frac);
+}
+
+uvec4 hdMixTexel(uvec4 a, uvec4 b, uint weight)
+{
+    return ((a * (256u - weight)) + (b * weight) + uvec4(128u)) >> 8u;
+}
+
 Color6A5 sampleTexture(in Triangle tri, in vec3 bary)
 {
     Color6A5 whiteTexel;
@@ -269,27 +335,56 @@ Color6A5 sampleTexture(in Triangle tri, in vec3 bary)
     whiteTexel.b = 63;
     whiteTexel.a = 31;
 
+    uint texelScale = (tri.texWidth >> 12u) & 0xFu;
+    uint hdFilterMode = (tri.texHeight >> 12u) & 0xFu;
+    int texWidth = int(tri.texWidth & 0xFFFu);
+    int texHeight = int(tri.texHeight & 0xFFFu);
+
     if ((tri.flags & TRI_FLAG_TEXTURED) == 0u
-        || tri.texWidth == 0u
-        || tri.texHeight == 0u
+        || texWidth == 0
+        || texHeight == 0
         || tri.texArrayIndex >= MAX_TEXTURE_DESCRIPTORS)
         return whiteTexel;
 
     float interpU = tri.u0 * bary.x + tri.u1 * bary.y + tri.u2 * bary.z;
     float interpV = tri.v0 * bary.x + tri.v1 * bary.y + tri.v2 * bary.z;
 
-    int sampleS = int(floor(interpU * (1.0 / 16.0)));
-    int sampleT = int(floor(interpV * (1.0 / 16.0)));
-
     bool repeatS = (tri.texParam & (1u << 16u)) != 0u;
     bool repeatT = (tri.texParam & (1u << 17u)) != 0u;
     bool mirrorS = (tri.texParam & (1u << 18u)) != 0u;
     bool mirrorT = (tri.texParam & (1u << 19u)) != 0u;
 
-    sampleS = wrapTexelCoord(sampleS, int(tri.texWidth), repeatS, mirrorS);
-    sampleT = wrapTexelCoord(sampleT, int(tri.texHeight), repeatT, mirrorT);
-
     uint descriptorIndex = nonuniformEXT(tri.texArrayIndex);
+    if (texelScale > 1u)
+    {
+        int scale = int(texelScale);
+        int fixedX = (int(floor(interpU)) * scale) - 8;
+        int fixedY = (int(floor(interpV)) * scale) - 8;
+        int baseX = floorDiv16(fixedX);
+        int baseY = floorDiv16(fixedY);
+        uint weightX = hdTextureWeight16(fixedX - (baseX << 4), hdFilterMode);
+        uint weightY = hdTextureWeight16(fixedY - (baseY << 4), hdFilterMode);
+
+        int x0 = wrapHdTexelCoord(baseX, texWidth, scale, repeatS, mirrorS);
+        int x1 = wrapHdTexelCoord(baseX + 1, texWidth, scale, repeatS, mirrorS);
+        int y0 = wrapHdTexelCoord(baseY, texHeight, scale, repeatT, mirrorT);
+        int y1 = wrapHdTexelCoord(baseY + 1, texHeight, scale, repeatT, mirrorT);
+        int layer = int(tri.texLayer);
+
+        uvec4 c00 = texelFetch(texArrays[descriptorIndex], ivec3(x0, y0, layer), 0);
+        uvec4 c10 = texelFetch(texArrays[descriptorIndex], ivec3(x1, y0, layer), 0);
+        uvec4 c01 = texelFetch(texArrays[descriptorIndex], ivec3(x0, y1, layer), 0);
+        uvec4 c11 = texelFetch(texArrays[descriptorIndex], ivec3(x1, y1, layer), 0);
+        uvec4 hdTexel = hdMixTexel(hdMixTexel(c00, c10, weightX), hdMixTexel(c01, c11, weightX), weightY);
+        return decodeTexelRgb6a5(hdTexel);
+    }
+
+    int sampleS = int(floor(interpU * (1.0 / 16.0)));
+    int sampleT = int(floor(interpV * (1.0 / 16.0)));
+
+    sampleS = wrapTexelCoord(sampleS, texWidth, repeatS, mirrorS);
+    sampleT = wrapTexelCoord(sampleT, texHeight, repeatT, mirrorT);
+
     uvec4 texel = texelFetch(texArrays[descriptorIndex], ivec3(sampleS, sampleT, int(tri.texLayer)), 0);
     return decodeTexelRgb6a5(texel);
 }

@@ -12126,7 +12126,18 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                     textureDescriptorIndex = textureIt->second.DescriptorIndex;
                 }
                 if (!textureFallbackUsed)
+                {
                     textureLayerOpaque = Texcache.GetLoader().IsTextureLayerOpaque(textureHandle, textureLayer);
+
+                    const u32 hdTexelScale = Texcache.GetHDTextureScale();
+                    if (hdTexelScale > 1u)
+                    {
+                        // bits 12+ of the size fields carry the HD texel scale and
+                        // filter mode into both raster shader families
+                        texWidth |= hdTexelScale << 12u;
+                        texHeight |= static_cast<u32>(Texcache.GetHDTextureFilterMode()) << 12u;
+                    }
+                }
             }
         }
 
@@ -13085,6 +13096,18 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
                 else
                 {
                     textureDescriptorIndex = textureIt->second.DescriptorIndex;
+                }
+
+                if (!textureFallbackUsed)
+                {
+                    const u32 hdTexelScale = Texcache.GetHDTextureScale();
+                    if (hdTexelScale > 1u)
+                    {
+                        // bits 12+ of the size fields carry the HD texel scale and
+                        // filter mode into both raster shader families
+                        texWidth |= hdTexelScale << 12u;
+                        texHeight |= static_cast<u32>(Texcache.GetHDTextureFilterMode()) << 12u;
+                    }
                 }
             }
         }

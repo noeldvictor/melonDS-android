@@ -269,6 +269,32 @@ int wrapTexelCoord(int coord, int size, bool repeat, bool mirror)
     return coord;
 }
 
+// HD texture support: the size fields carry the storage texel scale
+// (texWidth bits 12..14) and the upload filter mode (texHeight bits 12..15).
+// Scaled textures are sampled bilinearly in HD texel space with wrap, mirror
+// and clamp handling that matches the native path.
+int positiveModInt(int value, int modulo)
+{
+    int result = value % modulo;
+    return result < 0 ? result + modulo : result;
+}
+
+int wrapHdTexelCoord(int coord, int size, int scale, bool repeat, bool mirror)
+{
+    int hdSize = size * scale;
+    if (repeat)
+    {
+        if (mirror)
+        {
+            int period = hdSize * 2;
+            int wrapped = positiveModInt(coord, period);
+            return wrapped >= hdSize ? (period - 1) - wrapped : wrapped;
+        }
+        return positiveModInt(coord, hdSize);
+    }
+    return clamp(coord, 0, hdSize - 1);
+}
+
 Color6A5 unpackToonColor(uint shadeIndex)
 {
     uint clampedIndex = min(shadeIndex, 31u);
@@ -447,6 +473,10 @@ Color6A5 sampleTexture(uint polyAttr)
     uint texHeight = fTriInfo1.x;
     uint texParam = fTriInfo1.y;
 #endif
+    uint texelScale = (texWidth >> 12u) & 0xFu;
+    uint hdFilterMode = (texHeight >> 12u) & 0xFu;
+    texWidth &= 0xFFFu;
+    texHeight &= 0xFFFu;
     vec2 texcoord = fTexcoord;
 
 #if MELONDS_FAST_OPAQUE_MODULATE == 0
@@ -487,6 +517,37 @@ Color6A5 sampleTexture(uint polyAttr)
         texcoord -= vec2(LINEAR_TEXEL_COORD_BIAS);
     }
 #endif
+
+    if (texelScale > 1u)
+    {
+        int scale = int(texelScale);
+        vec2 hdCoord = (texcoord * float(scale)) - vec2(0.5);
+        ivec2 hdBase = ivec2(floor(hdCoord));
+        vec2 hdFrac = hdCoord - vec2(hdBase);
+        if (hdFilterMode == 10u)
+            hdFrac = hdFrac * hdFrac * hdFrac * (hdFrac * (hdFrac * 6.0 - 15.0) + 10.0);
+        else if (hdFilterMode == 2u)
+            hdFrac = hdFrac * hdFrac * (vec2(3.0) - (vec2(2.0) * hdFrac));
+
+        int x0 = wrapHdTexelCoord(hdBase.x, int(texWidth), scale, repeatS, mirrorS);
+        int x1 = wrapHdTexelCoord(hdBase.x + 1, int(texWidth), scale, repeatS, mirrorS);
+        int y0 = wrapHdTexelCoord(hdBase.y, int(texHeight), scale, repeatT, mirrorT);
+        int y1 = wrapHdTexelCoord(hdBase.y + 1, int(texHeight), scale, repeatT, mirrorT);
+        int layer = int(texLayer);
+
+        vec4 c00 = vec4(fetchTextureArrayTexel(texArrayIndex, ivec3(x0, y0, layer)));
+        vec4 c10 = vec4(fetchTextureArrayTexel(texArrayIndex, ivec3(x1, y0, layer)));
+        vec4 c01 = vec4(fetchTextureArrayTexel(texArrayIndex, ivec3(x0, y1, layer)));
+        vec4 c11 = vec4(fetchTextureArrayTexel(texArrayIndex, ivec3(x1, y1, layer)));
+        vec4 blended = mix(mix(c00, c10, hdFrac.x), mix(c01, c11, hdFrac.x), hdFrac.y);
+
+        Color6A5 hdColor;
+        hdColor.r = clamp6(int(blended.r + 0.5));
+        hdColor.g = clamp6(int(blended.g + 0.5));
+        hdColor.b = clamp6(int(blended.b + 0.5));
+        hdColor.a = clamp5(int(blended.a + 0.5));
+        return hdColor;
+    }
 
     int sampleS = int(floor(texcoord.x));
     int sampleT = int(floor(texcoord.y));
