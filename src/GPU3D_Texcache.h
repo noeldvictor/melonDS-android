@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include "GPU.h"
+#include "HDTexPack.h"
 
 #include <assert.h>
 #include <unordered_map>
@@ -154,6 +155,37 @@ public:
         return Update(gpu, []() {});
     }
 
+    void SetTexPack(HDTexPack* pack)
+    {
+        if (TexPack == pack)
+            return;
+
+        TexPack = pack;
+        Reset();
+    }
+
+    // Palette hash for compressed 4x4 textures covering only the palette
+    // range the block aux data actually references (the declared range is a
+    // whole 64K slot, which would make pack identities unstable).
+    u64 CompressedUsedPalHash(GPU& gpu, u32 slot1addr, u32 palBase, u32 width, u32 height)
+    {
+        u32 blocks = (width/4) * (height/4);
+        u32 minAddr = 0xFFFFFFFF, maxAddr = 0;
+        for (u32 i = 0; i < blocks; i++)
+        {
+            u16 aux = gpu.template ReadVRAMFlat_Texture<u16>(slot1addr + i*2);
+            u32 start = palBase + (aux & 0x3FFF) * 4;
+            u32 mode = (aux >> 14) & 0x3;
+            u32 entries = (mode == 2) ? 4 : ((mode == 0) ? 3 : 2);
+            minAddr = std::min(minAddr, start);
+            maxAddr = std::max(maxAddr, start + entries*2);
+        }
+        if (minAddr >= maxAddr)
+            return 0;
+        return MaskedHash(gpu.VRAMFlat_TexPal, sizeof(gpu.VRAMFlat_TexPal),
+            minAddr & (sizeof(gpu.VRAMFlat_TexPal) - 1), maxAddr - minAddr);
+    }
+
     void GetTexture(GPU& gpu, u32 texParam, u32 palBase, TexHandleT& textureHandle, u32& layer, u32*& helper)
     {
         // remove sampling and texcoord gen params
@@ -194,6 +226,8 @@ public:
         entry.WidthLog2 = widthLog2;
         entry.HeightLog2 = heightLog2;
 
+        u32 slot1addr = 0;
+
         // apparently a new texture
         if (fmt == 7)
         {
@@ -203,7 +237,7 @@ public:
         }
         else if (fmt == 5)
         {
-            u32 slot1addr = 0x20000 + ((addr & 0x1FFFC) >> 1);
+            slot1addr = 0x20000 + ((addr & 0x1FFFC) >> 1);
             if (addr >= 0x40000)
                 slot1addr += 0x10000;
 
@@ -259,6 +293,36 @@ public:
         if (entry.TexPalSize)
             entry.TexPalHash = MaskedHash(gpu.VRAMFlat_TexPal, sizeof(gpu.VRAMFlat_TexPal),
                 entry.TexPalStart, entry.TexPalSize);
+
+        // HD texture pack identity: encoded-bytes texel hash (both VRAM ranges
+        // for compressed textures) plus a used-range-only palette hash, so
+        // unrelated palette VRAM churn doesn't fork identities.
+        if (TexPack)
+        {
+            u64 packTexHash = entry.TextureHash[0];
+            if (entry.TextureRAMSize[1])
+                packTexHash = XXH64(entry.TextureHash, sizeof(u64)*2, 0);
+
+            bool hasPal = (fmt != 7);
+            u64 packPalHash = 0;
+            if (fmt == 5)
+                packPalHash = CompressedUsedPalHash(gpu, slot1addr, entry.TexPalStart, width, height);
+            else if (hasPal)
+                packPalHash = entry.TexPalHash;
+
+            if (TexPack->DumpActive())
+                TexPack->DumpTexture(width, height, packTexHash, packPalHash, hasPal, fmt, DecodingBuffer);
+
+            // native-resolution replacements slot straight into the decode
+            // buffer; scaled replacements need renderer-side texel scaling
+            const HDTexPackImage* replacement =
+                TexPack->LookupTexture(width, height, packTexHash, packPalHash, hasPal, fmt);
+            if (replacement && replacement->Width == width && replacement->Height == height)
+            {
+                for (u32 i = 0, n = width * height; i < n; i++)
+                    DecodingBuffer[i] = HDTexPack::RGBA8ToRGB6A5(replacement->RGBA[i]);
+            }
+        }
 
         auto& texArrays = TexArrays[widthLog2][heightLog2];
         auto& freeTextures = FreeTextures[widthLog2][heightLog2];
@@ -327,6 +391,8 @@ private:
         u64 TexPalHash;
     };
     std::unordered_map<u64, TexCacheEntry> Cache;
+
+    HDTexPack* TexPack = nullptr;
 
     TexLoaderT TexLoader;
 

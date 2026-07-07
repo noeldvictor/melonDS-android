@@ -45,6 +45,8 @@ add_library(core STATIC
     GPU3D_Texcache.cpp
     GPU3D_TexcacheVulkan.cpp
     GPU3D_Texcache.h
+    HDTexPack.cpp
+    HDTexPack.h
     melonDLDI.h
     Mic.cpp
     NDS.cpp

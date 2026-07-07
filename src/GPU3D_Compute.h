@@ -52,6 +52,7 @@ public:
     u32* GetLine(int line) override;
 
     void SetupAccelFrame() override;
+    void SetTexPack(HDTexPack* pack) { Texcache.SetTexPack(pack); }
     void PrepareCaptureFrame() override;
 
     void SetOutputTexture(int buffer, u32 texture) override;
