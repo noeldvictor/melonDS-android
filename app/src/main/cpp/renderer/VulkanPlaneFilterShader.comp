@@ -1,0 +1,678 @@
+#version 450
+
+// Per-producer 2D plane filter pre-pass.
+//
+// Reads one screen's packed 2D planes and writes filtered copies (plane 0
+// stacked above plane 1) that the compositor samples instead of the raw
+// planes. One filter mode is compiled per SPIR-V variant through
+// PLANE_FILTER_MODE so every blob stays small enough for mobile shader
+// compilers; producer selection (OBJ vs BG) happens at runtime through the
+// push constants, and two variants run in sequence when the producers use
+// different modes.
+//
+// Modes match the HD texture filter numbering: 1 linear, 2 smoothstep,
+// 3 Scale2x, 4 HQ2x lite, 5 2xSaI lite, 6 SuperEagle lite, 7 MMPX lite,
+// 8 Anime4K lite, 9 Super2xSaI strong, 10 SuperEagle smooth,
+// 11 crisp gradient, 12 crisp edge AA, 13 ScaleFX lite.
+
+#ifndef PLANE_FILTER_MODE
+#define PLANE_FILTER_MODE 3
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PackedBuffer
+{
+    uint packedData[];
+};
+
+layout(set = 0, binding = 1, rgba8) uniform image2D outFilteredPlanes;
+
+layout(push_constant) uniform PushConsts
+{
+    uint scale;
+    uint packedStride;
+    uint applyObj;
+    uint applyBg;
+    uint writeOthers;
+} pc;
+
+uint readPacked(int y, int x)
+{
+    return packedData[uint(y) * pc.packedStride + uint(x)];
+}
+
+bool isPacked3dPlaceholder(uint packedValue)
+{
+    return (packedValue & 0x00FFFFFFu) == 0u
+        && ((packedValue >> 24u) & 0xFFu) == 0x20u;
+}
+
+bool isPacked3dLayerSlot(uint packedValue)
+{
+    return ((packedValue >> 24u) & 0xFFu) == 0x40u;
+}
+
+bool packedTapIsUnsafe(uint packedValue)
+{
+    return isPacked3dPlaceholder(packedValue) || isPacked3dLayerSlot(packedValue);
+}
+
+// The packed alpha byte carries the winning producer of each pixel:
+// bits 0..3 BG0..BG3, bit 4 OBJ, bit 5 backdrop, bit 6 the 3D layer slot
+// and bit 7 semi-transparent OBJ. 3D pixels are never filtered here.
+bool pixelSelectedForThisPass(uint packedValue)
+{
+    uint flags = (packedValue >> 24u) & 0xFFu;
+    if ((flags & 0x40u) != 0u)
+        return false;
+    if (isPacked3dPlaceholder(packedValue))
+        return false;
+    if ((flags & 0x90u) != 0u)
+        return pc.applyObj != 0u;
+    if ((flags & 0x2Fu) != 0u)
+        return pc.applyBg != 0u;
+    return false;
+}
+
+vec4 passThroughColor(uint packedValue)
+{
+    return vec4(
+        float(packedValue & 0xFFu) * (1.0 / 63.0),
+        float((packedValue >> 8u) & 0xFFu) * (1.0 / 63.0),
+        float((packedValue >> 16u) & 0xFFu) * (1.0 / 63.0),
+        float((packedValue >> 24u) & 0xFFu) * (1.0 / 255.0));
+}
+
+// taps are normalized rgb with alpha pinned to 1.0; unsafe taps (3D
+// placeholder or 3D layer slot data) reuse the center color so control
+// values never leak into the filters
+vec4 tapColor(uint packedValue, uint centerValue)
+{
+    uint source = packedTapIsUnsafe(packedValue) ? centerValue : packedValue;
+    return vec4(
+        float(source & 0xFFu) * (1.0 / 63.0),
+        float((source >> 8u) & 0xFFu) * (1.0 / 63.0),
+        float((source >> 16u) & 0xFFu) * (1.0 / 63.0),
+        1.0);
+}
+
+float ColorDistance(vec4 a, vec4 b)
+{
+    vec4 delta = abs(a - b);
+    return max(max(delta.r, delta.g), max(delta.b, delta.a));
+}
+
+bool Similar(vec4 a, vec4 b)
+{
+    return ColorDistance(a, b) < (1.5 / 255.0);
+}
+
+#if PLANE_FILTER_MODE >= 7 && PLANE_FILTER_MODE <= 12
+bool SoftSimilar(vec4 a, vec4 b)
+{
+    return ColorDistance(a, b) < (24.0 / 255.0);
+}
+#endif
+
+#if PLANE_FILTER_MODE >= 4
+bool IsThinContrastDetail(vec4 e, vec4 b, vec4 d, vec4 f, vec4 h)
+{
+    if (e.a <= 0.01)
+        return false;
+
+    int support = 0;
+    support += Similar(e, b) ? 1 : 0;
+    support += Similar(e, d) ? 1 : 0;
+    support += Similar(e, f) ? 1 : 0;
+    support += Similar(e, h) ? 1 : 0;
+
+    float farthest = max(max(ColorDistance(e, b), ColorDistance(e, d)),
+                         max(ColorDistance(e, f), ColorDistance(e, h)));
+    return support <= 2 && farthest > (48.0 / 255.0);
+}
+
+vec4 ProtectThinDetail(vec4 candidate, vec4 b, vec4 d, vec4 e, vec4 f, vec4 h)
+{
+    if (IsThinContrastDetail(e, b, d, f, h) &&
+        ColorDistance(candidate, e) > (8.0 / 255.0))
+        return e;
+    return candidate;
+}
+#endif
+
+#if PLANE_FILTER_MODE == 3 || PLANE_FILTER_MODE == 4
+vec4 Scale2xTexel(vec4 b, vec4 d, vec4 e, vec4 f, vec4 h, ivec2 subpixel)
+{
+    if (Similar(b, h) || Similar(d, f))
+        return e;
+
+    if (all(equal(subpixel, ivec2(0, 0))))
+        return Similar(d, b) ? d : e;
+    if (all(equal(subpixel, ivec2(1, 0))))
+        return Similar(b, f) ? f : e;
+    if (all(equal(subpixel, ivec2(0, 1))))
+        return Similar(d, h) ? d : e;
+    return Similar(h, f) ? f : e;
+}
+#endif
+
+#if PLANE_FILTER_MODE == 4
+vec4 HQ2xLiteTexel(vec4 b, vec4 d, vec4 e, vec4 f, vec4 h, ivec2 subpixel)
+{
+    vec4 scaled = Scale2xTexel(b, d, e, f, h, subpixel);
+    if (Similar(e, scaled))
+        return e;
+
+    vec4 cardinal = (b + d + f + h) * 0.25;
+    float edge = max(ColorDistance(b, h), ColorDistance(d, f));
+    float weight = clamp(edge * 3.0, 0.0, 0.65);
+    return ProtectThinDetail(mix(mix(e, scaled, 0.65), cardinal, weight * 0.35),
+                             b, d, e, f, h);
+}
+#endif
+
+#if PLANE_FILTER_MODE == 5
+vec4 TwoXSaILiteTexel(vec4 b, vec4 d, vec4 e, vec4 f, vec4 h, ivec2 subpixel)
+{
+    vec4 corner = e;
+    if (all(equal(subpixel, ivec2(0, 0))))
+        corner = (Similar(d, b) && !Similar(d, h) && !Similar(b, f)) ? ((d + b) * 0.5) : e;
+    else if (all(equal(subpixel, ivec2(1, 0))))
+        corner = (Similar(b, f) && !Similar(b, d) && !Similar(f, h)) ? ((b + f) * 0.5) : e;
+    else if (all(equal(subpixel, ivec2(0, 1))))
+        corner = (Similar(d, h) && !Similar(d, b) && !Similar(h, f)) ? ((d + h) * 0.5) : e;
+    else
+        corner = (Similar(h, f) && !Similar(h, d) && !Similar(f, b)) ? ((h + f) * 0.5) : e;
+
+    return ProtectThinDetail(mix(e, corner, 0.75), b, d, e, f, h);
+}
+#endif
+
+#if PLANE_FILTER_MODE == 6 || PLANE_FILTER_MODE == 10
+vec4 SuperEagleCorner(vec4 e, vec4 edge0, vec4 edge1, vec4 diagonal, vec4 opposite0, vec4 opposite1)
+{
+    if (Similar(edge0, edge1) && !Similar(opposite0, opposite1))
+        return mix(e, (edge0 + edge1) * 0.5, 0.88);
+    if (Similar(edge0, diagonal) && Similar(edge1, diagonal))
+        return mix(e, diagonal, 0.78);
+    if (Similar(edge0, edge1))
+        return mix(e, (edge0 + edge1) * 0.5, 0.55);
+    return e;
+}
+
+vec4 SuperEagleLiteTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    vec4 tl = SuperEagleCorner(e, d, b, a, f, h);
+    vec4 tr = SuperEagleCorner(e, b, f, c, d, h);
+    vec4 bl = SuperEagleCorner(e, d, h, g, b, f);
+    vec4 br = SuperEagleCorner(e, h, f, px_i, d, b);
+
+    bool diagonal_down = Similar(a, px_i) && !Similar(c, g);
+    bool diagonal_up = Similar(c, g) && !Similar(a, px_i);
+    if (diagonal_down)
+    {
+        tl = mix(tl, a, 0.45);
+        br = mix(br, px_i, 0.45);
+    }
+    else if (diagonal_up)
+    {
+        tr = mix(tr, c, 0.45);
+        bl = mix(bl, g, 0.45);
+    }
+
+    vec4 corner;
+    if (all(equal(subpixel, ivec2(0, 0))))
+        corner = tl;
+    else if (all(equal(subpixel, ivec2(1, 0))))
+        corner = tr;
+    else if (all(equal(subpixel, ivec2(0, 1))))
+        corner = bl;
+    else
+        corner = br;
+
+    if (Similar(corner, e))
+    {
+        bool vertical = Similar(b, h);
+        bool horizontal = Similar(d, f);
+        if (vertical && !horizontal)
+            corner = mix(e, (b + h) * 0.5, 0.18);
+        else if (horizontal && !vertical)
+            corner = mix(e, (d + f) * 0.5, 0.18);
+    }
+
+    return ProtectThinDetail(corner, b, d, e, f, h);
+}
+#endif
+
+#if PLANE_FILTER_MODE == 7 || PLANE_FILTER_MODE == 8 || PLANE_FILTER_MODE == 11 || PLANE_FILTER_MODE == 12
+vec4 MMPXLiteCorner(vec4 e, vec4 edge0, vec4 edge1, vec4 diagonal, vec4 opposite0, vec4 opposite1)
+{
+    if (SoftSimilar(edge0, edge1) && !SoftSimilar(opposite0, opposite1))
+        return mix(e, (edge0 + edge1) * 0.5, 0.92);
+    if (SoftSimilar(edge0, diagonal) && SoftSimilar(edge1, diagonal))
+        return mix(e, diagonal, 0.84);
+    if (SoftSimilar(edge0, diagonal) && !SoftSimilar(edge1, opposite1))
+        return mix(e, edge0, 0.72);
+    if (SoftSimilar(edge1, diagonal) && !SoftSimilar(edge0, opposite0))
+        return mix(e, edge1, 0.72);
+    if (SoftSimilar(edge0, edge1))
+        return mix(e, (edge0 + edge1) * 0.5, 0.62);
+    return e;
+}
+
+vec4 MMPXLiteTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    vec4 tl = MMPXLiteCorner(e, d, b, a, f, h);
+    vec4 tr = MMPXLiteCorner(e, b, f, c, d, h);
+    vec4 bl = MMPXLiteCorner(e, d, h, g, b, f);
+    vec4 br = MMPXLiteCorner(e, h, f, px_i, d, b);
+
+    bool diagonal_down = SoftSimilar(a, px_i) && !SoftSimilar(c, g);
+    bool diagonal_up = SoftSimilar(c, g) && !SoftSimilar(a, px_i);
+    if (diagonal_down)
+    {
+        tl = mix(tl, a, 0.35);
+        br = mix(br, px_i, 0.35);
+    }
+    else if (diagonal_up)
+    {
+        tr = mix(tr, c, 0.35);
+        bl = mix(bl, g, 0.35);
+    }
+
+    vec4 corner;
+    if (all(equal(subpixel, ivec2(0, 0))))
+        corner = tl;
+    else if (all(equal(subpixel, ivec2(1, 0))))
+        corner = tr;
+    else if (all(equal(subpixel, ivec2(0, 1))))
+        corner = bl;
+    else
+        corner = br;
+
+    vec4 cardinal = (b + d + f + h) * 0.25;
+    float flatness = min(ColorDistance(b, h), ColorDistance(d, f));
+    float smoothWeight = 0.18 * (1.0 - smoothstep(8.0 / 255.0, 64.0 / 255.0, flatness));
+    return ProtectThinDetail(mix(corner, cardinal, smoothWeight), b, d, e, f, h);
+}
+#endif
+
+#if PLANE_FILTER_MODE == 8 || PLANE_FILTER_MODE == 11 || PLANE_FILTER_MODE == 12
+vec4 Anime4KLiteTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    vec4 base = MMPXLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+    if (IsThinContrastDetail(e, b, d, f, h))
+        return ProtectThinDetail(base, b, d, e, f, h);
+
+    vec4 cardinal = (b + d + f + h) * 0.25;
+    vec4 pair = (d + f) * 0.5;
+    float pairDist = ColorDistance(d, f);
+    float verticalDist = ColorDistance(b, h);
+    if (verticalDist < pairDist)
+    {
+        pair = (b + h) * 0.5;
+        pairDist = verticalDist;
+    }
+
+    float diagDownDist = ColorDistance(a, px_i);
+    if (diagDownDist < pairDist)
+    {
+        pair = (a + px_i) * 0.5;
+        pairDist = diagDownDist;
+    }
+
+    float diagUpDist = ColorDistance(c, g);
+    if (diagUpDist < pairDist)
+        pair = (c + g) * 0.5;
+
+    float contrast = max(max(ColorDistance(e, b), ColorDistance(e, d)),
+                         max(ColorDistance(e, f), ColorDistance(e, h)));
+    float edgeWeight = smoothstep(4.0 / 255.0, 56.0 / 255.0, contrast);
+    vec4 smoothed = mix(base, pair, edgeWeight * 0.72);
+    vec4 sharpened = smoothed + ((smoothed - cardinal) * (edgeWeight * 0.30));
+    return ProtectThinDetail(clamp(sharpened, vec4(0.0), vec4(1.0)), b, d, e, f, h);
+}
+#endif
+
+#if PLANE_FILTER_MODE >= 9 && PLANE_FILTER_MODE <= 12
+vec4 SuperSAIStrongCorner(vec4 e, vec4 edge0, vec4 edge1, vec4 diagonal, vec4 opposite0, vec4 opposite1)
+{
+    float pairDist = ColorDistance(edge0, edge1);
+    float oppositeDist = ColorDistance(opposite0, opposite1);
+    float diag0 = ColorDistance(edge0, diagonal);
+    float diag1 = ColorDistance(edge1, diagonal);
+
+    if (pairDist < (40.0 / 255.0) && oppositeDist > (pairDist + (10.0 / 255.0)))
+        return mix(e, (edge0 + edge1) * 0.5, 0.96);
+    if (max(diag0, diag1) < (42.0 / 255.0))
+        return mix(e, diagonal, 0.92);
+    if (diag0 < (36.0 / 255.0) && ColorDistance(edge1, opposite1) > (diag0 + (8.0 / 255.0)))
+        return mix(e, edge0, 0.86);
+    if (diag1 < (36.0 / 255.0) && ColorDistance(edge0, opposite0) > (diag1 + (8.0 / 255.0)))
+        return mix(e, edge1, 0.86);
+    if (pairDist < (56.0 / 255.0))
+        return mix(e, (edge0 + edge1) * 0.5, 0.74);
+    return e;
+}
+
+vec4 SuperSAIStrongTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    vec4 tl = SuperSAIStrongCorner(e, d, b, a, f, h);
+    vec4 tr = SuperSAIStrongCorner(e, b, f, c, d, h);
+    vec4 bl = SuperSAIStrongCorner(e, d, h, g, b, f);
+    vec4 br = SuperSAIStrongCorner(e, h, f, px_i, d, b);
+
+    bool diagonalDown = ColorDistance(a, px_i) < (ColorDistance(c, g) + (8.0 / 255.0));
+    bool diagonalUp = ColorDistance(c, g) < (ColorDistance(a, px_i) + (8.0 / 255.0));
+    if (diagonalDown && !diagonalUp)
+    {
+        tl = mix(tl, a, 0.50);
+        br = mix(br, px_i, 0.50);
+    }
+    else if (diagonalUp && !diagonalDown)
+    {
+        tr = mix(tr, c, 0.50);
+        bl = mix(bl, g, 0.50);
+    }
+
+    vec4 corner;
+    if (all(equal(subpixel, ivec2(0, 0))))
+        corner = tl;
+    else if (all(equal(subpixel, ivec2(1, 0))))
+        corner = tr;
+    else if (all(equal(subpixel, ivec2(0, 1))))
+        corner = bl;
+    else
+        corner = br;
+
+    if (Similar(corner, e))
+    {
+        float horizontal = ColorDistance(d, f);
+        float vertical = ColorDistance(b, h);
+        float contrast = max(max(ColorDistance(e, b), ColorDistance(e, d)),
+                             max(ColorDistance(e, f), ColorDistance(e, h)));
+        float weight = smoothstep(6.0 / 255.0, 80.0 / 255.0, contrast) * 0.32;
+        corner = (horizontal < vertical)
+            ? mix(e, (d + f) * 0.5, weight)
+            : mix(e, (b + h) * 0.5, weight);
+    }
+
+    corner.a = e.a;
+    return clamp(corner, vec4(0.0), vec4(1.0));
+}
+#endif
+
+#if PLANE_FILTER_MODE == 10
+vec4 SuperEagleSmoothTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    vec4 eagle = SuperEagleLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+    vec4 sai = SuperSAIStrongTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+    vec4 guide = mix(eagle, sai, 0.62);
+
+    vec4 neighborhood = (a + b + c + d + e + f + g + h + px_i) * (1.0 / 9.0);
+    vec4 cardinal = (b + d + f + h) * 0.25;
+    vec4 pair = (d + f) * 0.5;
+    float pairDist = ColorDistance(d, f);
+
+    float verticalDist = ColorDistance(b, h);
+    if (verticalDist < pairDist)
+    {
+        pair = (b + h) * 0.5;
+        pairDist = verticalDist;
+    }
+
+    float diagDownDist = ColorDistance(a, px_i);
+    if (diagDownDist < pairDist)
+    {
+        pair = (a + px_i) * 0.5;
+        pairDist = diagDownDist;
+    }
+
+    float diagUpDist = ColorDistance(c, g);
+    if (diagUpDist < pairDist)
+        pair = (c + g) * 0.5;
+
+    float contrast = max(max(ColorDistance(e, b), ColorDistance(e, d)),
+                         max(ColorDistance(e, f), ColorDistance(e, h)));
+    float smoothWeight = mix(0.56, 0.94, smoothstep(2.0 / 255.0, 64.0 / 255.0, contrast));
+    vec4 soft = mix(mix(neighborhood, pair, 0.38), cardinal, 0.25);
+    vec4 smoothed = mix(guide, soft, smoothWeight);
+    smoothed.a = e.a;
+    return clamp(smoothed, vec4(0.0), vec4(1.0));
+}
+#endif
+
+#if PLANE_FILTER_MODE == 11 || PLANE_FILTER_MODE == 12
+vec4 CrispGradientTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    vec4 anime = Anime4KLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+    vec4 sai = SuperSAIStrongTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+    vec4 guide = mix(anime, sai, 0.38);
+
+    vec4 neighborhood = (a + b + c + d + e + f + g + h + px_i) * (1.0 / 9.0);
+    vec4 cardinal = (b + d + f + h) * 0.25;
+    vec4 reference = mix(neighborhood, cardinal, 0.35);
+
+    float contrast = max(max(ColorDistance(e, b), ColorDistance(e, d)),
+                         max(ColorDistance(e, f), ColorDistance(e, h)));
+    float edgeWeight = smoothstep(3.0 / 255.0, 72.0 / 255.0, contrast);
+    vec4 crisp = guide + ((guide - reference) * mix(0.20, 0.62, edgeWeight));
+    crisp = mix(crisp, e, 0.10 * (1.0 - edgeWeight));
+    crisp.a = e.a;
+    return ProtectThinDetail(clamp(crisp, vec4(0.0), vec4(1.0)), b, d, e, f, h);
+}
+#endif
+
+#if PLANE_FILTER_MODE == 12
+vec4 CrispEdgeAATexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    vec4 base = CrispGradientTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+
+    bool right = subpixel.x != 0;
+    bool down = subpixel.y != 0;
+    vec4 xNeighbor = right ? f : d;
+    vec4 yNeighbor = down ? h : b;
+    vec4 diagonal = right ? (down ? px_i : c) : (down ? g : a);
+    vec4 xSupport0 = right ? c : a;
+    vec4 xSupport1 = right ? px_i : g;
+    vec4 ySupport0 = down ? g : a;
+    vec4 ySupport1 = down ? px_i : c;
+
+    float xWeight = smoothstep(18.0 / 255.0, 92.0 / 255.0, ColorDistance(e, xNeighbor));
+    float yWeight = smoothstep(18.0 / 255.0, 92.0 / 255.0, ColorDistance(e, yNeighbor));
+    float xSupport = (SoftSimilar(xNeighbor, xSupport0) ? 1.0 : 0.0) +
+                     (SoftSimilar(xNeighbor, xSupport1) ? 1.0 : 0.0);
+    float ySupport = (SoftSimilar(yNeighbor, ySupport0) ? 1.0 : 0.0) +
+                     (SoftSimilar(yNeighbor, ySupport1) ? 1.0 : 0.0);
+    xWeight *= mix(0.60, 1.0, xSupport * 0.5);
+    yWeight *= mix(0.60, 1.0, ySupport * 0.5);
+
+    vec4 edge = mix(base, xNeighbor, xWeight * 0.28);
+    edge = mix(edge, yNeighbor, yWeight * 0.28);
+
+    float diagonalSupport = (SoftSimilar(diagonal, xNeighbor) ? 1.0 : 0.0) +
+                            (SoftSimilar(diagonal, yNeighbor) ? 1.0 : 0.0);
+    float diagonalWeight = smoothstep(22.0 / 255.0, 110.0 / 255.0, ColorDistance(e, diagonal)) *
+                           diagonalSupport * 0.14;
+    edge = mix(edge, diagonal, diagonalWeight);
+
+    float maxEdge = max(max(xWeight, yWeight), diagonalWeight * 2.0);
+    vec4 reference = mix((b + d + f + h) * 0.25, e, 0.31);
+    vec4 crisp = edge + ((edge - reference) * mix(0.07, 0.25, maxEdge));
+    crisp.a = e.a;
+    return ProtectThinDetail(clamp(crisp, vec4(0.0), vec4(1.0)), b, d, e, f, h);
+}
+#endif
+
+#if PLANE_FILTER_MODE == 13
+// ScaleFX lite: single-pass approximation of Sp00kyFox's ScaleFX. It
+// evaluates the pass-1 junction corner strength for the quadrant touching
+// this subpixel, applies the pass-2 corner dominance rule against the
+// opposing junction corner, then blends along the detected diagonal using
+// the pass-2 orientation metric.
+float ScaleFXLiteStrength(vec4 center, vec4 nx, vec4 ny, vec4 diag)
+{
+    float d = ColorDistance(nx, ny);
+    float ax = ColorDistance(center, nx);
+    float ay = ColorDistance(center, ny);
+    float bx = ColorDistance(diag, ny);
+    float by = ColorDistance(diag, nx);
+    float diff = ax - ay;
+    float wght1 = max(0.5 - d, 0.0) * 2.0;
+    float dir = (min(ax, bx) + ax > min(ay, by) + ay) ? diff : -diff;
+    float wght2 = clamp((1.0 - d) + dir, 0.0, 1.0);
+    return wght1 * wght2 * ax * ay;
+}
+
+vec4 ScaleFXLiteTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+    bool right = subpixel.x != 0;
+    bool down = subpixel.y != 0;
+    vec4 xNeighbor = right ? f : d;
+    vec4 yNeighbor = down ? h : b;
+    vec4 diagonal = right ? (down ? px_i : c) : (down ? g : a);
+
+    float ownStrength = ScaleFXLiteStrength(e, xNeighbor, yNeighbor, diagonal);
+    float rivalStrength = ScaleFXLiteStrength(diagonal, xNeighbor, yNeighbor, e);
+    if (ownStrength <= rivalStrength)
+        return e;
+
+    float ax = ColorDistance(e, xNeighbor);
+    float ay = ColorDistance(e, yNeighbor);
+    float horiCost = min(ax, ColorDistance(diagonal, yNeighbor)) + ax;
+    float vertCost = min(ay, ColorDistance(diagonal, xNeighbor)) + ay;
+    vec4 slope = (horiCost > vertCost) ? yNeighbor : xNeighbor;
+
+    float weight = smoothstep(0.01, 0.14, ownStrength - rivalStrength);
+    vec4 blended = mix(e, slope, weight);
+    if (IsThinContrastDetail(e, b, d, f, h) &&
+        ColorDistance(blended, e) > (8.0 / 255.0))
+        return e;
+    return clamp(blended, vec4(0.0), vec4(1.0));
+}
+#endif
+
+#if PLANE_FILTER_MODE >= 3
+vec4 FilterCorner(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
+{
+#if PLANE_FILTER_MODE == 3
+    return Scale2xTexel(b, d, e, f, h, subpixel);
+#elif PLANE_FILTER_MODE == 4
+    return HQ2xLiteTexel(b, d, e, f, h, subpixel);
+#elif PLANE_FILTER_MODE == 5
+    return TwoXSaILiteTexel(b, d, e, f, h, subpixel);
+#elif PLANE_FILTER_MODE == 6
+    return SuperEagleLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#elif PLANE_FILTER_MODE == 7
+    return MMPXLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#elif PLANE_FILTER_MODE == 8
+    return Anime4KLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#elif PLANE_FILTER_MODE == 9
+    return SuperSAIStrongTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#elif PLANE_FILTER_MODE == 10
+    return SuperEagleSmoothTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#elif PLANE_FILTER_MODE == 11
+    return CrispGradientTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#elif PLANE_FILTER_MODE == 12
+    return CrispEdgeAATexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#else
+    return ScaleFXLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+#endif
+}
+
+vec4 FilterTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, vec2 subpos)
+{
+    if (pc.scale <= 2u)
+    {
+        ivec2 quadrant = ivec2(subpos.x >= 0.5 ? 1 : 0, subpos.y >= 0.5 ? 1 : 0);
+        return FilterCorner(a, b, c, d, e, f, g, h, px_i, quadrant);
+    }
+
+    vec4 tl = FilterCorner(a, b, c, d, e, f, g, h, px_i, ivec2(0, 0));
+    vec4 tr = FilterCorner(a, b, c, d, e, f, g, h, px_i, ivec2(1, 0));
+    vec4 bl = FilterCorner(a, b, c, d, e, f, g, h, px_i, ivec2(0, 1));
+    vec4 br = FilterCorner(a, b, c, d, e, f, g, h, px_i, ivec2(1, 1));
+    vec2 weight = subpos * subpos * (vec2(3.0) - (vec2(2.0) * subpos));
+    return mix(mix(tl, tr, weight.x), mix(bl, br, weight.x), weight.y);
+}
+#endif
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint planeWidth = 256u * pc.scale;
+    uint planeHeight = 192u * pc.scale;
+    if (gid.x >= planeWidth || gid.y >= planeHeight * 2u)
+        return;
+
+    uint plane = gid.y / planeHeight;
+    int scaledX = int(gid.x);
+    int scaledY = int(gid.y - (plane * planeHeight));
+    int layerOffset = int(plane) * 256;
+    int sourceX = scaledX / int(pc.scale);
+    int dsY = scaledY / int(pc.scale);
+
+    uint centerValue = readPacked(dsY, layerOffset + sourceX);
+    if (!pixelSelectedForThisPass(centerValue))
+    {
+        if (pc.writeOthers != 0u)
+            imageStore(outFilteredPlanes, ivec2(gid), passThroughColor(centerValue));
+        return;
+    }
+
+    int xm = max(sourceX - 1, 0);
+    int xp = min(sourceX + 1, 255);
+    int ym = max(dsY - 1, 0);
+    int yp = min(dsY + 1, 191);
+
+    vec4 e = tapColor(centerValue, centerValue);
+    vec4 b = tapColor(readPacked(ym, layerOffset + sourceX), centerValue);
+    vec4 d = tapColor(readPacked(dsY, layerOffset + xm), centerValue);
+    vec4 f = tapColor(readPacked(dsY, layerOffset + xp), centerValue);
+    vec4 h = tapColor(readPacked(yp, layerOffset + sourceX), centerValue);
+
+    // flat neighborhoods (most pixels) skip the per-corner filter math
+    if (ColorDistance(e, b) + ColorDistance(e, d)
+        + ColorDistance(e, f) + ColorDistance(e, h) < (2.0 / 255.0))
+    {
+        imageStore(outFilteredPlanes, ivec2(gid), passThroughColor(centerValue));
+        return;
+    }
+
+    vec2 subpos = ((vec2(float(scaledX), float(scaledY))
+        - (vec2(float(sourceX), float(dsY)) * float(pc.scale)))
+        + vec2(0.5)) / float(pc.scale);
+
+#if PLANE_FILTER_MODE >= 3
+    vec4 a = tapColor(readPacked(ym, layerOffset + xm), centerValue);
+    vec4 c = tapColor(readPacked(ym, layerOffset + xp), centerValue);
+    vec4 g = tapColor(readPacked(yp, layerOffset + xm), centerValue);
+    vec4 px_i = tapColor(readPacked(yp, layerOffset + xp), centerValue);
+
+    vec4 filtered = FilterTexel(a, b, c, d, e, f, g, h, px_i, subpos);
+#else
+    // modes 1 and 2: bilinear between plane texels, smoothstep weighting for 2
+    float texelX = (float(scaledX) + 0.5) / float(pc.scale) - 0.5;
+    float texelY = (float(scaledY) + 0.5) / float(pc.scale) - 0.5;
+    int x0 = int(floor(clamp(texelX, 0.0, 255.0)));
+    int y0 = int(floor(clamp(texelY, 0.0, 191.0)));
+    int x1 = min(x0 + 1, 255);
+    int y1 = min(y0 + 1, 191);
+    float tx = clamp(texelX - float(x0), 0.0, 1.0);
+    float ty = clamp(texelY - float(y0), 0.0, 1.0);
+#if PLANE_FILTER_MODE == 2
+    tx = tx * tx * (3.0 - (2.0 * tx));
+    ty = ty * ty * (3.0 - (2.0 * ty));
+#endif
+    vec4 c00 = tapColor(readPacked(y0, layerOffset + x0), centerValue);
+    vec4 c10 = tapColor(readPacked(y0, layerOffset + x1), centerValue);
+    vec4 c01 = tapColor(readPacked(y1, layerOffset + x0), centerValue);
+    vec4 c11 = tapColor(readPacked(y1, layerOffset + x1), centerValue);
+    vec4 filtered = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+#endif
+
+    vec4 result = vec4(clamp(filtered.rgb, vec3(0.0), vec3(1.0)),
+                       float((centerValue >> 24u) & 0xFFu) * (1.0 / 255.0));
+    imageStore(outFilteredPlanes, ivec2(gid), result);
+}

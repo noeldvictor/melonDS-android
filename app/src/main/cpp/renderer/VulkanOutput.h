@@ -228,9 +228,13 @@ public:
     [[nodiscard]] bool isInitialized() const { return initialized; }
 
     bool ensureFrameResources(Frame* frame, u32 width, u32 height);
-    // The modes are pipeline specialization constants; changing them queues a
-    // compositor pipeline rebuild at the next safe frame boundary.
-    void setPacked2DFilterModes(u32 objMode, u32 bgMode);
+    // Per-producer 2D filter modes, applied through small per-mode pre-pass
+    // pipelines that are created lazily when a mode is first used.
+    void setPacked2DFilterModes(u32 objMode, u32 bgMode)
+    {
+        objFilterMode = objMode;
+        bgFilterMode = bgMode;
+    }
     void invalidateTemporalHistory();
     void clearStructuredCaptureHistory();
     void releaseTemporalFrameReferences();
@@ -315,6 +319,7 @@ private:
         u32 bottomStructuredHandoffNoCurrent3d;
         u32 topStructuredHandoffSuppress3d;
         u32 bottomStructuredHandoffSuppress3d;
+        u32 planeFilterActive;
     };
 
     struct AccumulatePushConstants
@@ -322,6 +327,15 @@ private:
         u32 scale;
         u32 packedStride;
         u32 topLcd;
+    };
+
+    struct PlaneFilterPushConstants
+    {
+        u32 scale;
+        u32 packedStride;
+        u32 applyObj;
+        u32 applyBg;
+        u32 writeOthers;
     };
 
     struct FrameResource
@@ -409,6 +423,10 @@ private:
         VkImageView cachedRendererImageView{VK_NULL_HANDLE};
         VkImageView cachedPreviousTopRendererImageView{VK_NULL_HANDLE};
         VkImageView cachedPreviousBottomRendererImageView{VK_NULL_HANDLE};
+        VkImageView cachedTopFilteredPlaneView{VK_NULL_HANDLE};
+        VkImageView cachedBottomFilteredPlaneView{VK_NULL_HANDLE};
+        std::array<VkDescriptorSet, 2> planeFilterDescriptorSets{};
+        bool planeFilterDescriptorsReady{};
         std::array<u32, 256 * 192> preparedCapture3dSource{};
     };
 
@@ -417,7 +435,10 @@ private:
     bool createCommandObjects();
     bool createCompositorResources();
     bool createCompositorPipeline();
-    bool refreshCompositorPipelineIfNeeded();
+    bool ensurePlaneFilterResources(u32 scale);
+    void destroyPlaneFilterResources();
+    VkPipeline getPlaneFilterPipeline(u32 mode);
+    bool recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs);
     bool createTimestampQueryPool(VkQueryPool& queryPool);
     void destroyTimestampQueryPool(VkQueryPool& queryPool);
     void destroyCompositorResources();
@@ -530,7 +551,26 @@ private:
 
     u32 objFilterMode{0};
     u32 bgFilterMode{0};
-    bool compositorPipelineDirty{false};
+
+    static constexpr u32 kPlaneFilterModeCount = 14;
+    VkDescriptorSetLayout planeFilterDescriptorSetLayout{VK_NULL_HANDLE};
+    VkDescriptorPool planeFilterDescriptorPool{VK_NULL_HANDLE};
+    VkPipelineLayout planeFilterPipelineLayout{VK_NULL_HANDLE};
+    std::array<VkPipeline, kPlaneFilterModeCount> planeFilterPipelines{};
+    std::array<bool, kPlaneFilterModeCount> planeFilterPipelineFailed{};
+    VkImage topFilteredPlaneImage{VK_NULL_HANDLE};
+    VkImageView topFilteredPlaneView{VK_NULL_HANDLE};
+    VkDeviceMemory topFilteredPlaneMemory{VK_NULL_HANDLE};
+    VkImage bottomFilteredPlaneImage{VK_NULL_HANDLE};
+    VkImageView bottomFilteredPlaneView{VK_NULL_HANDLE};
+    VkDeviceMemory bottomFilteredPlaneMemory{VK_NULL_HANDLE};
+    u32 filteredPlaneWidth{0};
+    u32 filteredPlaneHeight{0};
+    bool filteredPlaneLayoutReady{false};
+    VkImage placeholderPlaneImage{VK_NULL_HANDLE};
+    VkImageView placeholderPlaneView{VK_NULL_HANDLE};
+    VkDeviceMemory placeholderPlaneMemory{VK_NULL_HANDLE};
+    bool placeholderPlaneLayoutReady{false};
 
     std::unordered_map<Frame*, FrameResource> resources;
     std::mutex commandPoolLock;

@@ -349,6 +349,17 @@ generate_header \
   "melonDS_android_vulkan_accumulate_3d_comp_spv" \
   "$ROOT_DIR/app/src/main/cpp/renderer/VulkanAccumulate3dShaderData.h"
 
+# one small SPIR-V blob per 2D plane filter mode; some mobile shader
+# compilers cannot handle all filter modes in a single module
+for plane_filter_mode in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+  generate_header \
+    "$ROOT_DIR/app/src/main/cpp/renderer/VulkanPlaneFilterShader.comp" \
+    "comp" \
+    "melonDS_android_vulkan_plane_filter_mode${plane_filter_mode}_comp_spv" \
+    "$ROOT_DIR/app/src/main/cpp/renderer/VulkanPlaneFilterMode${plane_filter_mode}ShaderData.h" \
+    "-DPLANE_FILTER_MODE=${plane_filter_mode}"
+done
+
 generate_header \
   "$ROOT_DIR/app/src/main/cpp/renderer/VulkanSurfacePresenter.vert" \
   "vert" \

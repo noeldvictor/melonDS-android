@@ -17,6 +17,19 @@
 #include "VulkanDispatch.h"
 #include "VulkanCompositorShaderData.h"
 #include "VulkanAccumulate3dShaderData.h"
+#include "VulkanPlaneFilterMode1ShaderData.h"
+#include "VulkanPlaneFilterMode2ShaderData.h"
+#include "VulkanPlaneFilterMode3ShaderData.h"
+#include "VulkanPlaneFilterMode4ShaderData.h"
+#include "VulkanPlaneFilterMode5ShaderData.h"
+#include "VulkanPlaneFilterMode6ShaderData.h"
+#include "VulkanPlaneFilterMode7ShaderData.h"
+#include "VulkanPlaneFilterMode8ShaderData.h"
+#include "VulkanPlaneFilterMode9ShaderData.h"
+#include "VulkanPlaneFilterMode10ShaderData.h"
+#include "VulkanPlaneFilterMode11ShaderData.h"
+#include "VulkanPlaneFilterMode12ShaderData.h"
+#include "VulkanPlaneFilterMode13ShaderData.h"
 
 namespace MelonDSAndroid
 {
@@ -455,6 +468,7 @@ void VulkanOutput::shutdown()
 
     destroyFrameResources();
     destroyAccumulateResources();
+    destroyPlaneFilterResources();
     destroyCompositorResources();
 
     if (timelineSemaphore != VK_NULL_HANDLE)
@@ -715,7 +729,19 @@ bool VulkanOutput::createCompositorResources()
     previousBottomInput3dBinding.descriptorCount = 1;
     previousBottomInput3dBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    std::array<VkDescriptorSetLayoutBinding, 7> compositorBindings = {
+    VkDescriptorSetLayoutBinding topFilteredPlanesBinding{};
+    topFilteredPlanesBinding.binding = 7;
+    topFilteredPlanesBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    topFilteredPlanesBinding.descriptorCount = 1;
+    topFilteredPlanesBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutBinding bottomFilteredPlanesBinding{};
+    bottomFilteredPlanesBinding.binding = 8;
+    bottomFilteredPlanesBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bottomFilteredPlanesBinding.descriptorCount = 1;
+    bottomFilteredPlanesBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    std::array<VkDescriptorSetLayoutBinding, 9> compositorBindings = {
         outputBinding,
         input3dBinding,
         topPackedBinding,
@@ -723,6 +749,8 @@ bool VulkanOutput::createCompositorResources()
         previousTopInput3dBinding,
         capture3dBinding,
         previousBottomInput3dBinding,
+        topFilteredPlanesBinding,
+        bottomFilteredPlanesBinding,
     };
 
     VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCreateInfo{};
@@ -738,7 +766,7 @@ bool VulkanOutput::createCompositorResources()
 
     std::array<VkDescriptorPoolSize, 2> descriptorPoolSizes{};
     descriptorPoolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    descriptorPoolSizes[0].descriptorCount = static_cast<u32>(FRAME_QUEUE_SIZE * 4);
+    descriptorPoolSizes[0].descriptorCount = static_cast<u32>(FRAME_QUEUE_SIZE * 6);
     descriptorPoolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     descriptorPoolSizes[1].descriptorCount = static_cast<u32>(FRAME_QUEUE_SIZE * 3);
 
@@ -773,6 +801,58 @@ bool VulkanOutput::createCompositorResources()
         return false;
     }
 
+    // 1x1 stand-in bound to the filtered plane slots while no 2D filter mode
+    // is active
+    {
+        VkImageCreateInfo imageCreateInfo{};
+        imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        imageCreateInfo.extent = { 1, 1, 1 };
+        imageCreateInfo.mipLevels = 1;
+        imageCreateInfo.arrayLayers = 1;
+        imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageCreateInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device, &imageCreateInfo, nullptr, &placeholderPlaneImage) != VK_SUCCESS)
+        {
+            melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to create placeholder plane image");
+            return false;
+        }
+
+        VkMemoryRequirements memoryRequirements{};
+        vkGetImageMemoryRequirements(device, placeholderPlaneImage, &memoryRequirements);
+
+        VkMemoryAllocateInfo memoryAllocateInfo{};
+        memoryAllocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memoryAllocateInfo.allocationSize = memoryRequirements.size;
+        memoryAllocateInfo.memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryAllocateInfo.memoryTypeIndex == UINT32_MAX
+            || vkAllocateMemory(device, &memoryAllocateInfo, nullptr, &placeholderPlaneMemory) != VK_SUCCESS
+            || vkBindImageMemory(device, placeholderPlaneImage, placeholderPlaneMemory, 0) != VK_SUCCESS)
+        {
+            melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to allocate placeholder plane image memory");
+            return false;
+        }
+
+        VkImageViewCreateInfo viewCreateInfo{};
+        viewCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewCreateInfo.image = placeholderPlaneImage;
+        viewCreateInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        viewCreateInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewCreateInfo.subresourceRange.levelCount = 1;
+        viewCreateInfo.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(device, &viewCreateInfo, nullptr, &placeholderPlaneView) != VK_SUCCESS)
+        {
+            melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to create placeholder plane image view");
+            return false;
+        }
+        placeholderPlaneLayoutReady = false;
+    }
+
     return createCompositorPipeline();
 }
 
@@ -799,26 +879,11 @@ bool VulkanOutput::createCompositorPipeline()
         return false;
     }
 
-    // the 2D filter modes are specialization constants so the driver only
-    // compiles the selected filter paths
-    const std::array<VkSpecializationMapEntry, 2> specializationEntries = {
-        VkSpecializationMapEntry{0u, 0u, sizeof(u32)},
-        VkSpecializationMapEntry{1u, sizeof(u32), sizeof(u32)},
-    };
-    const std::array<u32, 2> specializationData = {objFilterMode, bgFilterMode};
-
-    VkSpecializationInfo specializationInfo{};
-    specializationInfo.mapEntryCount = static_cast<u32>(specializationEntries.size());
-    specializationInfo.pMapEntries = specializationEntries.data();
-    specializationInfo.dataSize = specializationData.size() * sizeof(u32);
-    specializationInfo.pData = specializationData.data();
-
     VkPipelineShaderStageCreateInfo shaderStageCreateInfo{};
     shaderStageCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     shaderStageCreateInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     shaderStageCreateInfo.module = shaderModule;
     shaderStageCreateInfo.pName = "main";
-    shaderStageCreateInfo.pSpecializationInfo = &specializationInfo;
 
     VkComputePipelineCreateInfo computePipelineCreateInfo{};
     computePipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -842,67 +907,576 @@ bool VulkanOutput::createCompositorPipeline()
         return false;
     }
 
-    compositorPipelineDirty = false;
     return true;
 }
 
-void VulkanOutput::setPacked2DFilterModes(u32 objMode, u32 bgMode)
+bool VulkanOutput::ensurePlaneFilterResources(u32 scale)
 {
-    if (objFilterMode == objMode && bgFilterMode == bgMode)
-        return;
+    const u32 width = 256u * scale;
+    const u32 height = 192u * scale * 2u;
+    if (width == 0 || height == 0)
+        return false;
 
-    objFilterMode = objMode;
-    bgFilterMode = bgMode;
-    compositorPipelineDirty = true;
-}
-
-bool VulkanOutput::refreshCompositorPipelineIfNeeded()
-{
-    if (!compositorPipelineDirty)
-        return compositorPipeline != VK_NULL_HANDLE;
-
-    // one-shot: the rebuild is attempted once per mode change so a failure
-    // can never turn into a per-dispatch pipeline compile loop
-    compositorPipelineDirty = false;
-
-    // wait until no submitted frame can still reference the old pipeline;
-    // a frame whose submission failed leaves its fence unsignaled forever,
-    // so the wait must stay bounded
-    constexpr u64 kPipelineRebuildFenceTimeoutNs = 5'000'000'000ull;
-    for (auto& [frame, frameResource] : resources)
+    if (planeFilterDescriptorSetLayout == VK_NULL_HANDLE)
     {
-        (void)frame;
-        if (frameResource.submitFence == VK_NULL_HANDLE)
-            continue;
-        if (vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kPipelineRebuildFenceTimeoutNs) != VK_SUCCESS)
+        VkDescriptorSetLayoutBinding packedBinding{};
+        packedBinding.binding = 0;
+        packedBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        packedBinding.descriptorCount = 1;
+        packedBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutBinding outputBinding{};
+        outputBinding.binding = 1;
+        outputBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        outputBinding.descriptorCount = 1;
+        outputBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        const std::array<VkDescriptorSetLayoutBinding, 2> bindings = {packedBinding, outputBinding};
+
+        VkDescriptorSetLayoutCreateInfo layoutCreateInfo{};
+        layoutCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutCreateInfo.bindingCount = static_cast<u32>(bindings.size());
+        layoutCreateInfo.pBindings = bindings.data();
+        if (vkCreateDescriptorSetLayout(device, &layoutCreateInfo, nullptr, &planeFilterDescriptorSetLayout) != VK_SUCCESS)
         {
-            melonDS::Platform::Log(
-                melonDS::Platform::LogLevel::Warn,
-                "VulkanOutput: frame fence wait timed out; keeping current compositor pipeline"
-            );
-            return compositorPipeline != VK_NULL_HANDLE;
+            melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to create plane filter descriptor set layout");
+            return false;
         }
     }
 
-    VkPipeline previousPipeline = compositorPipeline;
-    compositorPipeline = VK_NULL_HANDLE;
-    if (!createCompositorPipeline())
+    if (planeFilterDescriptorPool == VK_NULL_HANDLE)
+    {
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        poolSizes[0].descriptorCount = static_cast<u32>(FRAME_QUEUE_SIZE * 2);
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        poolSizes[1].descriptorCount = static_cast<u32>(FRAME_QUEUE_SIZE * 2);
+
+        VkDescriptorPoolCreateInfo poolCreateInfo{};
+        poolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolCreateInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        poolCreateInfo.maxSets = static_cast<u32>(FRAME_QUEUE_SIZE * 2);
+        poolCreateInfo.poolSizeCount = static_cast<u32>(poolSizes.size());
+        poolCreateInfo.pPoolSizes = poolSizes.data();
+        if (vkCreateDescriptorPool(device, &poolCreateInfo, nullptr, &planeFilterDescriptorPool) != VK_SUCCESS)
+        {
+            melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to create plane filter descriptor pool");
+            return false;
+        }
+    }
+
+    if (planeFilterPipelineLayout == VK_NULL_HANDLE)
+    {
+        VkPushConstantRange pushConstantRange{};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushConstantRange.offset = 0;
+        pushConstantRange.size = sizeof(PlaneFilterPushConstants);
+
+        VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{};
+        pipelineLayoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutCreateInfo.setLayoutCount = 1;
+        pipelineLayoutCreateInfo.pSetLayouts = &planeFilterDescriptorSetLayout;
+        pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
+        pipelineLayoutCreateInfo.pPushConstantRanges = &pushConstantRange;
+        if (vkCreatePipelineLayout(device, &pipelineLayoutCreateInfo, nullptr, &planeFilterPipelineLayout) != VK_SUCCESS)
+        {
+            melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to create plane filter pipeline layout");
+            return false;
+        }
+    }
+
+    if (topFilteredPlaneImage != VK_NULL_HANDLE
+        && bottomFilteredPlaneImage != VK_NULL_HANDLE
+        && filteredPlaneWidth == width
+        && filteredPlaneHeight == height)
+        return true;
+
+    // resize: wait for in-flight frames before dropping the old images; the
+    // waits stay bounded because a failed submission never signals its fence
+    constexpr u64 kResizeFenceTimeoutNs = 5'000'000'000ull;
+    for (auto& [frame, frameResource] : resources)
+    {
+        (void)frame;
+        if (frameResource.submitFence != VK_NULL_HANDLE)
+            (void)vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kResizeFenceTimeoutNs);
+        frameResource.planeFilterDescriptorsReady = false;
+        frameResource.cachedTopFilteredPlaneView = VK_NULL_HANDLE;
+        frameResource.cachedBottomFilteredPlaneView = VK_NULL_HANDLE;
+        frameResource.descriptorSetReady = false;
+    }
+
+    auto destroyOne = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory) {
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+    };
+    destroyOne(topFilteredPlaneImage, topFilteredPlaneView, topFilteredPlaneMemory);
+    destroyOne(bottomFilteredPlaneImage, bottomFilteredPlaneView, bottomFilteredPlaneMemory);
+    filteredPlaneLayoutReady = false;
+
+    auto createOne = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory) -> bool {
+        VkImageCreateInfo imageCreateInfo{};
+        imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        imageCreateInfo.extent = { width, height, 1 };
+        imageCreateInfo.mipLevels = 1;
+        imageCreateInfo.arrayLayers = 1;
+        imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageCreateInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device, &imageCreateInfo, nullptr, &image) != VK_SUCCESS)
+            return false;
+
+        VkMemoryRequirements memoryRequirements{};
+        vkGetImageMemoryRequirements(device, image, &memoryRequirements);
+
+        VkMemoryAllocateInfo memoryAllocateInfo{};
+        memoryAllocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memoryAllocateInfo.allocationSize = memoryRequirements.size;
+        memoryAllocateInfo.memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryAllocateInfo.memoryTypeIndex == UINT32_MAX
+            || vkAllocateMemory(device, &memoryAllocateInfo, nullptr, &memory) != VK_SUCCESS
+            || vkBindImageMemory(device, image, memory, 0) != VK_SUCCESS)
+        {
+            destroyOne(image, view, memory);
+            return false;
+        }
+
+        VkImageViewCreateInfo viewCreateInfo{};
+        viewCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewCreateInfo.image = image;
+        viewCreateInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        viewCreateInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewCreateInfo.subresourceRange.levelCount = 1;
+        viewCreateInfo.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(device, &viewCreateInfo, nullptr, &view) != VK_SUCCESS)
+        {
+            destroyOne(image, view, memory);
+            return false;
+        }
+        return true;
+    };
+
+    if (!createOne(topFilteredPlaneImage, topFilteredPlaneView, topFilteredPlaneMemory))
+        return false;
+    if (!createOne(bottomFilteredPlaneImage, bottomFilteredPlaneView, bottomFilteredPlaneMemory))
+    {
+        destroyOne(topFilteredPlaneImage, topFilteredPlaneView, topFilteredPlaneMemory);
+        return false;
+    }
+
+    filteredPlaneWidth = width;
+    filteredPlaneHeight = height;
+    return true;
+}
+
+VkPipeline VulkanOutput::getPlaneFilterPipeline(u32 mode)
+{
+    struct PlaneFilterBlob
+    {
+        const unsigned char* data;
+        size_t size;
+    };
+    static const std::array<PlaneFilterBlob, kPlaneFilterModeCount> blobs = {{
+        {nullptr, 0},
+        {melonDS_android_vulkan_plane_filter_mode1_comp_spv, melonDS_android_vulkan_plane_filter_mode1_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode2_comp_spv, melonDS_android_vulkan_plane_filter_mode2_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode3_comp_spv, melonDS_android_vulkan_plane_filter_mode3_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode4_comp_spv, melonDS_android_vulkan_plane_filter_mode4_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode5_comp_spv, melonDS_android_vulkan_plane_filter_mode5_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode6_comp_spv, melonDS_android_vulkan_plane_filter_mode6_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode7_comp_spv, melonDS_android_vulkan_plane_filter_mode7_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode8_comp_spv, melonDS_android_vulkan_plane_filter_mode8_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode9_comp_spv, melonDS_android_vulkan_plane_filter_mode9_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode10_comp_spv, melonDS_android_vulkan_plane_filter_mode10_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode11_comp_spv, melonDS_android_vulkan_plane_filter_mode11_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode12_comp_spv, melonDS_android_vulkan_plane_filter_mode12_comp_spv_len},
+        {melonDS_android_vulkan_plane_filter_mode13_comp_spv, melonDS_android_vulkan_plane_filter_mode13_comp_spv_len},
+    }};
+
+    if (mode == 0 || mode >= kPlaneFilterModeCount)
+        return VK_NULL_HANDLE;
+    if (planeFilterPipelines[mode] != VK_NULL_HANDLE)
+        return planeFilterPipelines[mode];
+    // one-shot: a mode whose pipeline failed to build stays disabled instead
+    // of retrying the compilation every frame
+    if (planeFilterPipelineFailed[mode])
+        return VK_NULL_HANDLE;
+    if (planeFilterPipelineLayout == VK_NULL_HANDLE)
+        return VK_NULL_HANDLE;
+
+    const PlaneFilterBlob& blob = blobs[mode];
+    if (blob.data == nullptr || blob.size == 0)
+    {
+        planeFilterPipelineFailed[mode] = true;
+        return VK_NULL_HANDLE;
+    }
+
+    std::vector<u32> shaderWords((blob.size + sizeof(u32) - 1u) / sizeof(u32));
+    std::memcpy(shaderWords.data(), blob.data, blob.size);
+
+    VkShaderModuleCreateInfo shaderModuleCreateInfo{};
+    shaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderModuleCreateInfo.codeSize = blob.size;
+    shaderModuleCreateInfo.pCode = shaderWords.data();
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &shaderModuleCreateInfo, nullptr, &shaderModule) != VK_SUCCESS)
+    {
+        melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to create plane filter shader module (mode %u)", mode);
+        planeFilterPipelineFailed[mode] = true;
+        return VK_NULL_HANDLE;
+    }
+
+    VkPipelineShaderStageCreateInfo shaderStageCreateInfo{};
+    shaderStageCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStageCreateInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    shaderStageCreateInfo.module = shaderModule;
+    shaderStageCreateInfo.pName = "main";
+
+    VkComputePipelineCreateInfo computePipelineCreateInfo{};
+    computePipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    computePipelineCreateInfo.stage = shaderStageCreateInfo;
+    computePipelineCreateInfo.layout = planeFilterPipelineLayout;
+
+    const VkResult pipelineResult = vkCreateComputePipelines(
+        device,
+        VK_NULL_HANDLE,
+        1,
+        &computePipelineCreateInfo,
+        nullptr,
+        &planeFilterPipelines[mode]
+    );
+
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+
+    if (pipelineResult != VK_SUCCESS)
     {
         melonDS::Platform::Log(
             melonDS::Platform::LogLevel::Error,
-            "VulkanOutput: compositor pipeline respecialization failed; keeping current pipeline"
+            "VulkanOutput: failed to create plane filter pipeline for mode %u (%d); rendering unfiltered",
+            mode,
+            static_cast<int>(pipelineResult)
         );
-        compositorPipeline = previousPipeline;
-        return compositorPipeline != VK_NULL_HANDLE;
+        planeFilterPipelines[mode] = VK_NULL_HANDLE;
+        planeFilterPipelineFailed[mode] = true;
+        return VK_NULL_HANDLE;
     }
 
-    if (previousPipeline != VK_NULL_HANDLE)
-        vkDestroyPipeline(device, previousPipeline, nullptr);
+    return planeFilterPipelines[mode];
+}
+
+void VulkanOutput::destroyPlaneFilterResources()
+{
+    for (VkPipeline& pipeline : planeFilterPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+    planeFilterPipelineFailed.fill(false);
+
+    if (planeFilterPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(device, planeFilterPipelineLayout, nullptr);
+        planeFilterPipelineLayout = VK_NULL_HANDLE;
+    }
+
+    if (planeFilterDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(device, planeFilterDescriptorPool, nullptr);
+        planeFilterDescriptorPool = VK_NULL_HANDLE;
+    }
+
+    if (planeFilterDescriptorSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, planeFilterDescriptorSetLayout, nullptr);
+        planeFilterDescriptorSetLayout = VK_NULL_HANDLE;
+    }
+
+    auto destroyOne = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory) {
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+    };
+    destroyOne(topFilteredPlaneImage, topFilteredPlaneView, topFilteredPlaneMemory);
+    destroyOne(bottomFilteredPlaneImage, bottomFilteredPlaneView, bottomFilteredPlaneMemory);
+    filteredPlaneWidth = 0;
+    filteredPlaneHeight = 0;
+    filteredPlaneLayoutReady = false;
+}
+
+bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs)
+{
+    const u32 scale = std::max(inputs.scale, 1u);
+    const u32 objMode = objFilterMode < kPlaneFilterModeCount ? objFilterMode : 0u;
+    const u32 bgMode = bgFilterMode < kPlaneFilterModeCount ? bgFilterMode : 0u;
+    if ((objMode == 0u && bgMode == 0u) || scale <= 1u)
+        return false;
+
+    if (!ensurePlaneFilterResources(scale))
+        return false;
+
+    // one pass per distinct heavy mode: the first pass also writes untouched
+    // pixels through, the second only replaces its own producer's pixels
+    struct Pass
+    {
+        u32 mode;
+        u32 applyObj;
+        u32 applyBg;
+        u32 writeOthers;
+    };
+    std::array<Pass, 2> passes{};
+    u32 passCount = 0;
+    if (objMode != 0u && objMode == bgMode)
+    {
+        passes[passCount++] = {objMode, 1u, 1u, 1u};
+    }
+    else
+    {
+        const bool firstIsObj = objMode != 0u;
+        passes[passCount++] = {
+            firstIsObj ? objMode : bgMode,
+            firstIsObj ? 1u : 0u,
+            firstIsObj ? 0u : 1u,
+            1u,
+        };
+        if (firstIsObj && bgMode != 0u)
+            passes[passCount++] = {bgMode, 0u, 1u, 0u};
+    }
+
+    std::array<VkPipeline, 2> passPipelines{};
+    for (u32 passIndex = 0; passIndex < passCount; passIndex++)
+    {
+        passPipelines[passIndex] = getPlaneFilterPipeline(passes[passIndex].mode);
+        if (passPipelines[passIndex] == VK_NULL_HANDLE)
+            return false;
+    }
+
+    if (!resource.planeFilterDescriptorsReady)
+    {
+        if (resource.planeFilterDescriptorSets[0] == VK_NULL_HANDLE)
+        {
+            const std::array<VkDescriptorSetLayout, 2> layouts = {
+                planeFilterDescriptorSetLayout,
+                planeFilterDescriptorSetLayout,
+            };
+            VkDescriptorSetAllocateInfo allocateInfo{};
+            allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocateInfo.descriptorPool = planeFilterDescriptorPool;
+            allocateInfo.descriptorSetCount = static_cast<u32>(layouts.size());
+            allocateInfo.pSetLayouts = layouts.data();
+            if (vkAllocateDescriptorSets(device, &allocateInfo, resource.planeFilterDescriptorSets.data()) != VK_SUCCESS)
+            {
+                resource.planeFilterDescriptorSets.fill(VK_NULL_HANDLE);
+                melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to allocate plane filter descriptor sets");
+                return false;
+            }
+        }
+
+        std::array<VkDescriptorBufferInfo, 2> bufferInfos{};
+        bufferInfos[0] = {resource.topPackedBuffer, 0, resource.packedBufferSize};
+        bufferInfos[1] = {resource.bottomPackedBuffer, 0, resource.packedBufferSize};
+
+        std::array<VkDescriptorImageInfo, 2> imageInfos{};
+        imageInfos[0] = {VK_NULL_HANDLE, topFilteredPlaneView, VK_IMAGE_LAYOUT_GENERAL};
+        imageInfos[1] = {VK_NULL_HANDLE, bottomFilteredPlaneView, VK_IMAGE_LAYOUT_GENERAL};
+
+        std::array<VkWriteDescriptorSet, 4> writes{};
+        for (u32 screen = 0; screen < 2; screen++)
+        {
+            writes[screen * 2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[screen * 2].dstSet = resource.planeFilterDescriptorSets[screen];
+            writes[screen * 2].dstBinding = 0;
+            writes[screen * 2].descriptorCount = 1;
+            writes[screen * 2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[screen * 2].pBufferInfo = &bufferInfos[screen];
+
+            writes[screen * 2 + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[screen * 2 + 1].dstSet = resource.planeFilterDescriptorSets[screen];
+            writes[screen * 2 + 1].dstBinding = 1;
+            writes[screen * 2 + 1].descriptorCount = 1;
+            writes[screen * 2 + 1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[screen * 2 + 1].pImageInfo = &imageInfos[screen];
+        }
+        vkUpdateDescriptorSets(device, static_cast<u32>(writes.size()), writes.data(), 0, nullptr);
+        resource.planeFilterDescriptorsReady = true;
+    }
+
+    const std::array<VkImage, 2> filteredImages = {topFilteredPlaneImage, bottomFilteredPlaneImage};
+
+    auto makeFilteredImageBarrier = [&](VkImage image, VkAccessFlags srcAccess, VkAccessFlags dstAccess, VkImageLayout oldLayout) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = srcAccess;
+        barrier.dstAccessMask = dstAccess;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        return barrier;
+    };
+
+    {
+        const VkImageLayout oldLayout = filteredPlaneLayoutReady ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        const VkAccessFlags srcAccess = filteredPlaneLayoutReady ? VK_ACCESS_SHADER_READ_BIT : 0;
+        const std::array<VkImageMemoryBarrier, 2> toWriteBarriers = {
+            makeFilteredImageBarrier(filteredImages[0], srcAccess, VK_ACCESS_SHADER_WRITE_BIT, oldLayout),
+            makeFilteredImageBarrier(filteredImages[1], srcAccess, VK_ACCESS_SHADER_WRITE_BIT, oldLayout),
+        };
+        vkCmdPipelineBarrier(
+            resource.commandBuffer,
+            filteredPlaneLayoutReady ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            static_cast<u32>(toWriteBarriers.size()),
+            toWriteBarriers.data()
+        );
+        filteredPlaneLayoutReady = true;
+    }
+
+    const u32 groupsX = (256u * scale + 7u) / 8u;
+    const u32 groupsY = (192u * scale * 2u + 7u) / 8u;
+
+    for (u32 screen = 0; screen < 2; screen++)
+    {
+        vkCmdBindDescriptorSets(
+            resource.commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            planeFilterPipelineLayout,
+            0,
+            1,
+            &resource.planeFilterDescriptorSets[screen],
+            0,
+            nullptr
+        );
+
+        for (u32 passIndex = 0; passIndex < passCount; passIndex++)
+        {
+            if (passIndex > 0)
+            {
+                // the second producer pass overwrites pixels the first wrote
+                // through, so order the writes explicitly
+                const VkImageMemoryBarrier writeOrderBarrier = makeFilteredImageBarrier(
+                    filteredImages[screen],
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_GENERAL);
+                vkCmdPipelineBarrier(
+                    resource.commandBuffer,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    0,
+                    nullptr,
+                    0,
+                    nullptr,
+                    1,
+                    &writeOrderBarrier
+                );
+            }
+
+            PlaneFilterPushConstants pushConstants{};
+            pushConstants.scale = scale;
+            pushConstants.packedStride = inputs.packedStride;
+            pushConstants.applyObj = passes[passIndex].applyObj;
+            pushConstants.applyBg = passes[passIndex].applyBg;
+            pushConstants.writeOthers = passes[passIndex].writeOthers;
+
+            vkCmdBindPipeline(resource.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, passPipelines[passIndex]);
+            vkCmdPushConstants(
+                resource.commandBuffer,
+                planeFilterPipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                sizeof(pushConstants),
+                &pushConstants
+            );
+            vkCmdDispatch(resource.commandBuffer, groupsX, groupsY, 1);
+        }
+    }
+
+    {
+        const std::array<VkImageMemoryBarrier, 2> toReadBarriers = {
+            makeFilteredImageBarrier(filteredImages[0], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+            makeFilteredImageBarrier(filteredImages[1], VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+        };
+        vkCmdPipelineBarrier(
+            resource.commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            static_cast<u32>(toReadBarriers.size()),
+            toReadBarriers.data()
+        );
+    }
+
     return true;
 }
 
 void VulkanOutput::destroyCompositorResources()
 {
+    if (placeholderPlaneView != VK_NULL_HANDLE)
+    {
+        vkDestroyImageView(device, placeholderPlaneView, nullptr);
+        placeholderPlaneView = VK_NULL_HANDLE;
+    }
+
+    if (placeholderPlaneImage != VK_NULL_HANDLE)
+    {
+        vkDestroyImage(device, placeholderPlaneImage, nullptr);
+        placeholderPlaneImage = VK_NULL_HANDLE;
+    }
+
+    if (placeholderPlaneMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(device, placeholderPlaneMemory, nullptr);
+        placeholderPlaneMemory = VK_NULL_HANDLE;
+    }
+    placeholderPlaneLayoutReady = false;
+
     if (compositorPipeline != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(device, compositorPipeline, nullptr);
@@ -1850,6 +2424,18 @@ void VulkanOutput::destroyFrameResource(Frame* frame)
 
     if (resource.descriptorSet != VK_NULL_HANDLE && compositorDescriptorPool != VK_NULL_HANDLE)
         vkFreeDescriptorSets(device, compositorDescriptorPool, 1, &resource.descriptorSet);
+
+    if (planeFilterDescriptorPool != VK_NULL_HANDLE)
+    {
+        for (VkDescriptorSet& planeFilterSet : resource.planeFilterDescriptorSets)
+        {
+            if (planeFilterSet != VK_NULL_HANDLE)
+            {
+                vkFreeDescriptorSets(device, planeFilterDescriptorPool, 1, &planeFilterSet);
+                planeFilterSet = VK_NULL_HANDLE;
+            }
+        }
+    }
 
     destroyTimestampQueryPool(resource.timestampQueryPool);
 
@@ -4590,9 +5176,6 @@ bool VulkanOutput::dispatchCompositor(
 {
     std::scoped_lock commandLock(commandPoolLock);
 
-    if (!refreshCompositorPipelineIfNeeded())
-        return false;
-
     if (!beginFrameCommand(resource))
         return false;
 
@@ -4729,6 +5312,47 @@ bool VulkanOutput::dispatchCompositor(
         nullptr
     );
 
+    // per-producer 2D filter pre-pass over the packed planes; on any failure
+    // the compositor simply samples the raw planes
+    const bool planeFilterActive =
+        (objFilterMode != 0u || bgFilterMode != 0u)
+        && inputs.scale > 1u
+        && recordPlaneFilterPasses(resource, inputs);
+
+    if (placeholderPlaneImage != VK_NULL_HANDLE && !placeholderPlaneLayoutReady)
+    {
+        VkImageMemoryBarrier placeholderBarrier{};
+        placeholderBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        placeholderBarrier.srcAccessMask = 0;
+        placeholderBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        placeholderBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        placeholderBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        placeholderBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        placeholderBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        placeholderBarrier.image = placeholderPlaneImage;
+        placeholderBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        placeholderBarrier.subresourceRange.levelCount = 1;
+        placeholderBarrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(
+            resource.commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &placeholderBarrier
+        );
+        placeholderPlaneLayoutReady = true;
+    }
+
+    const VkImageView topFilteredBindView =
+        planeFilterActive ? topFilteredPlaneView : placeholderPlaneView;
+    const VkImageView bottomFilteredBindView =
+        planeFilterActive ? bottomFilteredPlaneView : placeholderPlaneView;
+
     VkDescriptorImageInfo outputImageInfo{};
     outputImageInfo.imageView = resource.imageView;
     outputImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -4758,12 +5382,21 @@ bool VulkanOutput::dispatchCompositor(
     capture3dBufferInfo.offset = 0;
     capture3dBufferInfo.range = kCapture3dBufferSize;
 
+    VkDescriptorImageInfo topFilteredPlanesInfo{};
+    topFilteredPlanesInfo.imageView = topFilteredBindView;
+    topFilteredPlanesInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo bottomFilteredPlanesInfo{};
+    bottomFilteredPlanesInfo.imageView = bottomFilteredBindView;
+    bottomFilteredPlanesInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
     if (!resource.descriptorSetReady
         || resource.cachedRendererImageView != inputs.sourceImageView
         || resource.cachedPreviousTopRendererImageView != inputs.previousTopSourceImageView
-        || resource.cachedPreviousBottomRendererImageView != inputs.previousBottomSourceImageView)
+        || resource.cachedPreviousBottomRendererImageView != inputs.previousBottomSourceImageView
+        || resource.cachedTopFilteredPlaneView != topFilteredBindView
+        || resource.cachedBottomFilteredPlaneView != bottomFilteredBindView)
     {
-        std::array<VkWriteDescriptorSet, 7> descriptorWrites{};
+        std::array<VkWriteDescriptorSet, 9> descriptorWrites{};
         descriptorWrites[0] = makeImageDescriptorWrite(resource.descriptorSet, 0, &outputImageInfo);
         descriptorWrites[1] = makeImageDescriptorWrite(resource.descriptorSet, 1, &input3dImageInfo);
         descriptorWrites[2] = makeBufferDescriptorWrite(resource.descriptorSet, 2, &topPackedBufferInfo);
@@ -4771,12 +5404,16 @@ bool VulkanOutput::dispatchCompositor(
         descriptorWrites[4] = makeImageDescriptorWrite(resource.descriptorSet, 4, &previousTopInput3dImageInfo);
         descriptorWrites[5] = makeBufferDescriptorWrite(resource.descriptorSet, 5, &capture3dBufferInfo);
         descriptorWrites[6] = makeImageDescriptorWrite(resource.descriptorSet, 6, &previousBottomInput3dImageInfo);
+        descriptorWrites[7] = makeImageDescriptorWrite(resource.descriptorSet, 7, &topFilteredPlanesInfo);
+        descriptorWrites[8] = makeImageDescriptorWrite(resource.descriptorSet, 8, &bottomFilteredPlanesInfo);
 
         vkUpdateDescriptorSets(device, static_cast<u32>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
         resource.descriptorSetReady = true;
         resource.cachedRendererImageView = inputs.sourceImageView;
         resource.cachedPreviousTopRendererImageView = inputs.previousTopSourceImageView;
         resource.cachedPreviousBottomRendererImageView = inputs.previousBottomSourceImageView;
+        resource.cachedTopFilteredPlaneView = topFilteredBindView;
+        resource.cachedBottomFilteredPlaneView = bottomFilteredBindView;
     }
 
     vkCmdBindPipeline(resource.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, compositorPipeline);
@@ -4814,6 +5451,7 @@ bool VulkanOutput::dispatchCompositor(
     pushConstants.bottomStructuredHandoffNoCurrent3d = inputs.bottomStructuredHandoffNoCurrent3d ? 1u : 0u;
     pushConstants.topStructuredHandoffSuppress3d = inputs.topStructuredHandoffSuppress3d ? 1u : 0u;
     pushConstants.bottomStructuredHandoffSuppress3d = inputs.bottomStructuredHandoffSuppress3d ? 1u : 0u;
+    pushConstants.planeFilterActive = planeFilterActive ? 1u : 0u;
 
     vkCmdPushConstants(
         resource.commandBuffer,
