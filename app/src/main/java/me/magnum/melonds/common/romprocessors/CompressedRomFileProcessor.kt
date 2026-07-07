@@ -57,6 +57,11 @@ abstract class CompressedRomFileProcessor(private val context: Context, private 
         } catch (e: Exception) {
             e.printStackTrace()
             null
+        } catch (e: OutOfMemoryError) {
+            // A single archive with a huge dictionary must not kill the whole
+            // library scan; skip it and let the scan continue
+            e.printStackTrace()
+            null
         }
     }
 
