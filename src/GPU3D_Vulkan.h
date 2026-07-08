@@ -573,6 +573,7 @@ private:
     // whether the current raster pipelines were specialized with HD texture
     // sampling; flips (rarely) with the filter setting or texture pack scale
     bool PipelinesUseHDSampling = false;
+    u64 LastHDSamplingStatsLogNs = 0;
     BackendMode RequestedBackendMode = BackendMode::GraphicsHardware;
     BackendMode ActiveBackendMode = BackendMode::GraphicsHardware;
     bool UseSimplePipeline = true;

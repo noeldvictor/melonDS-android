@@ -714,6 +714,21 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
         logPerformanceIfNeeded();
     });
 
+    // once per second: is the 3D HD texture sampling path specialized in,
+    // and at what texel scale — cheap replacement for per-texel debug tint
+    {
+        const u64 nowNs = PerfNowNs();
+        if (nowNs - LastHDSamplingStatsLogNs >= 1'000'000'000ull)
+        {
+            LastHDSamplingStatsLogNs = nowNs;
+            Platform::Log(Platform::LogLevel::Info,
+                          "GPU3D_Vulkan[Stats]: hdSampling=%d texScale=%d filterMode=%d",
+                          PipelinesUseHDSampling ? 1 : 0,
+                          Texcache.GetHDTextureScale(),
+                          Texcache.GetHDTextureFilterMode());
+        }
+    }
+
     const bool textureCacheChanged = Texcache.Update(gpu, [&]() {
         if (Initialized && ActiveBackendMode == BackendMode::GraphicsHardware)
             (void)waitForTextureCacheMutationSafePoint();
