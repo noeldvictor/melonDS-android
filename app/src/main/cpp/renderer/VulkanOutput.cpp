@@ -37,6 +37,7 @@ namespace MelonDSAndroid
 {
 bool areRendererDebugToolsEnabled();
 bool areRendererDebugBgObjLogsEnabled();
+bool areRendererDebugFilterTintEnabled();
 bool areRenderer2DDebugControlsActive();
 bool isRenderer2DDebugBackgroundKindEnabled(melonDS::u32 featureFlag);
 
@@ -1698,6 +1699,7 @@ void VulkanOutput::recordPlaneOverlayPasses(FrameResource& resource, const Vulka
     auto* instanceData = static_cast<PlaneOverlayGpuInstance*>(resource.overlayInstanceMapped);
     for (size_t i = 0; i < prepared.size(); i++)
         instanceData[i] = prepared[i].gpu;
+    statsOverlayInstances += static_cast<u32>(prepared.size());
 
     // atlas: transition on first use, then order transfer uploads against
     // compute reads
@@ -1841,6 +1843,7 @@ void VulkanOutput::recordPlaneOverlayPasses(FrameResource& resource, const Vulka
             PlaneOverlayPushConstants pushConstants{};
             pushConstants.scale = scale;
             pushConstants.instanceIndex = static_cast<u32>(i);
+            pushConstants.debugTint = areRendererDebugFilterTintEnabled() ? 1u : 0u;
             vkCmdPushConstants(
                 resource.commandBuffer,
                 overlayPipelineLayout,
@@ -2100,6 +2103,7 @@ bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const Vulkan
             pushConstants.applyObj = passes[passIndex].applyObj;
             pushConstants.applyBg = passes[passIndex].applyBg;
             pushConstants.writeOthers = passes[passIndex].writeOthers;
+            pushConstants.debugTint = areRendererDebugFilterTintEnabled() ? 1u : 0u;
 
             vkCmdBindPipeline(resource.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, passPipelines[passIndex]);
             vkCmdPushConstants(
@@ -5928,13 +5932,17 @@ bool VulkanOutput::dispatchCompositor(
             );
         }
         if (!canReuseLastValid)
+        {
+            statsSkips++;
             return false;
+        }
 
         std::memcpy(resource.topPackedMapped, lastValidTopPacked.data(), lastValidTopPacked.size() * sizeof(u32));
         std::memcpy(resource.bottomPackedMapped, lastValidBottomPacked.data(), lastValidBottomPacked.size() * sizeof(u32));
         if (lastPackedScreenSwapValid)
             resource.screenSwap = lastPackedScreenSwap;
         packedFallbackApplied = true;
+        statsFallbacks++;
     }
 
     if (!beginFrameCommand(resource))
@@ -6080,6 +6088,53 @@ bool VulkanOutput::dispatchCompositor(
          || (replacement2DActive && !resource.replacementInstances.empty()))
         && inputs.scale > 1u
         && recordPlaneFilterPasses(resource, inputs);
+
+    if (!inputs.validationMode)
+    {
+        statsComposes++;
+        if (planeFilterActive)
+            statsPlaneFilters++;
+
+        // the filter pre-pass silently degrades to raw plane sampling when
+        // its pipelines or images are unavailable; surface that state
+        const bool planeFilterWanted =
+            (objFilterMode != 0u || bgFilterMode != 0u
+             || (replacement2DActive && !resource.replacementInstances.empty()))
+            && inputs.scale > 1u;
+        const u64 nowNs = PerfNowNs();
+        if (planeFilterWanted && !planeFilterActive
+            && nowNs - lastPlaneFilterUnavailableLogNs >= 1'000'000'000ull)
+        {
+            lastPlaneFilterUnavailableLogNs = nowNs;
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Warn,
+                "VulkanOutput: plane filter pass unavailable (obj=%u bg=%u scale=%u overlays=%zu)",
+                objFilterMode,
+                bgFilterMode,
+                inputs.scale,
+                resource.replacementInstances.size());
+        }
+
+        if (statsWindowStartNs == 0)
+            statsWindowStartNs = nowNs;
+        if (nowNs - statsWindowStartNs >= 1'000'000'000ull)
+        {
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Info,
+                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u",
+                statsComposes,
+                statsSkips,
+                statsFallbacks,
+                statsPlaneFilters,
+                statsOverlayInstances);
+            statsWindowStartNs = nowNs;
+            statsComposes = 0;
+            statsSkips = 0;
+            statsFallbacks = 0;
+            statsPlaneFilters = 0;
+            statsOverlayInstances = 0;
+        }
+    }
 
     if (placeholderPlaneImage != VK_NULL_HANDLE && !placeholderPlaneLayoutReady)
     {

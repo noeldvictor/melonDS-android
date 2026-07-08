@@ -321,6 +321,7 @@ std::unique_ptr<MelonDSAndroid::RenderSettings> MelonDSAndroidConfiguration::bui
     jboolean rendererDebugToolsEnabled = env->GetBooleanField(renderSettings, env->GetFieldID(renderSettingsClass, "rendererDebugToolsEnabled", "Z"));
     jboolean rendererDebugBgObjEnabled = env->GetBooleanField(renderSettings, env->GetFieldID(renderSettingsClass, "rendererDebugBgObjEnabled", "Z"));
     jboolean rendererDebugLatchTraceEnabled = env->GetBooleanField(renderSettings, env->GetFieldID(renderSettingsClass, "rendererDebugLatchTraceEnabled", "Z"));
+    jboolean rendererDebugFilterTintEnabled = env->GetBooleanField(renderSettings, env->GetFieldID(renderSettingsClass, "rendererDebugFilterTintEnabled", "Z"));
     jboolean conservativeCoverageEnabled = env->GetBooleanField(renderSettings, env->GetFieldID(renderSettingsClass, "conservativeCoverageEnabled", "Z"));
     jfloat conservativeCoveragePx = env->GetFloatField(renderSettings, env->GetFieldID(renderSettingsClass, "conservativeCoveragePx", "F"));
     jfloat conservativeCoverageDepthBias = env->GetFloatField(renderSettings, env->GetFieldID(renderSettingsClass, "conservativeCoverageDepthBias", "F"));
@@ -347,6 +348,7 @@ std::unique_ptr<MelonDSAndroid::RenderSettings> MelonDSAndroidConfiguration::bui
                 .rendererDebugToolsEnabled = rendererDebugToolsEnabled != 0,
                 .rendererDebugBgObjEnabled = rendererDebugBgObjEnabled != 0,
                 .rendererDebugLatchTraceEnabled = rendererDebugLatchTraceEnabled != 0,
+                .rendererDebugFilterTintEnabled = rendererDebugFilterTintEnabled != 0,
                 .conservativeCoverageEnabled = conservativeCoverageEnabled != 0,
                 .conservativeCoveragePx = (float)conservativeCoveragePx,
                 .conservativeCoverageDepthBias = (float)conservativeCoverageDepthBias,
@@ -367,6 +369,7 @@ std::unique_ptr<MelonDSAndroid::RenderSettings> MelonDSAndroidConfiguration::bui
                 .rendererDebugToolsEnabled = rendererDebugToolsEnabled != 0,
                 .rendererDebugBgObjEnabled = rendererDebugBgObjEnabled != 0,
                 .rendererDebugLatchTraceEnabled = rendererDebugLatchTraceEnabled != 0,
+                .rendererDebugFilterTintEnabled = rendererDebugFilterTintEnabled != 0,
                 .conservativeCoverageEnabled = conservativeCoverageEnabled != 0,
                 .conservativeCoveragePx = (float)conservativeCoveragePx,
                 .conservativeCoverageDepthBias = (float)conservativeCoverageDepthBias,
@@ -398,6 +401,7 @@ std::unique_ptr<MelonDSAndroid::RenderSettings> MelonDSAndroidConfiguration::bui
                 .rendererDebugToolsEnabled = rendererDebugToolsEnabled != 0,
                 .rendererDebugBgObjEnabled = rendererDebugBgObjEnabled != 0,
                 .rendererDebugLatchTraceEnabled = rendererDebugLatchTraceEnabled != 0,
+                .rendererDebugFilterTintEnabled = rendererDebugFilterTintEnabled != 0,
             }
         );
     }

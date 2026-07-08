@@ -111,6 +111,7 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
             add(findPreference("video_renderer_debug_tools_enabled")!!)
             add(findPreference("video_renderer_debug_bgobj_enabled")!!)
             add(findPreference("video_renderer_debug_latch_trace_enabled")!!)
+            add(findPreference("video_renderer_debug_filter_tint_enabled")!!)
         }
 
         coverageFixPreferences.apply {

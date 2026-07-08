@@ -159,6 +159,7 @@ namespace MelonDSAndroid {
     extern bool areRendererDebugToolsEnabled();
     extern bool areRendererDebugBgObjLogsEnabled();
     extern bool areRendererDebugLatchTraceLogsEnabled();
+    extern bool areRendererDebugFilterTintEnabled();
     extern Renderer2DDebugControlState getRenderer2DDebugControls();
     extern void setRenderer2DDebugControls(
         int mainForcedMode,

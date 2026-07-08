@@ -8,6 +8,7 @@ data class RendererConfiguration(
     val rendererDebugToolsEnabled: Boolean,
     val rendererDebugBgObjEnabled: Boolean,
     val rendererDebugLatchTraceEnabled: Boolean,
+    val rendererDebugFilterTintEnabled: Boolean,
     val conservativeCoverageEnabled: Boolean,
     val conservativeCoveragePx: Float,
     val conservativeCoverageDepthBias: Float,

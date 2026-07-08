@@ -58,6 +58,7 @@ internal class DebugCommandReceiver : BroadcastReceiver() {
             context.debugCommandAction(ACTION_SET_JIT_SUFFIX) -> { handleSetJit(entryPoint, intent); true }
             context.debugCommandAction(ACTION_SET_BGOBJ_LOG_SUFFIX) -> { handleSetBgObjLog(entryPoint, intent); true }
             context.debugCommandAction(ACTION_SET_LATCH_TRACE_SUFFIX) -> { handleSetLatchTrace(entryPoint, intent); true }
+            context.debugCommandAction(ACTION_SET_FILTER_TINT_SUFFIX) -> { handleSetFilterTint(entryPoint, intent); true }
             context.debugCommandAction(ACTION_SET_FAST_FORWARD_SUFFIX) -> { handleSetFastForward(intent); true }
             context.debugCommandAction(ACTION_SET_SLOT2_ANALOG_SUFFIX) -> { handleSetSlot2Analog(intent); true }
             context.debugCommandAction(ACTION_SET_SLOT2_ANALOG_MAPPING_SUFFIX) -> { handleSetSlot2AnalogMapping(entryPoint, intent); true }
@@ -127,6 +128,16 @@ internal class DebugCommandReceiver : BroadcastReceiver() {
         }
         val refreshed = DebugCommandStateStore.requestSettingsRefresh()
         Log.w(TAG, "action=set_latch_trace enabled=${if (enabled) 1 else 0} refreshed=${if (refreshed) 1 else 0}")
+    }
+
+    private fun handleSetFilterTint(entryPoint: DebugCommandEntryPoint, intent: Intent) {
+        val enabled = intent.firstBooleanExtra(EXTRA_ENABLED, EXTRA_VALUE)
+            ?: throw IllegalArgumentException("Missing enabled extra")
+        entryPoint.sharedPreferences().edit(commit = true) {
+            putBoolean(KEY_RENDERER_DEBUG_FILTER_TINT_ENABLED, enabled)
+        }
+        val refreshed = DebugCommandStateStore.requestSettingsRefresh()
+        Log.w(TAG, "action=set_filter_tint enabled=${if (enabled) 1 else 0} refreshed=${if (refreshed) 1 else 0}")
     }
 
     private fun handleSetFastForward(intent: Intent) {
@@ -1099,6 +1110,7 @@ internal class DebugCommandReceiver : BroadcastReceiver() {
         private const val KEY_RENDERER_DEBUG_TOOLS_ENABLED = "video_renderer_debug_tools_enabled"
         private const val KEY_RENDERER_DEBUG_BGOBJ_ENABLED = "video_renderer_debug_bgobj_enabled"
         private const val KEY_RENDERER_DEBUG_LATCH_TRACE_ENABLED = "video_renderer_debug_latch_trace_enabled"
+        private const val KEY_RENDERER_DEBUG_FILTER_TINT_ENABLED = "video_renderer_debug_filter_tint_enabled"
 
         private const val EXTRA_RENDERER = "renderer"
         private const val EXTRA_SCALE = "scale"
@@ -1165,6 +1177,7 @@ internal class DebugCommandReceiver : BroadcastReceiver() {
         private const val ACTION_SET_JIT_SUFFIX = "SET_JIT"
         private const val ACTION_SET_BGOBJ_LOG_SUFFIX = "SET_BGOBJ_LOG"
         private const val ACTION_SET_LATCH_TRACE_SUFFIX = "SET_LATCH_TRACE"
+        private const val ACTION_SET_FILTER_TINT_SUFFIX = "SET_FILTER_TINT"
         private const val ACTION_SET_FAST_FORWARD_SUFFIX = "SET_FAST_FORWARD"
         private const val ACTION_SET_SLOT2_ANALOG_SUFFIX = "SET_SLOT2_ANALOG"
         private const val ACTION_SET_SLOT2_ANALOG_MAPPING_SUFFIX = "SET_SLOT2_ANALOG_MAPPING"

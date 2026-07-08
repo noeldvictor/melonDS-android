@@ -311,6 +311,8 @@
     <string name="video_renderer_debug_bgobj_enabled_summary">Enables extra RendererDebug[BGOBJ] logs for 2D compositor diagnosis. Requires Renderer debug tools.</string>
     <string name="video_renderer_debug_latch_trace_enabled">Show RendererDebug Latch trace</string>
     <string name="video_renderer_debug_latch_trace_enabled_summary">Enables RendererDebug[Latch] logs that compare live framebuffer vs latched packed snapshot stage by stage. Requires Renderer debug tools. Spammy.</string>
+    <string name="video_renderer_debug_filter_tint_enabled">Tint HD filter coverage</string>
+    <string name="video_renderer_debug_filter_tint_enabled_summary">Tints pixels handled by the 2D plane filter (OBJ green, BG blue) and HD replacement overlay (magenta) so filter coverage is visible on screen. Requires Renderer debug tools.</string>
     <string name="renderer_debug_menu">Renderer debug</string>
     <string name="renderer_debug_capture">Dump renderer capture</string>
     <string name="renderer_debug_capture_logged">Renderer capture dumped to Logcat. Capture ID: %1$s</string>

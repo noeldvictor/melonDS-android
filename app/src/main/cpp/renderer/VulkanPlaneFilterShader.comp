@@ -35,7 +35,20 @@ layout(push_constant) uniform PushConsts
     uint applyObj;
     uint applyBg;
     uint writeOthers;
+    uint debugTint;
 } pc;
+
+// debug coverage visualization: pixels this pass classified and processed
+// are shifted towards green (OBJ) or blue (BG) so filter coverage shows in
+// a single screenshot
+vec4 applyDebugTint(vec4 color, uint centerValue)
+{
+    if (pc.debugTint == 0u)
+        return color;
+    uint flags = (centerValue >> 24u) & 0xFFu;
+    vec3 tint = ((flags & 0x90u) != 0u) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+    return vec4(mix(color.rgb, tint, 0.35), color.a);
+}
 
 uint readPacked(int y, int x)
 {
@@ -637,7 +650,7 @@ void main()
     if (ColorDistance(e, b) + ColorDistance(e, d)
         + ColorDistance(e, f) + ColorDistance(e, h) < (2.0 / 255.0))
     {
-        imageStore(outFilteredPlanes, ivec2(gid), passThroughColor(centerValue));
+        imageStore(outFilteredPlanes, ivec2(gid), applyDebugTint(passThroughColor(centerValue), centerValue));
         return;
     }
 
@@ -675,5 +688,5 @@ void main()
 
     vec4 result = vec4(clamp(filtered.rgb, vec3(0.0), vec3(1.0)),
                        float((centerValue >> 24u) & 0xFFu) * (1.0 / 255.0));
-    imageStore(outFilteredPlanes, ivec2(gid), result);
+    imageStore(outFilteredPlanes, ivec2(gid), applyDebugTint(result, centerValue));
 }

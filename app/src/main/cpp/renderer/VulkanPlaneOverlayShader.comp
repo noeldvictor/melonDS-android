@@ -33,6 +33,7 @@ layout(push_constant) uniform PushConsts
 {
     uint scale;
     uint instanceIndex;
+    uint debugTint;
 } pc;
 
 void main()
@@ -72,6 +73,8 @@ void main()
         if ((producer & requireMask) == 0u || (producer & rejectMask) != 0u)
             continue;
         vec3 blended = mix(existing.rgb, hd.rgb, hd.a);
+        if (pc.debugTint != 0u)
+            blended = mix(blended, vec3(1.0, 0.0, 1.0), 0.5);
         imageStore(planes, coord, vec4(blended, existing.a));
     }
 }

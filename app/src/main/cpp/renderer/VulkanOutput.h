@@ -349,12 +349,14 @@ private:
         u32 applyObj;
         u32 applyBg;
         u32 writeOthers;
+        u32 debugTint;
     };
 
     struct PlaneOverlayPushConstants
     {
         u32 scale;
         u32 instanceIndex;
+        u32 debugTint;
     };
 
     // std430 mirror of the overlay shader's OverlayInstance struct
@@ -608,6 +610,13 @@ private:
     u32 objFilterMode{0};
     u32 bgFilterMode{0};
     u64 lastEmptyPackedComposeLogNs{0};
+    u64 lastPlaneFilterUnavailableLogNs{0};
+    u64 statsWindowStartNs{0};
+    u32 statsComposes{0};
+    u32 statsSkips{0};
+    u32 statsFallbacks{0};
+    u32 statsPlaneFilters{0};
+    u32 statsOverlayInstances{0};
 
     static constexpr u32 kPlaneFilterModeCount = 14;
     VkDescriptorSetLayout planeFilterDescriptorSetLayout{VK_NULL_HANDLE};

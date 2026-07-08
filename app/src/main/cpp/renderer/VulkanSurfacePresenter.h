@@ -411,6 +411,7 @@ private:
     u64 fallbackReasonSurfaceCount = 0;
     int lastLoggedPresentPath = -1;
     u64 lastPresentPathLogNs = 0;
+    u32 suppressedPresentPathTransitions = 0;
     std::unordered_set<u64> failedSwapchainConfigs;
     std::unordered_set<u64> loggedFailedSwapchainConfigs;
     bool lastPresentedDirect = true;

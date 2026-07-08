@@ -1022,24 +1022,34 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
     // visible in logs together with the source-validity flags that drive it
     const int presentPath = directPresentRequested ? 1 : 0;
     const u64 pathLogNowNs = PerfNowNs();
-    if (presentPath != lastLoggedPresentPath
-        && pathLogNowNs - lastPresentPathLogNs >= 1'000'000'000ull)
+    if (presentPath != lastLoggedPresentPath)
     {
-        lastPresentPathLogNs = pathLogNowNs;
-        melonDS::Platform::Log(
-            melonDS::Platform::LogLevel::Warn,
-            "VulkanPresenter[Path]: direct=%d surfaces=%zu dualRect=%d postFilter=%d planeFilter=%d capture=%d prevTop=%d prevBottom=%d readback=%d",
-            presentPath,
-            surfaces.size(),
-            hasDualScreenSurface ? 1 : 0,
-            postProcessFilterRequested ? 1 : 0,
-            inputs.planeFilterRequested ? 1 : 0,
-            inputs.capture3dSourceValid ? 1 : 0,
-            inputs.previousTopSourceValid ? 1 : 0,
-            inputs.previousBottomSourceValid ? 1 : 0,
-            inputs.needsReadback ? 1 : 0
-        );
-        lastLoggedPresentPath = presentPath;
+        if (pathLogNowNs - lastPresentPathLogNs >= 1'000'000'000ull)
+        {
+            lastPresentPathLogNs = pathLogNowNs;
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Warn,
+                "VulkanPresenter[Path]: direct=%d surfaces=%zu dualRect=%d postFilter=%d planeFilter=%d capture=%d prevTop=%d prevBottom=%d readback=%d suppressed=%u",
+                presentPath,
+                surfaces.size(),
+                hasDualScreenSurface ? 1 : 0,
+                postProcessFilterRequested ? 1 : 0,
+                inputs.planeFilterRequested ? 1 : 0,
+                inputs.capture3dSourceValid ? 1 : 0,
+                inputs.previousTopSourceValid ? 1 : 0,
+                inputs.previousBottomSourceValid ? 1 : 0,
+                inputs.needsReadback ? 1 : 0,
+                suppressedPresentPathTransitions
+            );
+            lastLoggedPresentPath = presentPath;
+            suppressedPresentPathTransitions = 0;
+        }
+        else
+        {
+            // rapid oscillation inside the cooldown stays visible through
+            // the counter on the next emitted line
+            suppressedPresentPathTransitions++;
+        }
     }
 
     VkImage frameImage = VK_NULL_HANDLE;

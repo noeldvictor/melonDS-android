@@ -163,6 +163,7 @@ class SharedPreferencesSettingsRepository(
         val rendererDebugToolsEnabled: Boolean,
         val rendererDebugBgObjEnabled: Boolean,
         val rendererDebugLatchTraceEnabled: Boolean,
+        val rendererDebugFilterTintEnabled: Boolean,
     )
     private data class CoverageFixConfigurationInputs(
         val enabled: Boolean,
@@ -205,6 +206,7 @@ class SharedPreferencesSettingsRepository(
                     rendererDebugToolsEnabled = false,
                     rendererDebugBgObjEnabled = false,
                     rendererDebugLatchTraceEnabled = false,
+                    rendererDebugFilterTintEnabled = false,
                 )
             },
             isRendererDebugToolsEnabled(),
@@ -219,11 +221,18 @@ class SharedPreferencesSettingsRepository(
             coreInputs.copy(rendererDebugBgObjEnabled = rendererDebugBgObjEnabled)
         }
 
-        val fullCoreRenderInputsFlow = combine(
+        val coreWithLatchTraceFlow = combine(
             coreWithBgObjFlow,
             isRendererDebugLatchTraceEnabled(),
         ) { coreInputs, rendererDebugLatchTraceEnabled ->
             coreInputs.copy(rendererDebugLatchTraceEnabled = rendererDebugLatchTraceEnabled)
+        }
+
+        val fullCoreRenderInputsFlow = combine(
+            coreWithLatchTraceFlow,
+            isRendererDebugFilterTintEnabled(),
+        ) { coreInputs, rendererDebugFilterTintEnabled ->
+            coreInputs.copy(rendererDebugFilterTintEnabled = rendererDebugFilterTintEnabled)
         }
 
         val coverageFixInputsFlow = combine(
@@ -291,6 +300,7 @@ class SharedPreferencesSettingsRepository(
                 renderInputs.core.rendererDebugToolsEnabled,
                 renderInputs.core.rendererDebugBgObjEnabled,
                 renderInputs.core.rendererDebugLatchTraceEnabled,
+                renderInputs.core.rendererDebugFilterTintEnabled,
                 coverageFixEnabled,
                 renderInputs.coverageFix.coveragePx,
                 renderInputs.coverageFix.depthBias,
@@ -1125,6 +1135,12 @@ class SharedPreferencesSettingsRepository(
     override fun isRendererDebugLatchTraceEnabled(): Flow<Boolean> {
         return getOrCreatePreferenceSharedFlow("video_renderer_debug_latch_trace_enabled") {
             preferences.getBoolean("video_renderer_debug_latch_trace_enabled", false)
+        }
+    }
+
+    private fun isRendererDebugFilterTintEnabled(): Flow<Boolean> {
+        return getOrCreatePreferenceSharedFlow("video_renderer_debug_filter_tint_enabled") {
+            preferences.getBoolean("video_renderer_debug_filter_tint_enabled", false)
         }
     }
 
