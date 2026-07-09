@@ -722,12 +722,14 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
         if (nowNs - LastHDSamplingStatsLogNs >= 1'000'000'000ull)
         {
             LastHDSamplingStatsLogNs = nowNs;
-            Platform::Log(Platform::LogLevel::Info,
-                          "GPU3D_Vulkan[Stats]: hdSampling=%d texScale=%d filterMode=%d capFallback(restore=%llu miss=%llu fill=%llu clear=%llu)",
+            Platform::Log(Platform::LogLevel::Warn,
+                          "GPU3D_Vulkan[Stats]: hdSampling=%d texScale=%d filterMode=%d capFallback(restore=%llu otherSwap=%llu banked=%llu miss=%llu fill=%llu clear=%llu)",
                           PipelinesUseHDSampling ? 1 : 0,
                           Texcache.GetHDTextureScale(),
                           Texcache.GetHDTextureFilterMode(),
                           static_cast<unsigned long long>(ExactCaptureRestoreCount),
+                          static_cast<unsigned long long>(ExactCaptureRestoreOtherSwapCount),
+                          static_cast<unsigned long long>(ExactCaptureBankedMismatchCount),
                           static_cast<unsigned long long>(ExactCaptureRestoreMissCount),
                           static_cast<unsigned long long>(ExactCaptureFallbackFillCount),
                           static_cast<unsigned long long>(ExactCaptureClearCount));
@@ -1244,15 +1246,16 @@ void VulkanRenderer3D::PrepareCaptureFrameActiveBackend()
     {
         if (finalizeCaptureLineFrame(exactCaptureOnly))
         {
-            const bool readyMatchesHint =
-                !exactCaptureOnly
-                || !HasCurrentCaptureScreenSwapHint
-                || ReadyCaptureLineScreenSwap == CurrentCaptureScreenSwapHint;
-            HasCpuFrame = readyMatchesHint && copyReadyCaptureLineToLineCache();
+            HasCpuFrame = copyReadyCaptureLineToLineCache();
+            if (HasCpuFrame || !exactCaptureOnly)
+                return;
+            // graphics_hw: the finished export belonged to the other swap
+            // phase and was banked; fall through to the per-swap hold
+        }
+        else if (CaptureLinePending)
+        {
             return;
         }
-        if (CaptureLinePending)
-            return;
     }
 
     if (!HasCpuFrame && CaptureReadbackPending)
@@ -13873,10 +13876,36 @@ bool VulkanRenderer3D::copyReadyCaptureLineToLineCache()
         && HasCurrentCaptureScreenSwapHint
         && ReadyCaptureLineScreenSwap != CurrentCaptureScreenSwapHint)
     {
+        // a late export still carries a valid capture for the OTHER swap
+        // phase; bank it so the per-swap hold can serve that screen's next
+        // frame instead of degrading to a fill. Under a systematic one-frame
+        // export lag with per-frame swap alternation this keeps every frame
+        // on real capture content.
+        const size_t swapIndex = ReadyCaptureLineScreenSwap ? 1u : 0u;
+        auto& banked = LastValidExactCaptureLineCache[swapIndex];
+        if (CaptureLineDataIsRgba8)
+        {
+            for (size_t i = 0; i < banked.size(); i++)
+            {
+                const u32 sourcePixel = captureSource[i];
+                banked[i] = ((sourcePixel & 0xFFu) >> 2u)
+                    | ((((sourcePixel >> 8u) & 0xFFu) >> 2u) << 8u)
+                    | ((((sourcePixel >> 16u) & 0xFFu) >> 2u) << 16u)
+                    | ((((sourcePixel >> 24u) & 0xFFu) >> 3u) << 24u);
+            }
+        }
+        else
+        {
+            std::memcpy(banked.data(), captureSource, banked.size() * sizeof(u32));
+        }
+        HasLastValidExactCapture[swapIndex] = true;
+        ExactCaptureBankedMismatchCount++;
+
         CaptureLineReady = false;
         ReadyCaptureLineData = nullptr;
         ReadyCaptureLineBufferSlot = -1;
         ReadyCaptureLineScreenSwap = false;
+        CaptureLineDataIsRgba8 = false;
         return false;
     }
 
@@ -13931,17 +13960,29 @@ bool VulkanRenderer3D::restoreLastValidExactCaptureToLineCache()
     const bool wantSwap = HasCurrentCaptureScreenSwapHint
         ? CurrentCaptureScreenSwapHint
         : LastValidExactCaptureMostRecentSwap;
-    const size_t swapIndex = wantSwap ? 1u : 0u;
+    size_t swapIndex = wantSwap ? 1u : 0u;
     if (!HasLastValidExactCapture[swapIndex])
     {
-        ExactCaptureRestoreMissCount++;
-        return false;
+        // startup transient: no capture of this screen has completed yet.
+        // The other screen's capture is still far closer to real content
+        // than the clear-color fill.
+        const size_t otherIndex = swapIndex ^ 1u;
+        if (!HasLastValidExactCapture[otherIndex])
+        {
+            ExactCaptureRestoreMissCount++;
+            return false;
+        }
+        swapIndex = otherIndex;
+        ExactCaptureRestoreOtherSwapCount++;
+    }
+    else
+    {
+        ExactCaptureRestoreCount++;
     }
 
     LineCache = LastValidExactCaptureLineCache[swapIndex];
     ExactCaptureLineCachePrepared = true;
     ExactCaptureLineCacheFresh = false;
-    ExactCaptureRestoreCount++;
     return true;
 }
 

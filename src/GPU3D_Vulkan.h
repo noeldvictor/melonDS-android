@@ -783,6 +783,8 @@ private:
     std::array<bool, 2> HasLastValidExactCapture{};
     bool LastValidExactCaptureMostRecentSwap = false;
     u64 ExactCaptureRestoreCount = 0;
+    u64 ExactCaptureRestoreOtherSwapCount = 0;
+    u64 ExactCaptureBankedMismatchCount = 0;
     u64 ExactCaptureRestoreMissCount = 0;
     u64 ExactCaptureFallbackFillCount = 0;
     u64 ExactCaptureClearCount = 0;
