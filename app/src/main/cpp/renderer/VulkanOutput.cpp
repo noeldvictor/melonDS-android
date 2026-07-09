@@ -4888,6 +4888,17 @@ bool VulkanOutput::prepareFrameForPresentation(
         && topUsesStructured3d
         && topUsesPlainStructuredComp7Slot
         && !live3dOwnerIsTop;
+    // a screen whose packed content is 3D-backed (vram capture, regular
+    // capture or a structured slot) while the live 3D belongs to the other
+    // LCD has no source unless it holds previous 3D content: the compositor
+    // otherwise composes the packed placeholder, which is black, and the
+    // master-brightness "up" register turns alternate frames white — the
+    // every-other-frame title strobe on plain (non-class4) alternating
+    // vram/structured pairs
+    const bool topShows3dBackedContent =
+        topUsesVramCapture3d || topUsesRegularCapture3d || topUsesStructured3d;
+    const bool bottomShows3dBackedContent =
+        bottomUsesVramCapture3d || bottomUsesRegularCapture3d || bottomUsesStructured3d;
     const bool topNeedsAccumulatedHighres =
         topCanUseAccumulatedHighres
         && (!topStructuredHandoffNoCurrent3d || live3dOwnerIsTop)
@@ -4898,7 +4909,7 @@ bool VulkanOutput::prepareFrameForPresentation(
             || topPlainStructuredComp7PureAlternatingVramCadenceCarry
             || (topPlainStructuredComp7UsesOppositeLive3d
                 && !topPlainStructuredComp7PureAlternatingVramPair)
-            || (class4VramStructuredPair
+            || (topShows3dBackedContent
                 && !live3dOwnerIsTop
                 && !topPlainStructuredComp7PureAlternatingVramPair));
     const bool bottomNeedsAccumulatedHighres =
@@ -4910,7 +4921,7 @@ bool VulkanOutput::prepareFrameForPresentation(
             || bottomStructuredSlotUsesPreviousWhileTop2dOnly
             || (bottomPlainStructuredComp7UsesOppositeLive3d
                 && !bottomPlainStructuredComp7PureAlternatingVramPair)
-            || (class4VramStructuredPair
+            || (bottomShows3dBackedContent
                 && live3dOwnerIsTop
                 && !bottomPlainStructuredComp7PureAlternatingVramPair));
     resource.previousTopRendererSourceImage = currentSourceImage;
@@ -6582,13 +6593,18 @@ bool VulkanOutput::dispatchCompositor(
         if (nowNs - statsWindowStartNs >= 1'000'000'000ull)
         {
             melonDS::Platform::Log(
-                melonDS::Platform::LogLevel::Info,
-                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u",
+                melonDS::Platform::LogLevel::Warn,
+                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u src(cap=%u prevTop=%u prevBottom=%u liveSwap=%u screenSwap=%u)",
                 statsComposes,
                 statsSkips,
                 statsFallbacks,
                 statsPlaneFilters,
-                statsOverlayInstances);
+                statsOverlayInstances,
+                inputs.capture3dSourceValid ? 1u : 0u,
+                inputs.previousTopSourceValid ? 1u : 0u,
+                inputs.previousBottomSourceValid ? 1u : 0u,
+                inputs.liveSourceScreenSwap ? 1u : 0u,
+                inputs.screenSwap);
             statsWindowStartNs = nowNs;
             statsComposes = 0;
             statsSkips = 0;
