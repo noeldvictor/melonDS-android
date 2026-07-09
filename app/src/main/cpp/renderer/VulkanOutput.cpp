@@ -12,6 +12,9 @@
 #include "GPU2D_Soft.h"
 #include "GPU3D_Vulkan.h"
 #include "HDTexPack.h"
+
+#define XXH_STATIC_LINKING_ONLY
+#include "xxhash/xxhash.h"
 #include "NDS.h"
 #include "Platform.h"
 #include "VulkanContext.h"
@@ -1040,6 +1043,7 @@ bool VulkanOutput::ensurePlaneFilterResources(u32 scale)
     destroyOne(topFilteredPlaneImage, topFilteredPlaneView, topFilteredPlaneMemory);
     destroyOne(bottomFilteredPlaneImage, bottomFilteredPlaneView, bottomFilteredPlaneMemory);
     filteredPlaneLayoutReady = false;
+    planeFilterCacheValid = false;
 
     auto createOne = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory) -> bool {
         VkImageCreateInfo imageCreateInfo{};
@@ -1249,6 +1253,7 @@ void VulkanOutput::destroyPlaneFilterResources()
     filteredPlaneWidth = 0;
     filteredPlaneHeight = 0;
     filteredPlaneLayoutReady = false;
+    planeFilterCacheValid = false;
 }
 
 void VulkanOutput::setReplacement2DActive(bool active)
@@ -6599,12 +6604,68 @@ bool VulkanOutput::dispatchCompositor(
     );
 
     // per-producer 2D filter pre-pass over the packed planes; on any failure
-    // the compositor simply samples the raw planes
-    const bool planeFilterActive =
-        (objFilterMode != 0u || bgFilterMode != 0u
-         || (replacement2DActive && !resource.replacementInstances.empty()))
-        && inputs.scale > 1u
-        && recordPlaneFilterPasses(resource, inputs);
+    // the compositor simply samples the raw planes. The filtered plane
+    // images are pure functions of the packed plane bytes, the scale and the
+    // filter modes, so when none of those changed since the last recorded
+    // pass the whole pre-pass chain (and the ScaleFX multi-pass) is skipped
+    // and the existing filtered images are reused - static scenes such as
+    // menus and dialogs stop paying the filter cost entirely.
+    const bool overlayWantedForFrame =
+        replacement2DActive && !resource.replacementInstances.empty();
+    const bool planeFilterWanted =
+        (objFilterMode != 0u || bgFilterMode != 0u || overlayWantedForFrame)
+        && inputs.scale > 1u;
+    bool planeFilterActive = false;
+    if (planeFilterWanted)
+    {
+        bool cacheHit = false;
+        u64 topHash = 0;
+        u64 bottomHash = 0;
+        const bool cacheUsable =
+            !overlayWantedForFrame
+            && !inputs.validationMode
+            && resource.topPackedMapped != nullptr
+            && resource.bottomPackedMapped != nullptr;
+        if (cacheUsable)
+        {
+            topHash = XXH64(resource.topPackedMapped, static_cast<size_t>(resource.packedBufferSize), 0);
+            bottomHash = XXH64(resource.bottomPackedMapped, static_cast<size_t>(resource.packedBufferSize), 0);
+            cacheHit = planeFilterCacheValid
+                && filteredPlaneLayoutReady
+                && topFilteredPlaneImage != VK_NULL_HANDLE
+                && planeFilterCacheScale == inputs.scale
+                && planeFilterCacheObjMode == objFilterMode
+                && planeFilterCacheBgMode == bgFilterMode
+                && planeFilterCacheTopHash == topHash
+                && planeFilterCacheBottomHash == bottomHash;
+        }
+
+        if (cacheHit)
+        {
+            planeFilterActive = true;
+            statsPlaneFilterCacheHits++;
+        }
+        else
+        {
+            planeFilterActive = recordPlaneFilterPasses(resource, inputs);
+            if (planeFilterActive && cacheUsable)
+            {
+                planeFilterCacheValid = true;
+                planeFilterCacheScale = inputs.scale;
+                planeFilterCacheObjMode = objFilterMode;
+                planeFilterCacheBgMode = bgFilterMode;
+                planeFilterCacheTopHash = topHash;
+                planeFilterCacheBottomHash = bottomHash;
+            }
+            else
+            {
+                // overlay passes draw extra content into the filtered
+                // images, and failed recordings leave them stale
+                planeFilterCacheValid = false;
+            }
+            statsPlaneFilterCacheMisses++;
+        }
+    }
 
     if (!inputs.validationMode)
     {
@@ -6638,12 +6699,14 @@ bool VulkanOutput::dispatchCompositor(
         {
             melonDS::Platform::Log(
                 melonDS::Platform::LogLevel::Warn,
-                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u src(cap=%u prevTop=%u prevBottom=%u liveSwap=%u screenSwap=%u) prevArm(topLatch=%u topAcc=%u botLatch=%u botAcc=%u reject=%u)",
+                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u pfCache(hit=%u miss=%u) src(cap=%u prevTop=%u prevBottom=%u liveSwap=%u screenSwap=%u) prevArm(topLatch=%u topAcc=%u botLatch=%u botAcc=%u reject=%u)",
                 statsComposes,
                 statsSkips,
                 statsFallbacks,
                 statsPlaneFilters,
                 statsOverlayInstances,
+                statsPlaneFilterCacheHits,
+                statsPlaneFilterCacheMisses,
                 inputs.capture3dSourceValid ? 1u : 0u,
                 inputs.previousTopSourceValid ? 1u : 0u,
                 inputs.previousBottomSourceValid ? 1u : 0u,
@@ -6660,6 +6723,8 @@ bool VulkanOutput::dispatchCompositor(
             statsFallbacks = 0;
             statsPlaneFilters = 0;
             statsOverlayInstances = 0;
+            statsPlaneFilterCacheHits = 0;
+            statsPlaneFilterCacheMisses = 0;
             statsPrevTopFromLatch = 0;
             statsPrevTopFromAccum = 0;
             statsPrevBottomFromLatch = 0;

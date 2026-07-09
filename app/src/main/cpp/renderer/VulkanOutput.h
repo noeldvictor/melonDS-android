@@ -632,6 +632,14 @@ private:
     u32 statsPrevBottomFromLatch{0};
     u32 statsPrevBottomFromAccum{0};
     u32 statsPrevLatchOwnershipRejects{0};
+    u32 statsPlaneFilterCacheHits{0};
+    u32 statsPlaneFilterCacheMisses{0};
+    bool planeFilterCacheValid{false};
+    u32 planeFilterCacheScale{0};
+    u32 planeFilterCacheObjMode{0};
+    u32 planeFilterCacheBgMode{0};
+    u64 planeFilterCacheTopHash{0};
+    u64 planeFilterCacheBottomHash{0};
 
     static constexpr u32 kPlaneFilterModeCount = 14;
     VkDescriptorSetLayout planeFilterDescriptorSetLayout{VK_NULL_HANDLE};
