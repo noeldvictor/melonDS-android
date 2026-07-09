@@ -5358,6 +5358,17 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
                     structuredTopPlane1,
                     structuredTopControl,
                     snapshotRowBase);
+            else if (topDisplayMode == 2u && topStructuredLineHasPayload())
+                mergeStructuredDisplayLine(
+                    lastSoftPackedFrameSnapshot.packedTopPlane0,
+                    lastSoftPackedFrameSnapshot.packedTopPlane1,
+                    lastSoftPackedFrameSnapshot.packedTopControl,
+                    topPackedRaw,
+                    structuredTopPlane0,
+                    structuredTopPlane1,
+                    structuredTopControl,
+                    y,
+                    snapshotRowBase);
 
             const u32 bottomLineMeta = lastSoftPackedFrameSnapshot.packedBottomLineMeta[static_cast<size_t>(y)];
             const u32 bottomDisplayMode = (bottomLineMeta >> 16u) & 0x3u;
@@ -5427,6 +5438,17 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
                     structuredBottomPlane0,
                     structuredBottomPlane1,
                     structuredBottomControl,
+                    snapshotRowBase);
+            else if (bottomDisplayMode == 2u && bottomStructuredLineHasPayload())
+                mergeStructuredDisplayLine(
+                    lastSoftPackedFrameSnapshot.packedBottomPlane0,
+                    lastSoftPackedFrameSnapshot.packedBottomPlane1,
+                    lastSoftPackedFrameSnapshot.packedBottomControl,
+                    bottomPackedRaw,
+                    structuredBottomPlane0,
+                    structuredBottomPlane1,
+                    structuredBottomControl,
+                    y,
                     snapshotRowBase);
         }
     }
