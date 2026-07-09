@@ -627,6 +627,11 @@ private:
     u32 statsFallbacks{0};
     u32 statsPlaneFilters{0};
     u32 statsOverlayInstances{0};
+    u32 statsPrevTopFromLatch{0};
+    u32 statsPrevTopFromAccum{0};
+    u32 statsPrevBottomFromLatch{0};
+    u32 statsPrevBottomFromAccum{0};
+    u32 statsPrevLatchOwnershipRejects{0};
 
     static constexpr u32 kPlaneFilterModeCount = 14;
     VkDescriptorSetLayout planeFilterDescriptorSetLayout{VK_NULL_HANDLE};

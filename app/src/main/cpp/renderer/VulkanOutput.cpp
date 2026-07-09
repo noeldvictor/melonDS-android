@@ -4816,13 +4816,19 @@ bool VulkanOutput::prepareFrameForPresentation(
                 || asymmetricFullRegularComp7
                 || liveOwnerUsesScreenWideRegularCapture
                 || structuredHandoffLiveOwnerNeedsReplace);
+        // the snapshot tag keeps the slot-sampling heuristic, but the
+        // accumulators store CONTENT: the live 3D image must merge into the
+        // LCD the 3D unit actually rendered it for. Keying the merge off the
+        // heuristic poisons the other screen's accumulator whenever the two
+        // disagree (per-frame swap alternation), and the held-content path
+        // then presents the top screen's image on the bottom display.
         if (!recordDirectPresentationPrep(
                 frame,
                 resource,
                 renderer3D,
                 liveSourceScreenSwap,
-                liveSourceScreenSwap,
-                !liveSourceScreenSwap,
+                backendRenderScreenSwap,
+                !backendRenderScreenSwap,
                 replaceAccumulatedHighres))
         {
             return false;
@@ -4955,6 +4961,15 @@ bool VulkanOutput::prepareFrameForPresentation(
             && previousResource.snapshotHeight == currentSourceHeight;
         if (!previousSnapshotCompatible)
             return;
+        // frames are pooled: since this pointer was recorded as the LCD's
+        // last live source, the frame may have been re-prepared with the
+        // other LCD's snapshot; serving it would put the other screen's
+        // content on this display
+        if (previousResource.renderer3dSnapshotScreenSwap != topLcd)
+        {
+            statsPrevLatchOwnershipRejects++;
+            return;
+        }
 
         if (topLcd)
         {
@@ -4978,6 +4993,10 @@ bool VulkanOutput::prepareFrameForPresentation(
         latchPreviousLcdSource(lastTopRendererSourceFrame, true);
     if (bottomNeedsAccumulatedHighres)
         latchPreviousLcdSource(lastBottomRendererSourceFrame, false);
+    if (resource.previousTopRendererSourceValid)
+        statsPrevTopFromLatch++;
+    if (resource.previousBottomRendererSourceValid)
+        statsPrevBottomFromLatch++;
 
     const bool useAccumulators = resource.snapshotFromGraphicsBackend
         && accumulatedHighresWidth == currentSourceWidth
@@ -5137,6 +5156,7 @@ bool VulkanOutput::prepareFrameForPresentation(
         resource.previousTopRendererSourceImage = accumulatedTopHighresImage;
         resource.previousTopRendererSourceImageView = accumulatedTopHighresView;
         resource.previousTopRendererSourceValid = true;
+        statsPrevTopFromAccum++;
     }
     if (bottomNeedsAccumulatedHighres
         && bottomAccumulatorAvailable
@@ -5145,6 +5165,7 @@ bool VulkanOutput::prepareFrameForPresentation(
         resource.previousBottomRendererSourceImage = accumulatedBottomHighresImage;
         resource.previousBottomRendererSourceImageView = accumulatedBottomHighresView;
         resource.previousBottomRendererSourceValid = true;
+        statsPrevBottomFromAccum++;
     }
 
     const bool topStructuredHandoffIncomplete =
@@ -6594,7 +6615,7 @@ bool VulkanOutput::dispatchCompositor(
         {
             melonDS::Platform::Log(
                 melonDS::Platform::LogLevel::Warn,
-                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u src(cap=%u prevTop=%u prevBottom=%u liveSwap=%u screenSwap=%u)",
+                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u src(cap=%u prevTop=%u prevBottom=%u liveSwap=%u screenSwap=%u) prevArm(topLatch=%u topAcc=%u botLatch=%u botAcc=%u reject=%u)",
                 statsComposes,
                 statsSkips,
                 statsFallbacks,
@@ -6604,13 +6625,23 @@ bool VulkanOutput::dispatchCompositor(
                 inputs.previousTopSourceValid ? 1u : 0u,
                 inputs.previousBottomSourceValid ? 1u : 0u,
                 inputs.liveSourceScreenSwap ? 1u : 0u,
-                inputs.screenSwap);
+                inputs.screenSwap,
+                statsPrevTopFromLatch,
+                statsPrevTopFromAccum,
+                statsPrevBottomFromLatch,
+                statsPrevBottomFromAccum,
+                statsPrevLatchOwnershipRejects);
             statsWindowStartNs = nowNs;
             statsComposes = 0;
             statsSkips = 0;
             statsFallbacks = 0;
             statsPlaneFilters = 0;
             statsOverlayInstances = 0;
+            statsPrevTopFromLatch = 0;
+            statsPrevTopFromAccum = 0;
+            statsPrevBottomFromLatch = 0;
+            statsPrevBottomFromAccum = 0;
+            statsPrevLatchOwnershipRejects = 0;
         }
     }
 
