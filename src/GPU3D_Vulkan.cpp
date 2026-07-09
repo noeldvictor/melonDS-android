@@ -636,9 +636,10 @@ void VulkanRenderer3D::ResetActiveBackend(GPU& gpu)
     PendingCaptureReadbackContext = nullptr;
     resetCaptureLineState();
     clearLineCache();
-    LastValidExactCaptureLineCache.fill(0);
-    HasLastValidExactCapture = false;
-    LastValidExactCaptureScreenSwap = false;
+    LastValidExactCaptureLineCache[0].fill(0);
+    LastValidExactCaptureLineCache[1].fill(0);
+    HasLastValidExactCapture.fill(false);
+    LastValidExactCaptureMostRecentSwap = false;
     CurrentCaptureScreenSwapHint = false;
     HasCurrentCaptureScreenSwapHint = false;
     CurrentRenderScreenSwap = false;
@@ -722,10 +723,14 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
         {
             LastHDSamplingStatsLogNs = nowNs;
             Platform::Log(Platform::LogLevel::Info,
-                          "GPU3D_Vulkan[Stats]: hdSampling=%d texScale=%d filterMode=%d",
+                          "GPU3D_Vulkan[Stats]: hdSampling=%d texScale=%d filterMode=%d capFallback(restore=%llu miss=%llu fill=%llu clear=%llu)",
                           PipelinesUseHDSampling ? 1 : 0,
                           Texcache.GetHDTextureScale(),
-                          Texcache.GetHDTextureFilterMode());
+                          Texcache.GetHDTextureFilterMode(),
+                          static_cast<unsigned long long>(ExactCaptureRestoreCount),
+                          static_cast<unsigned long long>(ExactCaptureRestoreMissCount),
+                          static_cast<unsigned long long>(ExactCaptureFallbackFillCount),
+                          static_cast<unsigned long long>(ExactCaptureClearCount));
         }
     }
 
@@ -1171,12 +1176,15 @@ u32* VulkanRenderer3D::GetLineActiveBackend(int line)
                 }
                 else if (exactCaptureOnly && ExactCaptureFallbackValid)
                 {
+                    ExactCaptureFallbackFillCount++;
                     fillLineCacheWithCaptureFallbackColor();
                     HasCpuFrame = true;
                     usedFallbackFill = true;
                 }
                 else
                 {
+                    if (exactCaptureOnly)
+                        ExactCaptureClearCount++;
                     clearLineCache();
                 }
             }
@@ -1278,11 +1286,13 @@ void VulkanRenderer3D::PrepareCaptureFrameActiveBackend()
         }
         else if (ExactCaptureFallbackValid)
         {
+            ExactCaptureFallbackFillCount++;
             fillLineCacheWithCaptureFallbackColor();
             HasCpuFrame = true;
         }
         else
         {
+            ExactCaptureClearCount++;
             clearLineCache();
         }
         return;
@@ -1394,9 +1404,10 @@ void VulkanRenderer3D::StopActiveBackend(const GPU& gpu)
     ExactCaptureFallbackValid = false;
     resetCaptureLineState();
     clearLineCache();
-    LastValidExactCaptureLineCache.fill(0);
-    HasLastValidExactCapture = false;
-    LastValidExactCaptureScreenSwap = false;
+    LastValidExactCaptureLineCache[0].fill(0);
+    LastValidExactCaptureLineCache[1].fill(0);
+    HasLastValidExactCapture.fill(false);
+    LastValidExactCaptureMostRecentSwap = false;
     CurrentCaptureScreenSwapHint = false;
     HasCurrentCaptureScreenSwapHint = false;
     CurrentRenderScreenSwap = false;
@@ -13896,9 +13907,10 @@ bool VulkanRenderer3D::copyReadyCaptureLineToLineCache()
     ExactCaptureLineCacheFresh = ActiveBackendMode == BackendMode::GraphicsHardware;
     if (ActiveBackendMode == BackendMode::GraphicsHardware)
     {
-        LastValidExactCaptureLineCache = LineCache;
-        HasLastValidExactCapture = true;
-        LastValidExactCaptureScreenSwap = ReadyCaptureLineScreenSwap;
+        const size_t swapIndex = ReadyCaptureLineScreenSwap ? 1u : 0u;
+        LastValidExactCaptureLineCache[swapIndex] = LineCache;
+        HasLastValidExactCapture[swapIndex] = true;
+        LastValidExactCaptureMostRecentSwap = ReadyCaptureLineScreenSwap;
     }
     CaptureLineReady = false;
     ReadyCaptureLineData = nullptr;
@@ -13913,17 +13925,23 @@ bool VulkanRenderer3D::copyReadyCaptureLineToLineCache()
 
 bool VulkanRenderer3D::restoreLastValidExactCaptureToLineCache()
 {
-    if (!HasLastValidExactCapture)
-        return false;
-    if (HasCurrentCaptureScreenSwapHint
-        && LastValidExactCaptureScreenSwap != CurrentCaptureScreenSwapHint)
+    // hold the previous capture of the screen this frame targets; falling
+    // through to the fallback fill turns the whole capture surface into the
+    // 3D clear color, which strobes black on late frames
+    const bool wantSwap = HasCurrentCaptureScreenSwapHint
+        ? CurrentCaptureScreenSwapHint
+        : LastValidExactCaptureMostRecentSwap;
+    const size_t swapIndex = wantSwap ? 1u : 0u;
+    if (!HasLastValidExactCapture[swapIndex])
     {
+        ExactCaptureRestoreMissCount++;
         return false;
     }
 
-    LineCache = LastValidExactCaptureLineCache;
+    LineCache = LastValidExactCaptureLineCache[swapIndex];
     ExactCaptureLineCachePrepared = true;
     ExactCaptureLineCacheFresh = false;
+    ExactCaptureRestoreCount++;
     return true;
 }
 

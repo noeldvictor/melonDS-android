@@ -93,8 +93,11 @@ public:
     [[nodiscard]] bool GetCurrentRenderScreenSwap() const noexcept { return CurrentRenderScreenSwap; }
     [[nodiscard]] bool IsCurrentCaptureScreenSwapHintValid() const noexcept { return HasCurrentCaptureScreenSwapHint; }
     [[nodiscard]] bool GetCurrentCaptureScreenSwapHint() const noexcept { return CurrentCaptureScreenSwapHint; }
-    [[nodiscard]] bool IsLastValidExactCaptureAvailable() const noexcept { return HasLastValidExactCapture; }
-    [[nodiscard]] bool GetLastValidExactCaptureScreenSwap() const noexcept { return LastValidExactCaptureScreenSwap; }
+    [[nodiscard]] bool IsLastValidExactCaptureAvailable() const noexcept
+    {
+        return HasLastValidExactCapture[0] || HasLastValidExactCapture[1];
+    }
+    [[nodiscard]] bool GetLastValidExactCaptureScreenSwap() const noexcept { return LastValidExactCaptureMostRecentSwap; }
     [[nodiscard]] bool EnsureVulkanReadyForValidation();
     [[nodiscard]] bool HasColorTarget() const noexcept { return ColorImage != VK_NULL_HANDLE && ColorImageView != VK_NULL_HANDLE; }
     [[nodiscard]] bool IsColorTargetInitialized() const noexcept { return ColorImageInitialized; }
@@ -771,11 +774,18 @@ private:
     std::vector<u32> RawReadbackRgba;
     std::vector<u32> RawResultReadback;
     std::array<u32, 256 * 192> LineCache{};
-    std::array<u32, 256 * 192> LastValidExactCaptureLineCache{};
+    // last completed exact capture per screen-swap state: dual-screen 3D
+    // titles alternate the swap every frame, so a late frame must fall back
+    // to the previous capture of the SAME screen, never the other one
+    std::array<std::array<u32, 256 * 192>, 2> LastValidExactCaptureLineCache{};
     u32 ExactCaptureFallbackPackedColor = 0;
     bool ExactCaptureFallbackValid = false;
-    bool HasLastValidExactCapture = false;
-    bool LastValidExactCaptureScreenSwap = false;
+    std::array<bool, 2> HasLastValidExactCapture{};
+    bool LastValidExactCaptureMostRecentSwap = false;
+    u64 ExactCaptureRestoreCount = 0;
+    u64 ExactCaptureRestoreMissCount = 0;
+    u64 ExactCaptureFallbackFillCount = 0;
+    u64 ExactCaptureClearCount = 0;
     bool CurrentCaptureScreenSwapHint = false;
     bool HasCurrentCaptureScreenSwapHint = false;
     bool CurrentRenderScreenSwap = false;
