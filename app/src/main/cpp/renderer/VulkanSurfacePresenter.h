@@ -79,6 +79,7 @@ struct VulkanPresenterPacingStats
     u64 PresentSkippedForDeadline = 0;
     u64 SurfaceWaitTimeouts = 0;
     u64 FrameWaitFailures = 0;
+    u64 SuppressedHoldPresents = 0;
     u64 ComposeSubmitFailures = 0;
     u64 ComposeWaitFailures = 0;
     u64 MissingFrameImageFailures = 0;
@@ -391,6 +392,7 @@ private:
     u64 acquireTimeouts = 0;
     u64 presentSkippedForDeadline = 0;
     u64 frameWaitFailures = 0;
+    u64 suppressedHoldPresents = 0;
     u64 composeSubmitFailures = 0;
     u64 composeWaitFailures = 0;
     u64 missingFrameImageFailures = 0;

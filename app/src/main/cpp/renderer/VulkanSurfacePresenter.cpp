@@ -955,7 +955,10 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
 
     if (frame == nullptr || !output.waitForFrame(frame, timeoutNs))
     {
+        // the frame is not provably complete: skip this present entirely and
+        // let the surface keep showing the last presented image
         frameWaitFailures++;
+        suppressedHoldPresents++;
         return false;
     }
 
@@ -1316,6 +1319,7 @@ VulkanPresenterPacingStats VulkanSurfacePresenter::takePacingStatsSnapshotAndRes
     stats.PresentSkippedForDeadline = presentSkippedForDeadline;
     stats.SurfaceWaitTimeouts = skippedSurfaceWaits;
     stats.FrameWaitFailures = frameWaitFailures;
+    stats.SuppressedHoldPresents = suppressedHoldPresents;
     stats.ComposeSubmitFailures = composeSubmitFailures;
     stats.ComposeWaitFailures = composeWaitFailures;
     stats.MissingFrameImageFailures = missingFrameImageFailures;
@@ -1338,6 +1342,7 @@ VulkanPresenterPacingStats VulkanSurfacePresenter::takePacingStatsSnapshotAndRes
     presentSkippedForDeadline = 0;
     skippedSurfaceWaits = 0;
     frameWaitFailures = 0;
+    suppressedHoldPresents = 0;
     composeSubmitFailures = 0;
     composeWaitFailures = 0;
     missingFrameImageFailures = 0;
@@ -2056,7 +2061,7 @@ void VulkanSurfacePresenter::logPerformanceIfNeeded()
 
     melonDS::Platform::Log(
         melonDS::Platform::LogLevel::Warn,
-        "VulkanPerf[Presenter]: mode=%s frame wall avg=%.3fms p95=%.3fms max=%.3fms wait avg=%.3fms p95=%.3fms max=%.3fms acquire avg=%.3fms p95=%.3fms max=%.3fms desc avg=%.3fms vertex avg=%.3fms record avg=%.3fms submit avg=%.3fms present avg=%.3fms gpu avg=%.3fms p95=%.3fms max=%.3fms presented=%llu direct=%llu fallback=%llu skippedWait=%llu acquireTimeouts=%llu deadlineSkipped=%llu recoveries=%llu presentMode=%d swapchainImages=%u reasons(needsReadback=%llu validation=%llu missingHandles=%llu surfaceCount=%llu) fail(frameWait=%llu composeSubmit=%llu composeWait=%llu missingImage=%llu noConfigured=%llu swapchain=%llu surfaceWait=%llu descriptor=%llu vertex=%llu acquire=%llu record=%llu submit=%llu)",
+        "VulkanPerf[Presenter]: mode=%s frame wall avg=%.3fms p95=%.3fms max=%.3fms wait avg=%.3fms p95=%.3fms max=%.3fms acquire avg=%.3fms p95=%.3fms max=%.3fms desc avg=%.3fms vertex avg=%.3fms record avg=%.3fms submit avg=%.3fms present avg=%.3fms gpu avg=%.3fms p95=%.3fms max=%.3fms presented=%llu direct=%llu fallback=%llu skippedWait=%llu acquireTimeouts=%llu deadlineSkipped=%llu recoveries=%llu presentMode=%d swapchainImages=%u reasons(needsReadback=%llu validation=%llu missingHandles=%llu surfaceCount=%llu) fail(frameWait=%llu composeSubmit=%llu composeWait=%llu missingImage=%llu noConfigured=%llu swapchain=%llu surfaceWait=%llu descriptor=%llu vertex=%llu acquire=%llu record=%llu submit=%llu) suppressedHold=%llu",
         lastPresentedDirect ? "direct" : "fallback",
         PerfNsToMs(frameWallSummary.MeanNs),
         PerfNsToMs(frameWallSummary.P95Ns),
@@ -2099,7 +2104,8 @@ void VulkanSurfacePresenter::logPerformanceIfNeeded()
         static_cast<unsigned long long>(vertexUpdateFailures),
         static_cast<unsigned long long>(acquireFailures),
         static_cast<unsigned long long>(recordFailures),
-        static_cast<unsigned long long>(submitFailures)
+        static_cast<unsigned long long>(submitFailures),
+        static_cast<unsigned long long>(suppressedHoldPresents)
     );
 
     fallbackReasonNeedsReadback = 0;
@@ -2107,6 +2113,7 @@ void VulkanSurfacePresenter::logPerformanceIfNeeded()
     fallbackReasonMissingHandles = 0;
     fallbackReasonSurfaceCount = 0;
     frameWaitFailures = 0;
+    suppressedHoldPresents = 0;
     composeSubmitFailures = 0;
     composeWaitFailures = 0;
     missingFrameImageFailures = 0;

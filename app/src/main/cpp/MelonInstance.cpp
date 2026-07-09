@@ -4679,7 +4679,7 @@ void MelonInstance::logVulkanPerformanceIfNeeded()
     );
     Platform::Log(
         Platform::LogLevel::Warn,
-        "VulkanPerf[Pacing]: mode=%s acquireTimeouts=%llu presentDropped=%llu renderDropped=%llu ffSkipped=%llu backlog=%llu/%llu reusedPrev=%llu stolen=%llu skippedWait=%llu presented=%llu direct=%llu fallback=%llu recoveries=%llu presentMode=%d swapchainImages=%u renderScale=%d outputScale=%d dropCause(stale=%llu steal=%llu deadline=%llu backlogTrim=%llu deferred=%llu) presentFail(frameWait=%llu composeSubmit=%llu composeWait=%llu missingImage=%llu noConfigured=%llu swapchain=%llu surfaceWait=%llu descriptor=%llu vertex=%llu acquire=%llu record=%llu submit=%llu) ageMs(present avg=%.3f max=%.3f drop avg=%.3f max=%.3f)",
+        "VulkanPerf[Pacing]: mode=%s acquireTimeouts=%llu presentDropped=%llu renderDropped=%llu ffSkipped=%llu backlog=%llu/%llu reusedPrev=%llu stolen=%llu skippedWait=%llu presented=%llu direct=%llu fallback=%llu recoveries=%llu presentMode=%d swapchainImages=%u renderScale=%d outputScale=%d dropCause(stale=%llu steal=%llu deadline=%llu backlogTrim=%llu deferred=%llu) presentFail(frameWait=%llu composeSubmit=%llu composeWait=%llu missingImage=%llu noConfigured=%llu swapchain=%llu surfaceWait=%llu descriptor=%llu vertex=%llu acquire=%llu record=%llu submit=%llu) suppressedHold=%llu ageMs(present avg=%.3f max=%.3f drop avg=%.3f max=%.3f)",
         isFastForwardActive() ? "ff" : "realtime",
         static_cast<unsigned long long>(presenterStats.AcquireTimeouts),
         static_cast<unsigned long long>(queueStats.PresentFramesDroppedByPolicy),
@@ -4715,6 +4715,7 @@ void MelonInstance::logVulkanPerformanceIfNeeded()
         static_cast<unsigned long long>(presenterStats.AcquireFailures),
         static_cast<unsigned long long>(presenterStats.RecordFailures),
         static_cast<unsigned long long>(presenterStats.SubmitFailures),
+        static_cast<unsigned long long>(presenterStats.SuppressedHoldPresents),
         presentedFrameAgeAvgMs,
         PerfNsToMs(queueStats.PresentedFrameAgeMaxNs),
         droppedFrameAgeAvgMs,
