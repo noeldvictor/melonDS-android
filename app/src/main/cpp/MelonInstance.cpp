@@ -8197,6 +8197,113 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
         }
     }
 
+    if (hasStructuredVulkan2D)
+    {
+        // transient producer dropouts: on rare late frames a capture-backed
+        // line arrives with only 3D slot/control markers and no visible 2D
+        // colors in ANY source (raw, structured, final) while the previous
+        // frames had them - the captured scenery (island backdrop) blinks
+        // out for a single frame. Hold each line's last colored content for
+        // up to two frames: single-frame blinks bridge invisibly, real
+        // scene changes replace the hold immediately on the next colored
+        // frame and time the hold out after two.
+        if (!heldPlanesInitialized)
+        {
+            heldTopLineAge.fill(255);
+            heldBottomLineAge.fill(255);
+            heldTopColorStreak.fill(0);
+            heldBottomColorStreak.fill(0);
+            heldTopHeldStreak.fill(0);
+            heldBottomHeldStreak.fill(0);
+            heldTopRecentHold.fill(0);
+            heldBottomRecentHold.fill(0);
+            heldPlanesInitialized = true;
+        }
+        const auto holdScreen = [&](std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& plane0,
+                                    std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& plane1,
+                                    std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& control,
+                                    std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& heldPlane0,
+                                    std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& heldPlane1,
+                                    std::array<u32, SoftPackedFrameSnapshot::kPixelCount>& heldControl,
+                                    std::array<melonDS::u8, SoftPackedFrameSnapshot::kLineCount>& heldAge,
+                                    std::array<melonDS::u8, SoftPackedFrameSnapshot::kLineCount>& colorStreak,
+                                    std::array<melonDS::u8, SoftPackedFrameSnapshot::kLineCount>& heldStreak,
+                                    std::array<melonDS::u8, SoftPackedFrameSnapshot::kLineCount>& recentHold,
+                                    u32& heldLines) {
+            for (size_t y = 0; y < SoftPackedFrameSnapshot::kLineCount; y++)
+            {
+                const size_t rowBase = y * SoftPackedFrameSnapshot::kScreenWidth;
+                bool hasColors = false;
+                bool active = false;
+                for (size_t x = 0; x < SoftPackedFrameSnapshot::kScreenWidth; x++)
+                {
+                    const u32 p0 = plane0[rowBase + x];
+                    const u32 p1 = plane1[rowBase + x];
+                    if (!active && (p0 != 0u || p1 != 0u || control[rowBase + x] != 0u))
+                        active = true;
+                    if (((p0 & 0x00FFFFFFu) != 0u && p0 != 0x20000000u)
+                        || ((p1 & 0x00FFFFFFu) != 0u && p1 != 0x20000000u))
+                    {
+                        hasColors = true;
+                        break;
+                    }
+                }
+                if (hasColors)
+                {
+                    std::memcpy(heldPlane0.data() + rowBase, plane0.data() + rowBase,
+                                SoftPackedFrameSnapshot::kScreenWidth * sizeof(u32));
+                    std::memcpy(heldPlane1.data() + rowBase, plane1.data() + rowBase,
+                                SoftPackedFrameSnapshot::kScreenWidth * sizeof(u32));
+                    std::memcpy(heldControl.data() + rowBase, control.data() + rowBase,
+                                SoftPackedFrameSnapshot::kScreenWidth * sizeof(u32));
+                    heldAge[y] = 0;
+                    if (colorStreak[y] < 250u)
+                        colorStreak[y]++;
+                    heldStreak[y] = colorStreak[y];
+                    if (recentHold[y] > 0u)
+                        recentHold[y]--;
+                    continue;
+                }
+                colorStreak[y] = 0;
+                if (heldAge[y] < 250u)
+                    heldAge[y]++;
+                // only bridge lines that were continuously colored before the
+                // dropout; swap-alternating scenes (colored every other frame)
+                // never build a streak and are left untouched. Lines that
+                // recently qualified stay bridgeable through blink BURSTS,
+                // where the streak cannot rebuild between drops.
+                const bool holdEligible =
+                    heldStreak[y] >= 8u
+                    || (recentHold[y] > 0u && heldStreak[y] >= 1u);
+                if (active && heldAge[y] <= 2u && holdEligible)
+                {
+                    recentHold[y] = 60u;
+                    std::memcpy(plane0.data() + rowBase, heldPlane0.data() + rowBase,
+                                SoftPackedFrameSnapshot::kScreenWidth * sizeof(u32));
+                    std::memcpy(plane1.data() + rowBase, heldPlane1.data() + rowBase,
+                                SoftPackedFrameSnapshot::kScreenWidth * sizeof(u32));
+                    std::memcpy(control.data() + rowBase, heldControl.data() + rowBase,
+                                SoftPackedFrameSnapshot::kScreenWidth * sizeof(u32));
+                    heldLines++;
+                }
+            }
+        };
+        holdScreen(
+            lastSoftPackedFrameSnapshot.packedTopPlane0,
+            lastSoftPackedFrameSnapshot.packedTopPlane1,
+            lastSoftPackedFrameSnapshot.packedTopControl,
+            heldTopPlane0, heldTopPlane1, heldTopControl, heldTopLineAge,
+            heldTopColorStreak, heldTopHeldStreak, heldTopRecentHold,
+            planeHoldTopLines);
+        holdScreen(
+            lastSoftPackedFrameSnapshot.packedBottomPlane0,
+            lastSoftPackedFrameSnapshot.packedBottomPlane1,
+            lastSoftPackedFrameSnapshot.packedBottomControl,
+            heldBottomPlane0, heldBottomPlane1, heldBottomControl, heldBottomLineAge,
+            heldBottomColorStreak, heldBottomHeldStreak, heldBottomRecentHold,
+            planeHoldBottomLines);
+    }
+
     lastSoftPackedFrameSnapshot.valid = true;
     return true;
 }
