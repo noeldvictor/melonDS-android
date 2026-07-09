@@ -13,7 +13,8 @@
 // Modes match the HD texture filter numbering: 1 linear, 2 smoothstep,
 // 3 Scale2x, 4 HQ2x lite, 5 2xSaI lite, 6 SuperEagle lite, 7 MMPX lite,
 // 8 Anime4K lite, 9 Super2xSaI strong, 10 SuperEagle smooth,
-// 11 crisp gradient, 12 crisp edge AA, 13 ScaleFX lite.
+// 11 crisp gradient, 12 crisp edge AA. Mode 13 (ScaleFX) runs through the
+// dedicated multi-pass chain in VulkanScaleFXShader.comp instead.
 
 #ifndef PLANE_FILTER_MODE
 #define PLANE_FILTER_MODE 3
@@ -519,54 +520,6 @@ vec4 CrispEdgeAATexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, ve
 }
 #endif
 
-#if PLANE_FILTER_MODE == 13
-// ScaleFX lite: single-pass approximation of Sp00kyFox's ScaleFX. It
-// evaluates the pass-1 junction corner strength for the quadrant touching
-// this subpixel, applies the pass-2 corner dominance rule against the
-// opposing junction corner, then blends along the detected diagonal using
-// the pass-2 orientation metric.
-float ScaleFXLiteStrength(vec4 center, vec4 nx, vec4 ny, vec4 diag)
-{
-    float d = ColorDistance(nx, ny);
-    float ax = ColorDistance(center, nx);
-    float ay = ColorDistance(center, ny);
-    float bx = ColorDistance(diag, ny);
-    float by = ColorDistance(diag, nx);
-    float diff = ax - ay;
-    float wght1 = max(0.5 - d, 0.0) * 2.0;
-    float dir = (min(ax, bx) + ax > min(ay, by) + ay) ? diff : -diff;
-    float wght2 = clamp((1.0 - d) + dir, 0.0, 1.0);
-    return wght1 * wght2 * ax * ay;
-}
-
-vec4 ScaleFXLiteTexel(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
-{
-    bool right = subpixel.x != 0;
-    bool down = subpixel.y != 0;
-    vec4 xNeighbor = right ? f : d;
-    vec4 yNeighbor = down ? h : b;
-    vec4 diagonal = right ? (down ? px_i : c) : (down ? g : a);
-
-    float ownStrength = ScaleFXLiteStrength(e, xNeighbor, yNeighbor, diagonal);
-    float rivalStrength = ScaleFXLiteStrength(diagonal, xNeighbor, yNeighbor, e);
-    if (ownStrength <= rivalStrength)
-        return e;
-
-    float ax = ColorDistance(e, xNeighbor);
-    float ay = ColorDistance(e, yNeighbor);
-    float horiCost = min(ax, ColorDistance(diagonal, yNeighbor)) + ax;
-    float vertCost = min(ay, ColorDistance(diagonal, xNeighbor)) + ay;
-    vec4 slope = (horiCost > vertCost) ? yNeighbor : xNeighbor;
-
-    float weight = smoothstep(0.01, 0.14, ownStrength - rivalStrength);
-    vec4 blended = mix(e, slope, weight);
-    if (IsThinContrastDetail(e, b, d, f, h) &&
-        ColorDistance(blended, e) > (8.0 / 255.0))
-        return e;
-    return clamp(blended, vec4(0.0), vec4(1.0));
-}
-#endif
-
 #if PLANE_FILTER_MODE >= 3
 vec4 FilterCorner(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h, vec4 px_i, ivec2 subpixel)
 {
@@ -588,10 +541,8 @@ vec4 FilterCorner(vec4 a, vec4 b, vec4 c, vec4 d, vec4 e, vec4 f, vec4 g, vec4 h
     return SuperEagleSmoothTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
 #elif PLANE_FILTER_MODE == 11
     return CrispGradientTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
-#elif PLANE_FILTER_MODE == 12
-    return CrispEdgeAATexel(a, b, c, d, e, f, g, h, px_i, subpixel);
 #else
-    return ScaleFXLiteTexel(a, b, c, d, e, f, g, h, px_i, subpixel);
+    return CrispEdgeAATexel(a, b, c, d, e, f, g, h, px_i, subpixel);
 #endif
 }
 

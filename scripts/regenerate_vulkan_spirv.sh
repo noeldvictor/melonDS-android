@@ -350,14 +350,25 @@ generate_header \
   "$ROOT_DIR/app/src/main/cpp/renderer/VulkanAccumulate3dShaderData.h"
 
 # one small SPIR-V blob per 2D plane filter mode; some mobile shader
-# compilers cannot handle all filter modes in a single module
-for plane_filter_mode in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+# compilers cannot handle all filter modes in a single module. Mode 13
+# (ScaleFX) uses the dedicated multi-pass chain below instead.
+for plane_filter_mode in 1 2 3 4 5 6 7 8 9 10 11 12; do
   generate_header \
     "$ROOT_DIR/app/src/main/cpp/renderer/VulkanPlaneFilterShader.comp" \
     "comp" \
     "melonDS_android_vulkan_plane_filter_mode${plane_filter_mode}_comp_spv" \
     "$ROOT_DIR/app/src/main/cpp/renderer/VulkanPlaneFilterMode${plane_filter_mode}ShaderData.h" \
     "-DPLANE_FILTER_MODE=${plane_filter_mode}"
+done
+
+# faithful multi-pass ScaleFX for plane filter mode 13: one small blob per pass
+for scalefx_pass in 0 1 2 3 4; do
+  generate_header \
+    "$ROOT_DIR/app/src/main/cpp/renderer/VulkanScaleFXShader.comp" \
+    "comp" \
+    "melonDS_android_vulkan_scalefx_pass${scalefx_pass}_comp_spv" \
+    "$ROOT_DIR/app/src/main/cpp/renderer/VulkanScaleFXPass${scalefx_pass}ShaderData.h" \
+    "-DSCALEFX_PASS=${scalefx_pass}"
 done
 
 generate_header \

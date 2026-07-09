@@ -1,0 +1,493 @@
+#version 450
+
+// Faithful multi-pass ScaleFX (Sp00kyFox) for the 2D plane filter, mode 13.
+//
+// GPU translation of the whole-image CPU port in HDTextureFilter.cpp
+// (ScaleFX3x/ScaleFXImage): pass 0 color-metric map, pass 1 junction corner
+// strengths, pass 2 dominance/edge classification, pass 3 candidate
+// resolution up to level 6, pass 4 subpixel emission at the pipeline's
+// native 3x with a center-based nearest resample to the compositor scale.
+// Passes 0-3 run at native plane resolution (256x192 per plane, both plane
+// halves stacked); only the emit runs at output resolution. Producer
+// classification (OBJ/BG masks) and pass-through of unselected pixels apply
+// at the emit stage exactly like the single-pass plane filter variants.
+//
+// 3D layer-slot and placeholder texels form their own color class in the
+// metric (like fully transparent texels in the CPU sprite path) and are
+// never emitted as candidate colors.
+
+#ifndef SCALEFX_PASS
+#define SCALEFX_PASS 0
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer PackedBuffer
+{
+    uint packedData[];
+};
+
+layout(set = 0, binding = 1, rgba32f) uniform image2D metricImage;
+layout(set = 0, binding = 2, rgba32f) uniform image2D strengthImage;
+layout(set = 0, binding = 3, r32ui) uniform uimage2D flagsImage;
+layout(set = 0, binding = 4, r32ui) uniform uimage2D candidateImage;
+layout(set = 0, binding = 5, rgba8) uniform image2D outFilteredPlanes;
+
+layout(push_constant) uniform PushConsts
+{
+    uint scale;
+    uint packedStride;
+    uint applyObj;
+    uint applyBg;
+    uint writeOthers;
+    uint debugTint;
+} pc;
+
+const int kPlaneW = 256;
+const int kPlaneH = 192;
+
+bool isPacked3dPlaceholder(uint packedValue)
+{
+    return (packedValue & 0x00FFFFFFu) == 0u
+        && ((packedValue >> 24u) & 0xFFu) == 0x20u;
+}
+
+bool isPacked3dLayerSlot(uint packedValue)
+{
+    return ((packedValue >> 24u) & 0xFFu) == 0x40u;
+}
+
+bool packedTapIsUnsafe(uint packedValue)
+{
+    return isPacked3dPlaceholder(packedValue) || isPacked3dLayerSlot(packedValue);
+}
+
+// clamped fetch inside one plane half; plane selects the packed column block
+uint fetchPlane(int plane, int x, int y)
+{
+    x = clamp(x, 0, kPlaneW - 1);
+    y = clamp(y, 0, kPlaneH - 1);
+    return packedData[uint(y) * pc.packedStride + uint(plane * kPlaneW + x)];
+}
+
+#if SCALEFX_PASS == 0
+// scalefx-pass0 dist(): compuphase perceptual RGB metric; unsafe texels form
+// one dedicated color class
+float scalefxMetric(uint a, uint b)
+{
+    bool ta = packedTapIsUnsafe(a);
+    bool tb = packedTapIsUnsafe(b);
+    if (ta || tb)
+        return (ta && tb) ? 0.0 : 1.0;
+
+    float ra = float(a & 0xFFu) * (1.0 / 63.0);
+    float ga = float((a >> 8u) & 0xFFu) * (1.0 / 63.0);
+    float ba = float((a >> 16u) & 0xFFu) * (1.0 / 63.0);
+    float rb = float(b & 0xFFu) * (1.0 / 63.0);
+    float gb = float((b >> 8u) & 0xFFu) * (1.0 / 63.0);
+    float bb = float((b >> 16u) & 0xFFu) * (1.0 / 63.0);
+
+    float r = 0.5 * (ra + rb);
+    float dr = ra - rb;
+    float dg = ga - gb;
+    float db = ba - bb;
+    return sqrt((2.0 + r) * dr * dr + 4.0 * dg * dg + (3.0 - r) * db * db) * (1.0 / 3.0);
+}
+#endif
+
+#if SCALEFX_PASS == 1
+float scalefxStrength(float d, float ax, float ay, float bx, float by)
+{
+    float diff = ax - ay;
+    float wght1 = max(0.5 - d, 0.0) * 2.0;
+    float dir = (min(ax, bx) + ax > min(ay, by) + ay) ? diff : -diff;
+    float wght2 = clamp((1.0 - d) + dir, 0.0, 1.0);
+    return wght1 * wght2 * ax * ay;
+}
+#endif
+
+#if SCALEFX_PASS == 1 || SCALEFX_PASS == 2
+vec4 metricAt(int plane, int x, int y)
+{
+    x = clamp(x, 0, kPlaneW - 1);
+    y = clamp(y, 0, kPlaneH - 1);
+    return imageLoad(metricImage, ivec2(x, plane * kPlaneH + y));
+}
+#endif
+
+#if SCALEFX_PASS == 2
+vec4 strengthAt(int plane, int x, int y)
+{
+    x = clamp(x, 0, kPlaneW - 1);
+    y = clamp(y, 0, kPlaneH - 1);
+    return imageLoad(strengthImage, ivec2(x, plane * kPlaneH + y));
+}
+
+float sfxGE(float x, float y)
+{
+    return (x > y) ? 1.0 : 0.0;
+}
+
+float sfxLEQ(float x, float y)
+{
+    return (x <= y) ? 1.0 : 0.0;
+}
+
+// scalefx-pass2 clear(): necessary junction condition for orthogonal edges
+bool sfxClear(float crn0, float crn1, float a0, float a1, float b0, float b1)
+{
+    return (crn0 >= max(min(a0, a1), min(b0, b1)))
+        && (crn1 >= max(min(a0, b1), min(b0, a1)));
+}
+#endif
+
+#if SCALEFX_PASS == 3
+uint flagsAt(int plane, int x, int y)
+{
+    x = clamp(x, 0, kPlaneW - 1);
+    y = clamp(y, 0, kPlaneH - 1);
+    return imageLoad(flagsImage, ivec2(x, plane * kPlaneH + y)).r;
+}
+
+bool fCrn(uint bits, int k) { return ((bits >> k) & 1u) != 0u; }
+bool fHori(uint bits, int k) { return ((bits >> (4 + k)) & 1u) != 0u; }
+bool fVert(uint bits, int k) { return ((bits >> (8 + k)) & 1u) != 0u; }
+bool fOr(uint bits, int k) { return ((bits >> (12 + k)) & 1u) != 0u; }
+#endif
+
+#if SCALEFX_PASS == 4
+// The packed alpha byte carries the winning producer of each pixel; the
+// selection contract matches the single-pass plane filter variants.
+bool pixelSelectedForThisPass(uint packedValue)
+{
+    uint flags = (packedValue >> 24u) & 0xFFu;
+    if ((flags & 0xC0u) == 0x40u)
+        return false;
+    if (isPacked3dPlaceholder(packedValue))
+        return false;
+    if ((flags & 0x90u) != 0u)
+        return pc.applyObj != 0u;
+    if ((flags & 0x2Fu) != 0u)
+        return pc.applyBg != 0u;
+    return false;
+}
+
+vec4 passThroughColor(uint packedValue)
+{
+    return vec4(
+        float(packedValue & 0xFFu) * (1.0 / 63.0),
+        float((packedValue >> 8u) & 0xFFu) * (1.0 / 63.0),
+        float((packedValue >> 16u) & 0xFFu) * (1.0 / 63.0),
+        float((packedValue >> 24u) & 0xFFu) * (1.0 / 255.0));
+}
+
+vec4 applyDebugTint(vec4 color, uint centerValue)
+{
+    if (pc.debugTint == 0u)
+        return color;
+    uint flags = (centerValue >> 24u) & 0xFFu;
+    vec3 tint = ((flags & 0x90u) != 0u) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+    return vec4(mix(color.rgb, tint, 0.35), color.a);
+}
+#endif
+
+void main()
+{
+#if SCALEFX_PASS == 4
+    // ---- pass 4: subpixel emission at compositor scale ----
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint planeWidth = uint(kPlaneW) * pc.scale;
+    uint planeHeight = uint(kPlaneH) * pc.scale;
+    if (gid.x >= planeWidth || gid.y >= planeHeight * 2u)
+        return;
+
+    int plane = int(gid.y / planeHeight);
+    int outX = int(gid.x);
+    int outY = int(gid.y - uint(plane) * planeHeight);
+
+    // center-based nearest mapping from output scale to the native 3x stage
+    // (matches the CPU resample in ScaleFXImage exactly for scale 1..4)
+    int stageX = ((2 * outX + 1) * 3) / int(2u * pc.scale);
+    int stageY = ((2 * outY + 1) * 3) / int(2u * pc.scale);
+    int x = stageX / 3;
+    int y = stageY / 3;
+    int subX = stageX - x * 3;
+    int subY = stageY - y * 3;
+
+    uint centerValue = fetchPlane(plane, x, y);
+    if (!pixelSelectedForThisPass(centerValue))
+    {
+        if (pc.writeOthers != 0u)
+            imageStore(outFilteredPlanes, ivec2(gid), passThroughColor(centerValue));
+        return;
+    }
+
+    uint cand = imageLoad(candidateImage, ivec2(x, plane * kPlaneH + y)).r;
+    uint crn0 = cand & 0xFu;
+    uint crn1 = (cand >> 4u) & 0xFu;
+    uint crn2 = (cand >> 8u) & 0xFu;
+    uint crn3 = (cand >> 12u) & 0xFu;
+    uint mid0 = (cand >> 16u) & 0xFu;
+    uint mid1 = (cand >> 20u) & 0xFu;
+    uint mid2 = (cand >> 24u) & 0xFu;
+    uint mid3 = (cand >> 28u) & 0xFu;
+
+    uint sp;
+    if (subY == 0)
+        sp = (subX == 0) ? crn0 : (subX == 1) ? mid0 : crn1;
+    else if (subY == 1)
+        sp = (subX == 0) ? mid3 : (subX == 1) ? 0u : mid1;
+    else
+        sp = (subX == 0) ? crn3 : (subX == 1) ? mid2 : crn2;
+
+    // candidate index -> source offset: 0=E 1=D 2=D0 3=F 4=F0 5=B 6=B0 7=H 8=H0
+    const ivec2 offsets[9] = ivec2[9](
+        ivec2(0, 0), ivec2(-1, 0), ivec2(-2, 0), ivec2(1, 0), ivec2(2, 0),
+        ivec2(0, -1), ivec2(0, -2), ivec2(0, 1), ivec2(0, 2));
+    uint source = fetchPlane(plane, x + offsets[sp].x, y + offsets[sp].y);
+    if (packedTapIsUnsafe(source))
+        source = centerValue;
+
+    // color from the winning candidate, producer flags from the center pixel
+    vec4 result = vec4(
+        float(source & 0xFFu) * (1.0 / 63.0),
+        float((source >> 8u) & 0xFFu) * (1.0 / 63.0),
+        float((source >> 16u) & 0xFFu) * (1.0 / 63.0),
+        float((centerValue >> 24u) & 0xFFu) * (1.0 / 255.0));
+    imageStore(outFilteredPlanes, ivec2(gid), applyDebugTint(result, centerValue));
+#else
+    // ---- passes 0-3: native-resolution analysis over both plane halves ----
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= uint(kPlaneW) || gid.y >= uint(kPlaneH) * 2u)
+        return;
+
+    int plane = int(gid.y) / kPlaneH;
+    int x = int(gid.x);
+    int y = int(gid.y) - plane * kPlaneH;
+    ivec2 store = ivec2(gid);
+
+#if SCALEFX_PASS == 0
+    uint e = fetchPlane(plane, x, y);
+    vec4 metric;
+    metric.x = scalefxMetric(e, fetchPlane(plane, x - 1, y - 1));
+    metric.y = scalefxMetric(e, fetchPlane(plane, x, y - 1));
+    metric.z = scalefxMetric(e, fetchPlane(plane, x + 1, y - 1));
+    metric.w = scalefxMetric(e, fetchPlane(plane, x + 1, y));
+    imageStore(metricImage, store, metric);
+#elif SCALEFX_PASS == 1
+    vec4 mA = metricAt(plane, x - 1, y - 1);
+    vec4 mB = metricAt(plane, x, y - 1);
+    vec4 mD = metricAt(plane, x - 1, y);
+    vec4 mE = metricAt(plane, x, y);
+    vec4 mF = metricAt(plane, x + 1, y);
+    vec4 mG = metricAt(plane, x - 1, y + 1);
+    vec4 mH = metricAt(plane, x, y + 1);
+    vec4 mI = metricAt(plane, x + 1, y + 1);
+
+    vec4 strength;
+    strength.x = scalefxStrength(mD.z, mD.w, mE.y, mA.w, mD.y);
+    strength.y = scalefxStrength(mF.x, mE.w, mE.y, mB.w, mF.y);
+    strength.z = scalefxStrength(mH.z, mE.w, mH.y, mH.w, mI.y);
+    strength.w = scalefxStrength(mH.x, mD.w, mH.y, mG.w, mG.y);
+    imageStore(strengthImage, store, strength);
+#elif SCALEFX_PASS == 2
+    vec4 mA = metricAt(plane, x - 1, y - 1);
+    vec4 mB = metricAt(plane, x, y - 1);
+    vec4 mD = metricAt(plane, x - 1, y);
+    vec4 mE = metricAt(plane, x, y);
+    vec4 mF = metricAt(plane, x + 1, y);
+    vec4 mG = metricAt(plane, x - 1, y + 1);
+    vec4 mH = metricAt(plane, x, y + 1);
+    vec4 mI = metricAt(plane, x + 1, y + 1);
+
+    vec4 sA = strengthAt(plane, x - 1, y - 1);
+    vec4 sB = strengthAt(plane, x, y - 1);
+    vec4 sC = strengthAt(plane, x + 1, y - 1);
+    vec4 sD = strengthAt(plane, x - 1, y);
+    vec4 sE = strengthAt(plane, x, y);
+    vec4 sF = strengthAt(plane, x + 1, y);
+    vec4 sG = strengthAt(plane, x - 1, y + 1);
+    vec4 sH = strengthAt(plane, x, y + 1);
+    vec4 sI = strengthAt(plane, x + 1, y + 1);
+
+    // strength & dominance junctions
+    float jS[4][4] = float[4][4](
+        float[4](sA.z, sB.w, sE.x, sD.y),
+        float[4](sB.z, sC.w, sF.x, sE.y),
+        float[4](sE.z, sF.w, sI.x, sH.y),
+        float[4](sD.z, sE.w, sH.x, sG.y));
+    float jD[4][4] = float[4][4](
+        float[4](2.0 * sA.z - (sA.y + sA.w), 2.0 * sB.w - (sB.z + sB.x),
+                 2.0 * sE.x - (sE.w + sE.y), 2.0 * sD.y - (sD.x + sD.z)),
+        float[4](2.0 * sB.z - (sB.y + sB.w), 2.0 * sC.w - (sC.z + sC.x),
+                 2.0 * sF.x - (sF.w + sF.y), 2.0 * sE.y - (sE.x + sE.z)),
+        float[4](2.0 * sE.z - (sE.y + sE.w), 2.0 * sF.w - (sF.z + sF.x),
+                 2.0 * sI.x - (sI.w + sI.y), 2.0 * sH.y - (sH.x + sH.z)),
+        float[4](2.0 * sD.z - (sD.y + sD.w), 2.0 * sE.w - (sE.z + sE.x),
+                 2.0 * sH.x - (sH.w + sH.y), 2.0 * sG.y - (sG.x + sG.z)));
+
+    // majority vote for ambiguous dominance junctions
+    float j[4][4];
+    for (int n = 0; n < 4; n++)
+    {
+        for (int k = 0; k < 4; k++)
+        {
+            float term = sfxLEQ(jD[n][(k + 1) & 3], 0.0) * sfxLEQ(jD[n][(k + 3) & 3], 0.0)
+                       + sfxGE(jD[n][k] + jD[n][(k + 2) & 3], jD[n][(k + 1) & 3] + jD[n][(k + 3) & 3]);
+            j[n][k] = min(sfxGE(jD[n][k], 0.0) * term, 1.0);
+        }
+    }
+
+    // inject strength without creating new contradictions
+    float res[4];
+    res[0] = min(j[0][2] + (1.0 - j[0][1]) * (1.0 - j[0][3]) * sfxGE(jS[0][2], 0.0) *
+                 (j[0][0] + sfxGE(jS[0][0] + jS[0][2], jS[0][1] + jS[0][3])), 1.0);
+    res[1] = min(j[1][3] + (1.0 - j[1][2]) * (1.0 - j[1][0]) * sfxGE(jS[1][3], 0.0) *
+                 (j[1][1] + sfxGE(jS[1][1] + jS[1][3], jS[1][0] + jS[1][2])), 1.0);
+    res[2] = min(j[2][0] + (1.0 - j[2][3]) * (1.0 - j[2][1]) * sfxGE(jS[2][0], 0.0) *
+                 (j[2][2] + sfxGE(jS[2][0] + jS[2][2], jS[2][1] + jS[2][3])), 1.0);
+    res[3] = min(j[3][1] + (1.0 - j[3][0]) * (1.0 - j[3][2]) * sfxGE(jS[3][1], 0.0) *
+                 (j[3][3] + sfxGE(jS[3][1] + jS[3][3], jS[3][0] + jS[3][2])), 1.0);
+
+    // single pixel & end of line detection
+    float jc[4] = float[4](j[0][2], j[1][3], j[2][0], j[3][1]);
+    float corner[4];
+    for (int k = 0; k < 4; k++)
+        corner[k] = min(res[k] * (jc[k] + (1.0 - res[(k + 3) & 3] * res[(k + 1) & 3])), 1.0);
+
+    bool clr0 = sfxClear(mD.z, mE.x, mD.w, mE.y, mA.w, mD.y);
+    bool clr1 = sfxClear(mF.x, mE.z, mE.w, mE.y, mB.w, mF.y);
+    bool clr2 = sfxClear(mH.z, mI.x, mE.w, mH.y, mH.w, mI.y);
+    bool clr3 = sfxClear(mH.x, mG.z, mD.w, mH.y, mG.w, mG.y);
+    bool clr[4] = bool[4](clr0, clr1, clr2, clr3);
+
+    float hEdge[4] = float[4](min(mD.w, mA.w), min(mE.w, mB.w), min(mE.w, mH.w), min(mD.w, mG.w));
+    float vEdge[4] = float[4](min(mE.y, mD.y), min(mE.y, mF.y), min(mH.y, mI.y), min(mH.y, mG.y));
+    float hAdd[4] = float[4](mD.w, mE.w, mE.w, mD.w);
+    float vAdd[4] = float[4](mE.y, mE.y, mH.y, mH.y);
+
+    uint bits = 0u;
+    for (int k = 0; k < 4; k++)
+    {
+        if (corner[k] > 0.0)
+            bits |= (1u << k);
+        if (hEdge[k] < vEdge[k] && clr[k])
+            bits |= (1u << (4 + k));
+        if (hEdge[k] > vEdge[k] && clr[k])
+            bits |= (1u << (8 + k));
+        if (hEdge[k] + hAdd[k] > vEdge[k] + vAdd[k])
+            bits |= (1u << (12 + k));
+    }
+    imageStore(flagsImage, store, uvec4(bits, 0u, 0u, 0u));
+#elif SCALEFX_PASS == 3
+    uint fE = flagsAt(plane, x, y);
+    uint fD = flagsAt(plane, x - 1, y);
+    uint fD0 = flagsAt(plane, x - 2, y);
+    uint fD1 = flagsAt(plane, x - 3, y);
+    uint fF = flagsAt(plane, x + 1, y);
+    uint fF0 = flagsAt(plane, x + 2, y);
+    uint fF1 = flagsAt(plane, x + 3, y);
+    uint fB = flagsAt(plane, x, y - 1);
+    uint fB0 = flagsAt(plane, x, y - 2);
+    uint fB1 = flagsAt(plane, x, y - 3);
+    uint fH = flagsAt(plane, x, y + 1);
+    uint fH0 = flagsAt(plane, x, y + 2);
+    uint fH1 = flagsAt(plane, x, y + 3);
+
+    // lvl1 corners (SFX_SCN == 1 keeps plain corners active)
+    bool lvl1x = fCrn(fE, 0);
+    bool lvl1y = fCrn(fE, 1);
+    bool lvl1z = fCrn(fE, 2);
+    bool lvl1w = fCrn(fE, 3);
+
+    // lvl2 mid (left, right / up, down)
+    bool lvl2x0 = (fCrn(fE, 0) && fHori(fE, 1)) && fCrn(fD, 2);
+    bool lvl2x1 = (fCrn(fE, 1) && fHori(fE, 0)) && fCrn(fF, 3);
+    bool lvl2y0 = (fCrn(fE, 1) && fVert(fE, 2)) && fCrn(fB, 3);
+    bool lvl2y1 = (fCrn(fE, 2) && fVert(fE, 1)) && fCrn(fH, 0);
+    bool lvl2z0 = (fCrn(fE, 3) && fHori(fE, 2)) && fCrn(fD, 1);
+    bool lvl2z1 = (fCrn(fE, 2) && fHori(fE, 3)) && fCrn(fF, 0);
+    bool lvl2w0 = (fCrn(fE, 0) && fVert(fE, 3)) && fCrn(fB, 2);
+    bool lvl2w1 = (fCrn(fE, 3) && fVert(fE, 0)) && fCrn(fH, 1);
+
+    // lvl3 corners (hori, vert)
+    bool lvl3x0 = lvl2x1 && (fHori(fD, 1) && fHori(fD, 0)) && fHori(fF, 2);
+    bool lvl3x1 = lvl2w1 && (fVert(fB, 3) && fVert(fB, 0)) && fVert(fH, 2);
+    bool lvl3y0 = lvl2x0 && (fHori(fF, 0) && fHori(fF, 1)) && fHori(fD, 3);
+    bool lvl3y1 = lvl2y1 && (fVert(fB, 2) && fVert(fB, 1)) && fVert(fH, 3);
+    bool lvl3z0 = lvl2z0 && (fHori(fF, 3) && fHori(fF, 2)) && fHori(fD, 0);
+    bool lvl3z1 = lvl2y0 && (fVert(fH, 1) && fVert(fH, 2)) && fVert(fB, 0);
+    bool lvl3w0 = lvl2z1 && (fHori(fD, 2) && fHori(fD, 3)) && fHori(fF, 1);
+    bool lvl3w1 = lvl2w0 && (fVert(fH, 0) && fVert(fH, 3)) && fVert(fB, 1);
+
+    // lvl4 corners (hori, vert)
+    bool lvl4x0 = (fCrn(fD, 0) && fHori(fD, 1) && fHori(fE, 0) && fHori(fE, 1) && fHori(fF, 0) && fHori(fF, 1))
+               && (fCrn(fD0, 2) && fHori(fD0, 3));
+    bool lvl4x1 = (fCrn(fB, 0) && fVert(fB, 3) && fVert(fE, 0) && fVert(fE, 3) && fVert(fH, 0) && fVert(fH, 3))
+               && (fCrn(fB0, 2) && fVert(fB0, 1));
+    bool lvl4y0 = (fCrn(fF, 1) && fHori(fF, 0) && fHori(fE, 1) && fHori(fE, 0) && fHori(fD, 1) && fHori(fD, 0))
+               && (fCrn(fF0, 3) && fHori(fF0, 2));
+    bool lvl4y1 = (fCrn(fB, 1) && fVert(fB, 2) && fVert(fE, 1) && fVert(fE, 2) && fVert(fH, 1) && fVert(fH, 2))
+               && (fCrn(fB0, 3) && fVert(fB0, 0));
+    bool lvl4z0 = (fCrn(fF, 2) && fHori(fF, 3) && fHori(fE, 2) && fHori(fE, 3) && fHori(fD, 2) && fHori(fD, 3))
+               && (fCrn(fF0, 0) && fHori(fF0, 1));
+    bool lvl4z1 = (fCrn(fH, 2) && fVert(fH, 1) && fVert(fE, 2) && fVert(fE, 1) && fVert(fB, 2) && fVert(fB, 1))
+               && (fCrn(fH0, 0) && fVert(fH0, 3));
+    bool lvl4w0 = (fCrn(fD, 3) && fHori(fD, 2) && fHori(fE, 3) && fHori(fE, 2) && fHori(fF, 3) && fHori(fF, 2))
+               && (fCrn(fD0, 1) && fHori(fD0, 0));
+    bool lvl4w1 = (fCrn(fH, 3) && fVert(fH, 0) && fVert(fE, 3) && fVert(fE, 0) && fVert(fB, 3) && fVert(fB, 0))
+               && (fCrn(fH0, 1) && fVert(fH0, 2));
+
+    // lvl5 mid (left, right / up, down)
+    bool lvl5x0 = lvl4x0 && (fHori(fF0, 0) && fHori(fF0, 1)) && (fHori(fD1, 2) && fHori(fD1, 3));
+    bool lvl5x1 = lvl4y0 && (fHori(fD0, 1) && fHori(fD0, 0)) && (fHori(fF1, 3) && fHori(fF1, 2));
+    bool lvl5y0 = lvl4y1 && (fVert(fH0, 1) && fVert(fH0, 2)) && (fVert(fB1, 3) && fVert(fB1, 0));
+    bool lvl5y1 = lvl4z1 && (fVert(fB0, 2) && fVert(fB0, 1)) && (fVert(fH1, 0) && fVert(fH1, 3));
+    bool lvl5z0 = lvl4w0 && (fHori(fF0, 3) && fHori(fF0, 2)) && (fHori(fD1, 1) && fHori(fD1, 0));
+    bool lvl5z1 = lvl4z0 && (fHori(fD0, 2) && fHori(fD0, 3)) && (fHori(fF1, 0) && fHori(fF1, 1));
+    bool lvl5w0 = lvl4x1 && (fVert(fH0, 0) && fVert(fH0, 3)) && (fVert(fB1, 2) && fVert(fB1, 1));
+    bool lvl5w1 = lvl4w1 && (fVert(fB0, 3) && fVert(fB0, 0)) && (fVert(fH1, 1) && fVert(fH1, 2));
+
+    // lvl6 corners (hori, vert)
+    bool lvl6x0 = lvl5x1 && (fHori(fD1, 1) && fHori(fD1, 0));
+    bool lvl6x1 = lvl5w1 && (fVert(fB1, 3) && fVert(fB1, 0));
+    bool lvl6y0 = lvl5x0 && (fHori(fF1, 0) && fHori(fF1, 1));
+    bool lvl6y1 = lvl5y1 && (fVert(fB1, 2) && fVert(fB1, 1));
+    bool lvl6z0 = lvl5z0 && (fHori(fF1, 3) && fHori(fF1, 2));
+    bool lvl6z1 = lvl5y0 && (fVert(fH1, 1) && fVert(fH1, 2));
+    bool lvl6w0 = lvl5z1 && (fHori(fD1, 2) && fHori(fD1, 3));
+    bool lvl6w1 = lvl5w0 && (fVert(fH1, 0) && fVert(fH1, 3));
+
+    // subpixel candidates - 0=E 1=D 2=D0 3=F 4=F0 5=B 6=B0 7=H 8=H0
+    uint crn0 = ((lvl1x && fOr(fE, 0)) || (lvl3x0 && fOr(fE, 1)) || (lvl4x0 && fOr(fD, 0)) || (lvl6x0 && fOr(fF, 1))) ? 5u
+              : (lvl1x || (lvl3x1 && !fOr(fE, 3)) || (lvl4x1 && !fOr(fB, 0)) || (lvl6x1 && !fOr(fH, 3))) ? 1u
+              : lvl3x0 ? 3u : lvl3x1 ? 7u : lvl4x0 ? 2u : lvl4x1 ? 6u : lvl6x0 ? 4u : lvl6x1 ? 8u : 0u;
+    uint crn1 = ((lvl1y && fOr(fE, 1)) || (lvl3y0 && fOr(fE, 0)) || (lvl4y0 && fOr(fF, 1)) || (lvl6y0 && fOr(fD, 0))) ? 5u
+              : (lvl1y || (lvl3y1 && !fOr(fE, 2)) || (lvl4y1 && !fOr(fB, 1)) || (lvl6y1 && !fOr(fH, 2))) ? 3u
+              : lvl3y0 ? 1u : lvl3y1 ? 7u : lvl4y0 ? 4u : lvl4y1 ? 6u : lvl6y0 ? 2u : lvl6y1 ? 8u : 0u;
+    uint crn2 = ((lvl1z && fOr(fE, 2)) || (lvl3z0 && fOr(fE, 3)) || (lvl4z0 && fOr(fF, 2)) || (lvl6z0 && fOr(fD, 3))) ? 7u
+              : (lvl1z || (lvl3z1 && !fOr(fE, 1)) || (lvl4z1 && !fOr(fH, 2)) || (lvl6z1 && !fOr(fB, 1))) ? 3u
+              : lvl3z0 ? 1u : lvl3z1 ? 5u : lvl4z0 ? 4u : lvl4z1 ? 8u : lvl6z0 ? 2u : lvl6z1 ? 6u : 0u;
+    uint crn3 = ((lvl1w && fOr(fE, 3)) || (lvl3w0 && fOr(fE, 2)) || (lvl4w0 && fOr(fD, 3)) || (lvl6w0 && fOr(fF, 2))) ? 7u
+              : (lvl1w || (lvl3w1 && !fOr(fE, 0)) || (lvl4w1 && !fOr(fH, 3)) || (lvl6w1 && !fOr(fB, 0))) ? 1u
+              : lvl3w0 ? 3u : lvl3w1 ? 5u : lvl4w0 ? 2u : lvl4w1 ? 8u : lvl6w0 ? 4u : lvl6w1 ? 6u : 0u;
+
+    uint mid0 = ((lvl2x0 && fOr(fE, 0)) || (lvl2x1 && fOr(fE, 1)) || (lvl5x0 && fOr(fD, 0)) || (lvl5x1 && fOr(fF, 1))) ? 5u
+              : lvl2x0 ? 1u : lvl2x1 ? 3u : lvl5x0 ? 2u : lvl5x1 ? 4u
+              : (fCrn(fE, 0) && fCrn(fD, 2) && fCrn(fE, 1) && fCrn(fF, 3)) ? (fOr(fE, 0) ? (fOr(fE, 1) ? 5u : 3u) : 1u) : 0u;
+    uint mid1 = ((lvl2y0 && !fOr(fE, 1)) || (lvl2y1 && !fOr(fE, 2)) || (lvl5y0 && !fOr(fB, 1)) || (lvl5y1 && !fOr(fH, 2))) ? 3u
+              : lvl2y0 ? 5u : lvl2y1 ? 7u : lvl5y0 ? 6u : lvl5y1 ? 8u
+              : (fCrn(fE, 1) && fCrn(fB, 3) && fCrn(fE, 2) && fCrn(fH, 0)) ? (!fOr(fE, 1) ? (!fOr(fE, 2) ? 3u : 7u) : 5u) : 0u;
+    uint mid2 = ((lvl2z0 && fOr(fE, 3)) || (lvl2z1 && fOr(fE, 2)) || (lvl5z0 && fOr(fD, 3)) || (lvl5z1 && fOr(fF, 2))) ? 7u
+              : lvl2z0 ? 1u : lvl2z1 ? 3u : lvl5z0 ? 2u : lvl5z1 ? 4u
+              : (fCrn(fE, 2) && fCrn(fF, 0) && fCrn(fE, 3) && fCrn(fD, 1)) ? (fOr(fE, 2) ? (fOr(fE, 3) ? 7u : 1u) : 3u) : 0u;
+    uint mid3 = ((lvl2w0 && !fOr(fE, 0)) || (lvl2w1 && !fOr(fE, 3)) || (lvl5w0 && !fOr(fB, 0)) || (lvl5w1 && !fOr(fH, 3))) ? 1u
+              : lvl2w0 ? 5u : lvl2w1 ? 7u : lvl5w0 ? 6u : lvl5w1 ? 8u
+              : (fCrn(fE, 3) && fCrn(fH, 1) && fCrn(fE, 0) && fCrn(fB, 2)) ? (!fOr(fE, 3) ? (!fOr(fE, 0) ? 1u : 5u) : 7u) : 0u;
+
+    uint packed = crn0 | (crn1 << 4u) | (crn2 << 8u) | (crn3 << 12u)
+                | (mid0 << 16u) | (mid1 << 20u) | (mid2 << 24u) | (mid3 << 28u);
+    imageStore(candidateImage, store, uvec4(packed, 0u, 0u, 0u));
+#endif
+#endif
+}

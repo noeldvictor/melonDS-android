@@ -465,6 +465,10 @@ private:
         VkImageView cachedBottomFilteredPlaneView{VK_NULL_HANDLE};
         std::array<VkDescriptorSet, 2> planeFilterDescriptorSets{};
         bool planeFilterDescriptorsReady{};
+        std::array<VkDescriptorSet, 2> scalefxDescriptorSets{};
+        bool scalefxDescriptorsReady{};
+        VkImageView cachedScaleFXTopPlaneView{VK_NULL_HANDLE};
+        VkImageView cachedScaleFXBottomPlaneView{VK_NULL_HANDLE};
         std::vector<melonDS::HDPack2DInstance> replacementInstances;
         VkBuffer overlayInstanceBuffer{VK_NULL_HANDLE};
         VkDeviceMemory overlayInstanceMemory{VK_NULL_HANDLE};
@@ -488,6 +492,12 @@ private:
     void destroyPlaneFilterResources();
     VkPipeline getPlaneFilterPipeline(u32 mode);
     bool recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs);
+    bool ensureScaleFXResources(FrameResource& resource);
+    void destroyScaleFXResources();
+    VkPipeline getScaleFXPipeline(u32 pass);
+    void recordScaleFXChain(FrameResource& resource, u32 screen,
+                            u32 applyObj, u32 applyBg, u32 writeOthers,
+                            const VulkanCompositionInputs& inputs);
     bool ensurePlaneOverlayResources(FrameResource& resource);
     void destroyPlaneOverlayResources();
     VkPipeline getPlaneOverlayPipeline();
@@ -637,6 +647,31 @@ private:
     VkImageView placeholderPlaneView{VK_NULL_HANDLE};
     VkDeviceMemory placeholderPlaneMemory{VK_NULL_HANDLE};
     bool placeholderPlaneLayoutReady{false};
+
+    // faithful multi-pass ScaleFX chain for plane filter mode 13; the
+    // analysis intermediates live at native plane resolution (256x192 per
+    // plane half, both halves stacked) and are shared by both screens
+    static constexpr u32 kScaleFXPassCount = 5;
+    static constexpr u32 kScaleFXImageWidth = 256;
+    static constexpr u32 kScaleFXImageHeight = 192 * 2;
+    VkDescriptorSetLayout scalefxDescriptorSetLayout{VK_NULL_HANDLE};
+    VkDescriptorPool scalefxDescriptorPool{VK_NULL_HANDLE};
+    VkPipelineLayout scalefxPipelineLayout{VK_NULL_HANDLE};
+    std::array<VkPipeline, kScaleFXPassCount> scalefxPipelines{};
+    bool scalefxPipelinesFailed{false};
+    VkImage scalefxMetricImage{VK_NULL_HANDLE};
+    VkImageView scalefxMetricView{VK_NULL_HANDLE};
+    VkDeviceMemory scalefxMetricMemory{VK_NULL_HANDLE};
+    VkImage scalefxStrengthImage{VK_NULL_HANDLE};
+    VkImageView scalefxStrengthView{VK_NULL_HANDLE};
+    VkDeviceMemory scalefxStrengthMemory{VK_NULL_HANDLE};
+    VkImage scalefxFlagsImage{VK_NULL_HANDLE};
+    VkImageView scalefxFlagsView{VK_NULL_HANDLE};
+    VkDeviceMemory scalefxFlagsMemory{VK_NULL_HANDLE};
+    VkImage scalefxCandidateImage{VK_NULL_HANDLE};
+    VkImageView scalefxCandidateView{VK_NULL_HANDLE};
+    VkDeviceMemory scalefxCandidateMemory{VK_NULL_HANDLE};
+    bool scalefxImagesLayoutReady{false};
 
     // HD 2D replacement overlay: instances land on the filtered plane images
     // through a small compute pass sampling a shared replacement atlas

@@ -30,7 +30,11 @@
 #include "VulkanPlaneFilterMode10ShaderData.h"
 #include "VulkanPlaneFilterMode11ShaderData.h"
 #include "VulkanPlaneFilterMode12ShaderData.h"
-#include "VulkanPlaneFilterMode13ShaderData.h"
+#include "VulkanScaleFXPass0ShaderData.h"
+#include "VulkanScaleFXPass1ShaderData.h"
+#include "VulkanScaleFXPass2ShaderData.h"
+#include "VulkanScaleFXPass3ShaderData.h"
+#include "VulkanScaleFXPass4ShaderData.h"
 #include "VulkanPlaneOverlayShaderData.h"
 
 namespace MelonDSAndroid
@@ -472,6 +476,7 @@ void VulkanOutput::shutdown()
     destroyFrameResources();
     destroyAccumulateResources();
     destroyPlaneOverlayResources();
+    destroyScaleFXResources();
     destroyPlaneFilterResources();
     destroyCompositorResources();
 
@@ -1006,6 +1011,9 @@ bool VulkanOutput::ensurePlaneFilterResources(u32 scale)
         frameResource.planeFilterDescriptorsReady = false;
         frameResource.cachedTopFilteredPlaneView = VK_NULL_HANDLE;
         frameResource.cachedBottomFilteredPlaneView = VK_NULL_HANDLE;
+        frameResource.scalefxDescriptorsReady = false;
+        frameResource.cachedScaleFXTopPlaneView = VK_NULL_HANDLE;
+        frameResource.cachedScaleFXBottomPlaneView = VK_NULL_HANDLE;
         frameResource.overlayDescriptorsReady = false;
         frameResource.cachedOverlayTopPlaneView = VK_NULL_HANDLE;
         frameResource.cachedOverlayBottomPlaneView = VK_NULL_HANDLE;
@@ -1114,7 +1122,7 @@ VkPipeline VulkanOutput::getPlaneFilterPipeline(u32 mode)
         {melonDS_android_vulkan_plane_filter_mode10_comp_spv, melonDS_android_vulkan_plane_filter_mode10_comp_spv_len},
         {melonDS_android_vulkan_plane_filter_mode11_comp_spv, melonDS_android_vulkan_plane_filter_mode11_comp_spv_len},
         {melonDS_android_vulkan_plane_filter_mode12_comp_spv, melonDS_android_vulkan_plane_filter_mode12_comp_spv_len},
-        {melonDS_android_vulkan_plane_filter_mode13_comp_spv, melonDS_android_vulkan_plane_filter_mode13_comp_spv_len},
+        {nullptr, 0}, // mode 13 (ScaleFX) uses the dedicated multi-pass chain
     }};
 
     if (mode == 0 || mode >= kPlaneFilterModeCount)
@@ -1911,6 +1919,422 @@ void VulkanOutput::destroyPlaneOverlayResources()
     overlayAtlasFull = false;
 }
 
+bool VulkanOutput::ensureScaleFXResources(FrameResource& resource)
+{
+    if (scalefxDescriptorSetLayout == VK_NULL_HANDLE)
+    {
+        std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        for (u32 index = 1; index < 6; index++)
+        {
+            bindings[index].binding = index;
+            bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[index].descriptorCount = 1;
+            bindings[index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+
+        VkDescriptorSetLayoutCreateInfo layoutCreateInfo{};
+        layoutCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutCreateInfo.bindingCount = static_cast<u32>(bindings.size());
+        layoutCreateInfo.pBindings = bindings.data();
+        if (vkCreateDescriptorSetLayout(device, &layoutCreateInfo, nullptr, &scalefxDescriptorSetLayout) != VK_SUCCESS)
+            return false;
+    }
+
+    if (scalefxDescriptorPool == VK_NULL_HANDLE)
+    {
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, FRAME_QUEUE_SIZE * 2};
+        poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, FRAME_QUEUE_SIZE * 2 * 5};
+
+        VkDescriptorPoolCreateInfo poolCreateInfo{};
+        poolCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolCreateInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        poolCreateInfo.maxSets = FRAME_QUEUE_SIZE * 2;
+        poolCreateInfo.poolSizeCount = static_cast<u32>(poolSizes.size());
+        poolCreateInfo.pPoolSizes = poolSizes.data();
+        if (vkCreateDescriptorPool(device, &poolCreateInfo, nullptr, &scalefxDescriptorPool) != VK_SUCCESS)
+            return false;
+    }
+
+    if (scalefxPipelineLayout == VK_NULL_HANDLE)
+    {
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushRange.size = sizeof(PlaneFilterPushConstants);
+
+        VkPipelineLayoutCreateInfo layoutCreateInfo{};
+        layoutCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutCreateInfo.setLayoutCount = 1;
+        layoutCreateInfo.pSetLayouts = &scalefxDescriptorSetLayout;
+        layoutCreateInfo.pushConstantRangeCount = 1;
+        layoutCreateInfo.pPushConstantRanges = &pushRange;
+        if (vkCreatePipelineLayout(device, &layoutCreateInfo, nullptr, &scalefxPipelineLayout) != VK_SUCCESS)
+            return false;
+    }
+
+    auto destroyOne = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory) {
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+    };
+
+    auto createOne = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory, VkFormat format) -> bool {
+        if (image != VK_NULL_HANDLE)
+            return true;
+
+        VkImageCreateInfo imageCreateInfo{};
+        imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageCreateInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageCreateInfo.format = format;
+        imageCreateInfo.extent = {kScaleFXImageWidth, kScaleFXImageHeight, 1};
+        imageCreateInfo.mipLevels = 1;
+        imageCreateInfo.arrayLayers = 1;
+        imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageCreateInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(device, &imageCreateInfo, nullptr, &image) != VK_SUCCESS)
+            return false;
+
+        VkMemoryRequirements memoryRequirements{};
+        vkGetImageMemoryRequirements(device, image, &memoryRequirements);
+
+        VkMemoryAllocateInfo memoryAllocateInfo{};
+        memoryAllocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memoryAllocateInfo.allocationSize = memoryRequirements.size;
+        memoryAllocateInfo.memoryTypeIndex = findMemoryType(memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryAllocateInfo.memoryTypeIndex == UINT32_MAX
+            || vkAllocateMemory(device, &memoryAllocateInfo, nullptr, &memory) != VK_SUCCESS
+            || vkBindImageMemory(device, image, memory, 0) != VK_SUCCESS)
+        {
+            destroyOne(image, view, memory);
+            return false;
+        }
+
+        VkImageViewCreateInfo viewCreateInfo{};
+        viewCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewCreateInfo.image = image;
+        viewCreateInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewCreateInfo.format = format;
+        viewCreateInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewCreateInfo.subresourceRange.levelCount = 1;
+        viewCreateInfo.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(device, &viewCreateInfo, nullptr, &view) != VK_SUCCESS)
+        {
+            destroyOne(image, view, memory);
+            return false;
+        }
+        return true;
+    };
+
+    if (!createOne(scalefxMetricImage, scalefxMetricView, scalefxMetricMemory, VK_FORMAT_R32G32B32A32_SFLOAT)
+        || !createOne(scalefxStrengthImage, scalefxStrengthView, scalefxStrengthMemory, VK_FORMAT_R32G32B32A32_SFLOAT)
+        || !createOne(scalefxFlagsImage, scalefxFlagsView, scalefxFlagsMemory, VK_FORMAT_R32_UINT)
+        || !createOne(scalefxCandidateImage, scalefxCandidateView, scalefxCandidateMemory, VK_FORMAT_R32_UINT))
+        return false;
+
+    if (resource.scalefxDescriptorsReady
+        && (resource.cachedScaleFXTopPlaneView != topFilteredPlaneView
+            || resource.cachedScaleFXBottomPlaneView != bottomFilteredPlaneView))
+        resource.scalefxDescriptorsReady = false;
+
+    if (!resource.scalefxDescriptorsReady)
+    {
+        if (resource.scalefxDescriptorSets[0] == VK_NULL_HANDLE)
+        {
+            const std::array<VkDescriptorSetLayout, 2> layouts = {
+                scalefxDescriptorSetLayout,
+                scalefxDescriptorSetLayout,
+            };
+            VkDescriptorSetAllocateInfo allocateInfo{};
+            allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocateInfo.descriptorPool = scalefxDescriptorPool;
+            allocateInfo.descriptorSetCount = static_cast<u32>(layouts.size());
+            allocateInfo.pSetLayouts = layouts.data();
+            if (vkAllocateDescriptorSets(device, &allocateInfo, resource.scalefxDescriptorSets.data()) != VK_SUCCESS)
+            {
+                resource.scalefxDescriptorSets.fill(VK_NULL_HANDLE);
+                return false;
+            }
+        }
+
+        std::array<VkDescriptorBufferInfo, 2> bufferInfos{};
+        bufferInfos[0] = {resource.topPackedBuffer, 0, resource.packedBufferSize};
+        bufferInfos[1] = {resource.bottomPackedBuffer, 0, resource.packedBufferSize};
+
+        VkDescriptorImageInfo metricInfo{VK_NULL_HANDLE, scalefxMetricView, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo strengthInfo{VK_NULL_HANDLE, scalefxStrengthView, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo flagsInfo{VK_NULL_HANDLE, scalefxFlagsView, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo candidateInfo{VK_NULL_HANDLE, scalefxCandidateView, VK_IMAGE_LAYOUT_GENERAL};
+        std::array<VkDescriptorImageInfo, 2> outputInfos{};
+        outputInfos[0] = {VK_NULL_HANDLE, topFilteredPlaneView, VK_IMAGE_LAYOUT_GENERAL};
+        outputInfos[1] = {VK_NULL_HANDLE, bottomFilteredPlaneView, VK_IMAGE_LAYOUT_GENERAL};
+
+        const VkDescriptorImageInfo* imageInfos[5] = {
+            &metricInfo, &strengthInfo, &flagsInfo, &candidateInfo, nullptr,
+        };
+
+        std::array<VkWriteDescriptorSet, 12> writes{};
+        u32 writeIndex = 0;
+        for (u32 screen = 0; screen < 2; screen++)
+        {
+            writes[writeIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[writeIndex].dstSet = resource.scalefxDescriptorSets[screen];
+            writes[writeIndex].dstBinding = 0;
+            writes[writeIndex].descriptorCount = 1;
+            writes[writeIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[writeIndex].pBufferInfo = &bufferInfos[screen];
+            writeIndex++;
+            for (u32 binding = 1; binding <= 5; binding++)
+            {
+                writes[writeIndex].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[writeIndex].dstSet = resource.scalefxDescriptorSets[screen];
+                writes[writeIndex].dstBinding = binding;
+                writes[writeIndex].descriptorCount = 1;
+                writes[writeIndex].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                writes[writeIndex].pImageInfo = (binding == 5) ? &outputInfos[screen] : imageInfos[binding - 1];
+                writeIndex++;
+            }
+        }
+        vkUpdateDescriptorSets(device, writeIndex, writes.data(), 0, nullptr);
+        resource.cachedScaleFXTopPlaneView = topFilteredPlaneView;
+        resource.cachedScaleFXBottomPlaneView = bottomFilteredPlaneView;
+        resource.scalefxDescriptorsReady = true;
+    }
+
+    return true;
+}
+
+VkPipeline VulkanOutput::getScaleFXPipeline(u32 pass)
+{
+    struct ScaleFXBlob
+    {
+        const unsigned char* data;
+        size_t size;
+    };
+    static const std::array<ScaleFXBlob, kScaleFXPassCount> blobs = {{
+        {melonDS_android_vulkan_scalefx_pass0_comp_spv, melonDS_android_vulkan_scalefx_pass0_comp_spv_len},
+        {melonDS_android_vulkan_scalefx_pass1_comp_spv, melonDS_android_vulkan_scalefx_pass1_comp_spv_len},
+        {melonDS_android_vulkan_scalefx_pass2_comp_spv, melonDS_android_vulkan_scalefx_pass2_comp_spv_len},
+        {melonDS_android_vulkan_scalefx_pass3_comp_spv, melonDS_android_vulkan_scalefx_pass3_comp_spv_len},
+        {melonDS_android_vulkan_scalefx_pass4_comp_spv, melonDS_android_vulkan_scalefx_pass4_comp_spv_len},
+    }};
+
+    if (pass >= kScaleFXPassCount)
+        return VK_NULL_HANDLE;
+    if (scalefxPipelines[pass] != VK_NULL_HANDLE)
+        return scalefxPipelines[pass];
+    // one-shot: a failed chain stays disabled instead of retrying every frame
+    if (scalefxPipelinesFailed || scalefxPipelineLayout == VK_NULL_HANDLE)
+        return VK_NULL_HANDLE;
+
+    std::vector<u32> shaderWords((blobs[pass].size + sizeof(u32) - 1u) / sizeof(u32));
+    std::memcpy(shaderWords.data(), blobs[pass].data, blobs[pass].size);
+
+    VkShaderModuleCreateInfo moduleCreateInfo{};
+    moduleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleCreateInfo.codeSize = blobs[pass].size;
+    moduleCreateInfo.pCode = shaderWords.data();
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &moduleCreateInfo, nullptr, &shaderModule) != VK_SUCCESS)
+    {
+        scalefxPipelinesFailed = true;
+        melonDS::Platform::Log(melonDS::Platform::LogLevel::Error, "VulkanOutput: failed to create ScaleFX pass %u shader module", pass);
+        return VK_NULL_HANDLE;
+    }
+
+    VkComputePipelineCreateInfo pipelineCreateInfo{};
+    pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineCreateInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineCreateInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineCreateInfo.stage.module = shaderModule;
+    pipelineCreateInfo.stage.pName = "main";
+    pipelineCreateInfo.layout = scalefxPipelineLayout;
+
+    const VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &scalefxPipelines[pass]);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+    if (result != VK_SUCCESS)
+    {
+        scalefxPipelines[pass] = VK_NULL_HANDLE;
+        scalefxPipelinesFailed = true;
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Error,
+            "VulkanOutput: failed to create ScaleFX pass %u pipeline (%d); rendering unfiltered",
+            pass,
+            static_cast<int>(result));
+        return VK_NULL_HANDLE;
+    }
+    return scalefxPipelines[pass];
+}
+
+void VulkanOutput::recordScaleFXChain(FrameResource& resource, u32 screen,
+                                      u32 applyObj, u32 applyBg, u32 writeOthers,
+                                      const VulkanCompositionInputs& inputs)
+{
+    const u32 scale = std::max(inputs.scale, 1u);
+
+    auto makeIntermediateBarrier = [&](VkImage image, VkAccessFlags srcAccess, VkAccessFlags dstAccess, VkImageLayout oldLayout) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = srcAccess;
+        barrier.dstAccessMask = dstAccess;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        return barrier;
+    };
+
+    // the intermediates are shared: the previous screen's (or frame's) chain
+    // may still be reading them
+    {
+        const VkImageLayout oldLayout = scalefxImagesLayoutReady ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        const VkAccessFlags srcAccess = scalefxImagesLayoutReady ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT) : 0;
+        const std::array<VkImageMemoryBarrier, 4> startBarriers = {
+            makeIntermediateBarrier(scalefxMetricImage, srcAccess, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, oldLayout),
+            makeIntermediateBarrier(scalefxStrengthImage, srcAccess, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, oldLayout),
+            makeIntermediateBarrier(scalefxFlagsImage, srcAccess, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, oldLayout),
+            makeIntermediateBarrier(scalefxCandidateImage, srcAccess, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, oldLayout),
+        };
+        vkCmdPipelineBarrier(
+            resource.commandBuffer,
+            scalefxImagesLayoutReady ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr,
+            static_cast<u32>(startBarriers.size()), startBarriers.data());
+        scalefxImagesLayoutReady = true;
+    }
+
+    vkCmdBindDescriptorSets(
+        resource.commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        scalefxPipelineLayout,
+        0, 1,
+        &resource.scalefxDescriptorSets[screen],
+        0, nullptr);
+
+    PlaneFilterPushConstants pushConstants{};
+    pushConstants.scale = scale;
+    pushConstants.packedStride = inputs.packedStride;
+    pushConstants.applyObj = applyObj;
+    pushConstants.applyBg = applyBg;
+    pushConstants.writeOthers = writeOthers;
+    pushConstants.debugTint = areRendererDebugFilterTintEnabled() ? 1u : 0u;
+    vkCmdPushConstants(
+        resource.commandBuffer,
+        scalefxPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(pushConstants),
+        &pushConstants);
+
+    const u32 nativeGroupsX = (kScaleFXImageWidth + 7u) / 8u;
+    const u32 nativeGroupsY = (kScaleFXImageHeight + 7u) / 8u;
+    const std::array<VkImage, 4> passOutputs = {
+        scalefxMetricImage, scalefxStrengthImage, scalefxFlagsImage, scalefxCandidateImage,
+    };
+
+    for (u32 pass = 0; pass < 4; pass++)
+    {
+        vkCmdBindPipeline(resource.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, scalefxPipelines[pass]);
+        vkCmdDispatch(resource.commandBuffer, nativeGroupsX, nativeGroupsY, 1);
+
+        const VkImageMemoryBarrier readBarrier = makeIntermediateBarrier(
+            passOutputs[pass],
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdPipelineBarrier(
+            resource.commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &readBarrier);
+    }
+
+    vkCmdBindPipeline(resource.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, scalefxPipelines[4]);
+    vkCmdDispatch(
+        resource.commandBuffer,
+        (kScaleFXImageWidth * scale + 7u) / 8u,
+        (kScaleFXImageHeight * scale + 7u) / 8u,
+        1);
+}
+
+void VulkanOutput::destroyScaleFXResources()
+{
+    for (VkPipeline& pipeline : scalefxPipelines)
+    {
+        if (pipeline != VK_NULL_HANDLE)
+        {
+            vkDestroyPipeline(device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+    scalefxPipelinesFailed = false;
+
+    if (scalefxPipelineLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyPipelineLayout(device, scalefxPipelineLayout, nullptr);
+        scalefxPipelineLayout = VK_NULL_HANDLE;
+    }
+
+    if (scalefxDescriptorPool != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorPool(device, scalefxDescriptorPool, nullptr);
+        scalefxDescriptorPool = VK_NULL_HANDLE;
+    }
+
+    if (scalefxDescriptorSetLayout != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, scalefxDescriptorSetLayout, nullptr);
+        scalefxDescriptorSetLayout = VK_NULL_HANDLE;
+    }
+
+    auto destroyOne = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory) {
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+    };
+    destroyOne(scalefxMetricImage, scalefxMetricView, scalefxMetricMemory);
+    destroyOne(scalefxStrengthImage, scalefxStrengthView, scalefxStrengthMemory);
+    destroyOne(scalefxFlagsImage, scalefxFlagsView, scalefxFlagsMemory);
+    destroyOne(scalefxCandidateImage, scalefxCandidateView, scalefxCandidateMemory);
+    scalefxImagesLayoutReady = false;
+}
+
 bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs)
 {
     const u32 scale = std::max(inputs.scale, 1u);
@@ -1959,11 +2383,25 @@ bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const Vulkan
     }
 
     std::array<VkPipeline, 2> passPipelines{};
+    bool chainNeeded = false;
     for (u32 passIndex = 0; passIndex < passCount; passIndex++)
     {
+        if (passes[passIndex].mode == 13u)
+        {
+            chainNeeded = true;
+            continue;
+        }
         passPipelines[passIndex] = getPlaneFilterPipeline(passes[passIndex].mode);
         if (passPipelines[passIndex] == VK_NULL_HANDLE)
             return false;
+    }
+    if (chainNeeded)
+    {
+        if (!ensureScaleFXResources(resource))
+            return false;
+        for (u32 pass = 0; pass < kScaleFXPassCount; pass++)
+            if (getScaleFXPipeline(pass) == VK_NULL_HANDLE)
+                return false;
     }
 
     if (!resource.planeFilterDescriptorsReady)
@@ -2061,17 +2499,6 @@ bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const Vulkan
 
     for (u32 screen = 0; screen < 2; screen++)
     {
-        vkCmdBindDescriptorSets(
-            resource.commandBuffer,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            planeFilterPipelineLayout,
-            0,
-            1,
-            &resource.planeFilterDescriptorSets[screen],
-            0,
-            nullptr
-        );
-
         for (u32 passIndex = 0; passIndex < passCount; passIndex++)
         {
             if (passIndex > 0)
@@ -2096,6 +2523,29 @@ bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const Vulkan
                     &writeOrderBarrier
                 );
             }
+
+            if (passes[passIndex].mode == 13u)
+            {
+                recordScaleFXChain(
+                    resource,
+                    screen,
+                    passes[passIndex].applyObj,
+                    passes[passIndex].applyBg,
+                    passes[passIndex].writeOthers,
+                    inputs);
+                continue;
+            }
+
+            vkCmdBindDescriptorSets(
+                resource.commandBuffer,
+                VK_PIPELINE_BIND_POINT_COMPUTE,
+                planeFilterPipelineLayout,
+                0,
+                1,
+                &resource.planeFilterDescriptorSets[screen],
+                0,
+                nullptr
+            );
 
             PlaneFilterPushConstants pushConstants{};
             pushConstants.scale = scale;
@@ -3122,6 +3572,18 @@ void VulkanOutput::destroyFrameResource(Frame* frame)
             {
                 vkFreeDescriptorSets(device, planeFilterDescriptorPool, 1, &planeFilterSet);
                 planeFilterSet = VK_NULL_HANDLE;
+            }
+        }
+    }
+
+    if (scalefxDescriptorPool != VK_NULL_HANDLE)
+    {
+        for (VkDescriptorSet& scalefxSet : resource.scalefxDescriptorSets)
+        {
+            if (scalefxSet != VK_NULL_HANDLE)
+            {
+                vkFreeDescriptorSets(device, scalefxDescriptorPool, 1, &scalefxSet);
+                scalefxSet = VK_NULL_HANDLE;
             }
         }
     }
