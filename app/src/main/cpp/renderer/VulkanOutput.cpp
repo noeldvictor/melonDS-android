@@ -4541,25 +4541,31 @@ bool VulkanOutput::prepareFrameForPresentation(
         && softPackedSnapshot.bottomScreenStats.VramCaptureUses3dLines == 0u
         && softPackedSnapshot.bottomScreenStats.ForceLive3dCompMode7Lines == 0u;
     bool liveSourceScreenSwap = resource.screenSwap;
+    bool liveOwnerFromTunedBranch = false;
     if (topStructuredSlotUsesPreviousWhileBottom2dOnly)
     {
         liveSourceScreenSwap = false;
+        liveOwnerFromTunedBranch = true;
     }
     else if (bottomStructuredSlotUsesPreviousWhileTop2dOnly)
     {
         liveSourceScreenSwap = true;
+        liveOwnerFromTunedBranch = true;
     }
     else if (preservePackedOwnerForTopVramBottomPlainStructuredComp7)
     {
         liveSourceScreenSwap = resource.screenSwap;
+        liveOwnerFromTunedBranch = true;
     }
     else if (class4VramStructuredPair)
     {
         liveSourceScreenSwap = topUsesVramCapture3d;
+        liveOwnerFromTunedBranch = true;
     }
     else if (preservePackedOwnerForAlternatingPlainStructuredComp7)
     {
         liveSourceScreenSwap = resource.screenSwap;
+        liveOwnerFromTunedBranch = true;
     }
     else if (asymmetricFullRegularComp7
         && !preservePackedOwnerForPlainRegularComp7Pair)
@@ -4582,6 +4588,23 @@ bool VulkanOutput::prepareFrameForPresentation(
         && topUsesRegularCapture3d)
     {
         liveSourceScreenSwap = true;
+    }
+    // the stats-driven owner chain can hand the live 3D to a screen that is
+    // DISPLAYING A CAPTURE this frame while the 3D unit actually rendered
+    // for the other screen. A capture-displaying screen shows past content
+    // by definition, so sampling the live image there paints the other
+    // screen's picture onto it (title sequence: the logo on the bottom
+    // display every other frame). When the unit's render swap disagrees and
+    // the heuristic's owner is capture-backed, trust the unit.
+    if (currentBackendIsGraphics
+        && !liveOwnerFromTunedBranch
+        && liveSourceScreenSwap != backendRenderScreenSwap)
+    {
+        const bool actualOwnerShowsCapture = backendRenderScreenSwap
+            ? topUsesCurrentCapture3d
+            : bottomUsesCurrentCapture3d;
+        if (!actualOwnerShowsCapture)
+            liveSourceScreenSwap = backendRenderScreenSwap;
     }
     const bool topPlainStructuredComp7UsesOppositeLive3d =
         currentBackendIsGraphics
