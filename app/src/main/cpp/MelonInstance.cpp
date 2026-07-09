@@ -5331,14 +5331,24 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
                     y,
                     snapshotRowBase);
             else if (topStructuredDisplayLine)
-                copyStructuredLine(
-                    lastSoftPackedFrameSnapshot.packedTopPlane0,
-                    lastSoftPackedFrameSnapshot.packedTopPlane1,
-                    lastSoftPackedFrameSnapshot.packedTopControl,
-                    structuredTopPlane0,
-                    structuredTopPlane1,
-                    structuredTopControl,
-                    snapshotRowBase);
+            {
+                // an empty structured line must not replace the raw packed
+                // line: the raw line still carries this frame's real 2D
+                // planes (and any 3D slot markers), and wholesale-copying
+                // zeros drops BG/OBJ/text for the whole line — the
+                // per-frame layer dropouts on capture-backed scenes
+                if (topStructuredLineHasPayload())
+                    copyStructuredLine(
+                        lastSoftPackedFrameSnapshot.packedTopPlane0,
+                        lastSoftPackedFrameSnapshot.packedTopPlane1,
+                        lastSoftPackedFrameSnapshot.packedTopControl,
+                        structuredTopPlane0,
+                        structuredTopPlane1,
+                        structuredTopControl,
+                        snapshotRowBase);
+                else
+                    planeHoldTopLines++;
+            }
             else if (topStructuredVramCapture)
                 copyStructuredLine(
                     lastSoftPackedFrameSnapshot.packedTopPlane0,
@@ -5396,14 +5406,19 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
                     y,
                     snapshotRowBase);
             else if (bottomStructuredDisplayLine)
-                copyStructuredLine(
-                    lastSoftPackedFrameSnapshot.packedBottomPlane0,
-                    lastSoftPackedFrameSnapshot.packedBottomPlane1,
-                    lastSoftPackedFrameSnapshot.packedBottomControl,
-                    structuredBottomPlane0,
-                    structuredBottomPlane1,
-                    structuredBottomControl,
-                    snapshotRowBase);
+            {
+                if (bottomStructuredLineHasPayload())
+                    copyStructuredLine(
+                        lastSoftPackedFrameSnapshot.packedBottomPlane0,
+                        lastSoftPackedFrameSnapshot.packedBottomPlane1,
+                        lastSoftPackedFrameSnapshot.packedBottomControl,
+                        structuredBottomPlane0,
+                        structuredBottomPlane1,
+                        structuredBottomControl,
+                        snapshotRowBase);
+                else
+                    planeHoldBottomLines++;
+            }
             else if (bottomStructuredVramCapture)
                 copyStructuredLine(
                     lastSoftPackedFrameSnapshot.packedBottomPlane0,
@@ -8141,6 +8156,24 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
         }
 
     logLatchTraceStage("after_carry_overlay");
+
+    if (hasStructuredVulkan2D)
+    {
+        const u64 nowNs = PerfNowNs();
+        if (planeHoldLogLastNs == 0)
+            planeHoldLogLastNs = nowNs;
+        if (nowNs - planeHoldLogLastNs >= 1'000'000'000ull)
+        {
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "VulkanPlanes[Hold]: top=%u bottom=%u",
+                planeHoldTopLines,
+                planeHoldBottomLines);
+            planeHoldLogLastNs = nowNs;
+            planeHoldTopLines = 0;
+            planeHoldBottomLines = 0;
+        }
+    }
 
     lastSoftPackedFrameSnapshot.valid = true;
     return true;

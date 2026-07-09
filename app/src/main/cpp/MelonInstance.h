@@ -253,6 +253,9 @@ private:
     int vulkanStructuredCaptureGateFrames = 0;
     int vulkanTemporal3dHistoryGateFrames = 0;
     int vulkanTemporal3dNotReadyFrames = 0;
+    u64 planeHoldLogLastNs = 0;
+    u32 planeHoldTopLines = 0;
+    u32 planeHoldBottomLines = 0;
     int vulkanTemporal3dHistoryDebugLogsRemaining = 0;
     bool lastVulkanFastForwardPresentationState = false;
     int vulkanFastForwardPreviousFrameFallbackFrames = 0;
