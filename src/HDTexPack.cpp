@@ -207,6 +207,18 @@ bool HDTexPack::AddEntry(const std::string& path, const std::string& name, const
     }
     u32 scale = pw / w;
 
+    // renderers store replacements at most at 8x; larger factors would only
+    // produce deterministic allocation failures (a legal 1024x1024 texture
+    // at 8x is already a 256 MiB image)
+    if (scale > 8)
+    {
+        stbi_image_free(pixels);
+        Platform::Log(Platform::LogLevel::Warn,
+                      "HDTexPack: %s has scale %ux, maximum is 8x — skipped\n",
+                      name.c_str(), scale);
+        return false;
+    }
+
     if (EntryCount > 0 && scale != PackScale)
     {
         stbi_image_free(pixels);
