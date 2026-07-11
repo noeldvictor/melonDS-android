@@ -159,9 +159,6 @@ void HDPack2D::ProcessFrame(GPU& gpu, HDTexPack* pack)
         std::swap(PrevBitmapKeys, CurBitmapKeys);
         CurBitmapKeys.clear();
     }
-
-    if (Instances.size() > kMaxInstances)
-        Instances.resize(kMaxInstances);
 }
 
 void HDPack2D::EmitSpriteInstance(const HDTexPackImage* img, int num, u8 flip,

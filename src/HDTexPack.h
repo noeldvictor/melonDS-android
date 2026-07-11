@@ -31,8 +31,8 @@ namespace melonDS
 {
 
 // HD texture pack repository: content-hash keyed replacement images plus
-// artist-facing dumping. Identity scheme and file layout are documented in
-// docs/HD_TEXTURE_PACK_DESIGN.md. Filenames are the database:
+// artist-facing dumping. The identity scheme and file layout are shared
+// with the desktop tooling; filenames are the database:
 //   tex1_<W>x<H>_<texhash16>_<palhash16|none|$>_<fmt>.png
 //   obj1_<W>x<H>_<tilehash16>_<palhash16|none|$>_<4|8|bmp>.png
 //   bg1_8x8_<tilehash16>_<palhash16|none|$>_<4|8>.png
@@ -91,14 +91,6 @@ public:
     static u32 RGBA8ToRGB6A5(u32 pixel);
 
 private:
-    struct PendingSpriteInstance
-    {
-        u64 MapKey;
-        u32 Frame;
-        char Screen;
-        int OamSlot, X, Y;
-    };
-
     void LoadDir(const std::string& dir, const char* kind);
     bool AddEntry(const std::string& path, const std::string& name, const char* kind);
     const HDTexPackImage* Find(const std::unordered_map<u64, HDTexPackImage>& exact,

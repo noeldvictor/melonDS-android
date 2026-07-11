@@ -54,9 +54,15 @@ struct HDPack2DInstance
 // (chained XXH64 over the encoded guest bytes plus a used-range palette
 // hash) so packs are interchangeable between platforms.
 //
-// v1 limits: replacement skips rotscale sprites and non-text BG layers;
-// scroll and palette state are sampled once per frame, so per-scanline
-// raster effects fall back to the unreplaced art.
+// v1 limits (frame-level walker by design):
+//  - replacement skips rotscale sprites and non-text BG layers
+//  - OAM, scroll and palette state are sampled once at end of frame; games
+//    that rewrite BG scroll in HBlank or use mosaic get replacements
+//    positioned from the final register state, which can misplace them on
+//    such frames (they are not detected and do not fall back)
+//  - overlapping OBJ replacements share the generic OBJ producer mask; the
+//    instance carries no OAM slot or priority, so where two sprites overlap
+//    the presenter cannot tell which sprite actually won a pixel
 class HDPack2D
 {
 public:

@@ -338,6 +338,15 @@ public:
         // HD texture pack identity: encoded-bytes texel hash (both VRAM ranges
         // for compressed textures) plus a used-range-only palette hash, so
         // unrelated palette VRAM churn doesn't fork identities.
+        //
+        // KNOWN ISSUES (format-affecting; must change together with the
+        // desktop tooling since existing packs would orphan):
+        //  - the color-0 transparency bit (TexParam bit 29) is not part of
+        //    the identity, so a texture used both opaque and transparent
+        //    shares one key and its replacement one alpha interpretation
+        //  - the compressed-texture palette hash covers the bounding span of
+        //    referenced entries, so writes to unused entries inside that
+        //    span still change the key
         const HDTexPackImage* replacement = nullptr;
         if (TexPack)
         {
