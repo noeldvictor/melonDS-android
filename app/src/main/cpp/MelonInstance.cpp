@@ -2255,10 +2255,13 @@ void MelonInstance::requestVulkanPresentationResync(const char* reason)
     if (currentRenderer != Renderer::Vulkan)
         return;
 
-    Platform::Log(
-        Platform::LogLevel::Warn,
-        "VulkanRuntime[Resync]: reason=%s",
-        reason != nullptr ? reason : "unknown");
+    if (areRendererDebugToolsEnabled())
+    {
+        Platform::Log(
+            Platform::LogLevel::Warn,
+            "VulkanRuntime[Resync]: reason=%s",
+            reason != nullptr ? reason : "unknown");
+    }
 
     frameQueue.requestPresentationResync();
     if (vulkanOutput)
@@ -8233,11 +8236,14 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
             planeHoldLogLastNs = nowNs;
         if (nowNs - planeHoldLogLastNs >= 1'000'000'000ull)
         {
-            Platform::Log(
-                Platform::LogLevel::Warn,
-                "VulkanPlanes[Hold]: top=%u bottom=%u",
-                planeHoldTopLines,
-                planeHoldBottomLines);
+            if (areRendererDebugToolsEnabled())
+            {
+                Platform::Log(
+                    Platform::LogLevel::Warn,
+                    "VulkanPlanes[Hold]: top=%u bottom=%u",
+                    planeHoldTopLines,
+                    planeHoldBottomLines);
+            }
             planeHoldLogLastNs = nowNs;
             planeHoldTopLines = 0;
             planeHoldBottomLines = 0;

@@ -699,6 +699,24 @@ void VulkanOutput::destroyTimestampQueryPool(VkQueryPool& queryPool)
 
 bool VulkanOutput::createCompositorResources()
 {
+    // KNOWN LIMITATION: the compositor layout requires six storage images
+    // (output, live 3D, two previous-3D, two filtered planes). Devices with
+    // a smaller per-stage storage image limit need a filterless compositor
+    // variant that is not implemented yet; surface the condition explicitly
+    // so a pipeline-creation failure on such a device is diagnosable.
+    if (physicalDevice != VK_NULL_HANDLE)
+    {
+        VkPhysicalDeviceProperties deviceProperties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+        if (deviceProperties.limits.maxPerStageDescriptorStorageImages < 6u)
+        {
+            melonDS::Platform::Log(
+                melonDS::Platform::LogLevel::Error,
+                "VulkanOutput: device supports only %u per-stage storage images, compositor needs 6",
+                deviceProperties.limits.maxPerStageDescriptorStorageImages);
+        }
+    }
+
     VkDescriptorSetLayoutBinding outputBinding{};
     outputBinding.binding = 0;
     outputBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -6847,26 +6865,31 @@ bool VulkanOutput::dispatchCompositor(
             statsWindowStartNs = nowNs;
         if (nowNs - statsWindowStartNs >= 1'000'000'000ull)
         {
-            melonDS::Platform::Log(
-                melonDS::Platform::LogLevel::Warn,
-                "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u pfCache(hit=%u miss=%u) src(cap=%u prevTop=%u prevBottom=%u liveSwap=%u screenSwap=%u) prevArm(topLatch=%u topAcc=%u botLatch=%u botAcc=%u reject=%u)",
-                statsComposes,
-                statsSkips,
-                statsFallbacks,
-                statsPlaneFilters,
-                statsOverlayInstances,
-                statsPlaneFilterCacheHits,
-                statsPlaneFilterCacheMisses,
-                inputs.capture3dSourceValid ? 1u : 0u,
-                inputs.previousTopSourceValid ? 1u : 0u,
-                inputs.previousBottomSourceValid ? 1u : 0u,
-                inputs.liveSourceScreenSwap ? 1u : 0u,
-                inputs.screenSwap,
-                statsPrevTopFromLatch,
-                statsPrevTopFromAccum,
-                statsPrevBottomFromLatch,
-                statsPrevBottomFromAccum,
-                statsPrevLatchOwnershipRejects);
+            // stats stay off by default; the debug-tools preference turns
+            // the once-per-second line on for diagnostics
+            if (areRendererDebugToolsEnabled())
+            {
+                melonDS::Platform::Log(
+                    melonDS::Platform::LogLevel::Warn,
+                    "VulkanOutput[Stats]: composes=%u skips=%u fallbacks=%u planeFilters=%u overlays=%u pfCache(hit=%u miss=%u) src(cap=%u prevTop=%u prevBottom=%u liveSwap=%u screenSwap=%u) prevArm(topLatch=%u topAcc=%u botLatch=%u botAcc=%u reject=%u)",
+                    statsComposes,
+                    statsSkips,
+                    statsFallbacks,
+                    statsPlaneFilters,
+                    statsOverlayInstances,
+                    statsPlaneFilterCacheHits,
+                    statsPlaneFilterCacheMisses,
+                    inputs.capture3dSourceValid ? 1u : 0u,
+                    inputs.previousTopSourceValid ? 1u : 0u,
+                    inputs.previousBottomSourceValid ? 1u : 0u,
+                    inputs.liveSourceScreenSwap ? 1u : 0u,
+                    inputs.screenSwap,
+                    statsPrevTopFromLatch,
+                    statsPrevTopFromAccum,
+                    statsPrevBottomFromLatch,
+                    statsPrevBottomFromAccum,
+                    statsPrevLatchOwnershipRejects);
+            }
             statsWindowStartNs = nowNs;
             statsComposes = 0;
             statsSkips = 0;

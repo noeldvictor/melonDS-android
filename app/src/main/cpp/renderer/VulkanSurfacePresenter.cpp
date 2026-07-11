@@ -16,6 +16,7 @@
 namespace MelonDSAndroid
 {
 bool isFastForwardActive();
+bool areRendererDebugToolsEnabled();
 bool areRendererDebugBgObjLogsEnabled();
 
 namespace
@@ -1025,7 +1026,11 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
     // visible in logs together with the source-validity flags that drive it
     const int presentPath = directPresentRequested ? 1 : 0;
     const u64 pathLogNowNs = PerfNowNs();
-    if (presentPath != lastLoggedPresentPath)
+    if (presentPath != lastLoggedPresentPath && !areRendererDebugToolsEnabled())
+    {
+        lastLoggedPresentPath = presentPath;
+    }
+    else if (presentPath != lastLoggedPresentPath)
     {
         if (pathLogNowNs - lastPresentPathLogNs >= 1'000'000'000ull)
         {
