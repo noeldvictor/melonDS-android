@@ -274,6 +274,9 @@ private:
         std::vector<DrawCall> cachedDrawCalls;
         VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
         bool timestampPending = false;
+        // consecutive transient (timeout) skips; used to decide whether a
+        // partially presented frame should be held back for this surface
+        u32 consecutiveTransientSkips = 0;
 
         BackgroundResource background{};
         RetroArchResources retroArch{};

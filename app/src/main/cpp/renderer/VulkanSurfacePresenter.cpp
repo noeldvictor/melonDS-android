@@ -1097,6 +1097,11 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
     u64 framePresentTimelineValue = 0;
     bool presentedAnySurface = false;
     bool sawConfiguredSurface = false;
+    // dual-display: committing after only one surface presented leaves the
+    // other permanently a frame behind; a transiently skipped surface holds
+    // the frame so the next attempt lets it catch up
+    bool holdForLaggingSurface = false;
+    constexpr u32 kMaxTransientSkipHolds = 3;
     for (auto& [surfaceId, surfaceState] : surfaces)
     {
         (void)surfaceId;
@@ -1132,6 +1137,9 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         {
             skippedSurfaceWaits++;
             presentSkippedForDeadline++;
+            surfaceState.consecutiveTransientSkips++;
+            if (surfaceState.consecutiveTransientSkips <= kMaxTransientSkipHolds)
+                holdForLaggingSurface = true;
             continue;
         }
         if (waitResult != VK_SUCCESS)
@@ -1226,6 +1234,9 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         {
             acquireTimeouts++;
             presentSkippedForDeadline++;
+            surfaceState.consecutiveTransientSkips++;
+            if (surfaceState.consecutiveTransientSkips <= kMaxTransientSkipHolds)
+                holdForLaggingSurface = true;
             continue;
         }
 
@@ -1259,6 +1270,7 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
         framePresentTimelineValue = std::max(framePresentTimelineValue, surfacePresentTimelineValue);
 
         presentedAnySurface = true;
+        surfaceState.consecutiveTransientSkips = 0;
         lastPresentedDirect = directPresent;
         lastPresentMode = surfaceState.presentMode;
         lastSwapchainImageCount = static_cast<u32>(surfaceState.swapchainImages.size());
@@ -1284,6 +1296,17 @@ bool VulkanSurfacePresenter::presentFrame(Frame* frame, VulkanOutput& output, co
     else if (!sawConfiguredSurface)
     {
         noConfiguredSurfaceFrames++;
+    }
+
+    // partial present: report failure so the caller keeps the frame pending
+    // and re-presents it, letting the transiently skipped surface catch up
+    // (repeat presents on the surfaces that already showed it are benign).
+    // A surface that keeps timing out stops holding frames after a few
+    // attempts so a broken display can't freeze the healthy one.
+    if (presentedAnySurface && holdForLaggingSurface)
+    {
+        suppressedHoldPresents++;
+        return false;
     }
 
     return presentedAnySurface;
