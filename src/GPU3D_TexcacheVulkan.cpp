@@ -25,7 +25,9 @@ bool TexcacheVulkanLoader::SetHDTextureFilter(int scale, int mode)
 
     HDTextureScale = clampedScale;
     HDTextureFilterMode = clampedMode;
-    UploadBuffer.clear();
+    // release the capacity too: a large previous scale can leave hundreds
+    // of megabytes reserved after scaling is reduced or disabled
+    std::vector<u32>().swap(UploadBuffer);
     return true;
 }
 
@@ -36,7 +38,7 @@ void TexcacheVulkanLoader::SetTexPackScale(u32 scale)
     if (TexPackScale == scale)
         return;
     TexPackScale = scale;
-    UploadBuffer.clear();
+    std::vector<u32>().swap(UploadBuffer);
 }
 
 TexcacheVulkanLoader::~TexcacheVulkanLoader()
