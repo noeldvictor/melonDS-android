@@ -7,7 +7,7 @@
 // one replaced OBJ or BG tile at its native screen position; the packed
 // alpha byte (carried in the plane image alpha channel) gates writes so a
 // replacement only lands on pixels its producer actually won during 2D
-// composition — occlusion and priority survive unchanged. Both stacked
+// composition, so occlusion and priority survive unchanged. Both stacked
 // plane halves are checked per invocation.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;

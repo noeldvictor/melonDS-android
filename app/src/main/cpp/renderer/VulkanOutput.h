@@ -248,6 +248,10 @@ public:
     // pack). Resets the replacement atlas cache: the pack that backs the
     // cached images may have been rebuilt, so stale slots must not survive.
     void setReplacement2DActive(bool active);
+    // Frees the large filter/overlay images (filtered planes, ScaleFX
+    // intermediates, replacement atlas) when the features that need them are
+    // disabled; they are recreated lazily on next use.
+    void releaseUnusedHDResources();
     // Bounded wait for every in-flight frame submission; used before the
     // texture pack backing replacement instances is destroyed.
     void flushInFlightFrames();

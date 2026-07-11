@@ -4445,6 +4445,9 @@ void MelonInstance::updateRenderer()
                 vulkanOutput->setPacked2DFilterModes(
                     static_cast<u32>(std::max(vulkanRenderSettings.objFilterMode, 0)),
                     static_cast<u32>(std::max(vulkanRenderSettings.bgFilterMode, 0)));
+                // returns the large filter/overlay images when everything
+                // that needs them is now disabled
+                vulkanOutput->releaseUnusedHDResources();
             }
             if (!vulkanRuntimeConfigLogged)
             {

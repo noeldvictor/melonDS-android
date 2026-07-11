@@ -1006,11 +1006,26 @@ bool VulkanOutput::ensurePlaneFilterResources(u32 scale)
     // resize: wait for in-flight frames before dropping the old images; the
     // waits stay bounded because a failed submission never signals its fence
     constexpr u64 kResizeFenceTimeoutNs = 5'000'000'000ull;
+    bool allFenceWaitsSucceeded = true;
     for (auto& [frame, frameResource] : resources)
     {
         (void)frame;
-        if (frameResource.submitFence != VK_NULL_HANDLE)
-            (void)vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kResizeFenceTimeoutNs);
+        if (frameResource.submitFence != VK_NULL_HANDLE
+            && vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kResizeFenceTimeoutNs) != VK_SUCCESS)
+            allFenceWaitsSucceeded = false;
+    }
+    if (!allFenceWaitsSucceeded)
+    {
+        // a timed-out or failed wait means work may still reference the old
+        // images; destroying them anyway is invalid Vulkan usage
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "VulkanOutput: fence wait failed before filtered plane resize, falling back to device idle");
+        (void)vkDeviceWaitIdle(device);
+    }
+    for (auto& [frame, frameResource] : resources)
+    {
+        (void)frame;
         frameResource.planeFilterDescriptorsReady = false;
         frameResource.cachedTopFilteredPlaneView = VK_NULL_HANDLE;
         frameResource.cachedBottomFilteredPlaneView = VK_NULL_HANDLE;
@@ -1269,6 +1284,96 @@ void VulkanOutput::setReplacement2DActive(bool active)
     overlayAtlasFull = false;
 }
 
+void VulkanOutput::releaseUnusedHDResources()
+{
+    if (device == VK_NULL_HANDLE)
+        return;
+
+    const bool filtersOff =
+        objFilterMode.load(std::memory_order_acquire) == 0u
+        && bgFilterMode.load(std::memory_order_acquire) == 0u;
+
+    std::scoped_lock commandLock(commandPoolLock);
+    const bool releaseAtlas = !replacement2DActive && overlayAtlasImage != VK_NULL_HANDLE;
+    const bool releasePlanes = filtersOff && !replacement2DActive
+        && (topFilteredPlaneImage != VK_NULL_HANDLE || scalefxMetricImage != VK_NULL_HANDLE);
+    if (!releaseAtlas && !releasePlanes)
+        return;
+
+    // the images may still be referenced by in-flight submissions
+    constexpr u64 kReleaseFenceTimeoutNs = 5'000'000'000ull;
+    bool allFenceWaitsSucceeded = true;
+    for (auto& [frame, frameResource] : resources)
+    {
+        (void)frame;
+        if (frameResource.submitFence != VK_NULL_HANDLE
+            && vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kReleaseFenceTimeoutNs) != VK_SUCCESS)
+            allFenceWaitsSucceeded = false;
+    }
+    if (!allFenceWaitsSucceeded)
+        (void)vkDeviceWaitIdle(device);
+
+    auto destroyImageSet = [&](VkImage& image, VkImageView& view, VkDeviceMemory& memory) {
+        if (view != VK_NULL_HANDLE)
+        {
+            vkDestroyImageView(device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (image != VK_NULL_HANDLE)
+        {
+            vkDestroyImage(device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+    };
+
+    for (auto& [frame, frameResource] : resources)
+    {
+        (void)frame;
+        frameResource.planeFilterDescriptorsReady = false;
+        frameResource.cachedTopFilteredPlaneView = VK_NULL_HANDLE;
+        frameResource.cachedBottomFilteredPlaneView = VK_NULL_HANDLE;
+        frameResource.scalefxDescriptorsReady = false;
+        frameResource.cachedScaleFXTopPlaneView = VK_NULL_HANDLE;
+        frameResource.cachedScaleFXBottomPlaneView = VK_NULL_HANDLE;
+        frameResource.overlayDescriptorsReady = false;
+        frameResource.cachedOverlayTopPlaneView = VK_NULL_HANDLE;
+        frameResource.cachedOverlayBottomPlaneView = VK_NULL_HANDLE;
+        frameResource.descriptorSetReady = false;
+    }
+
+    if (releaseAtlas)
+    {
+        destroyImageSet(overlayAtlasImage, overlayAtlasView, overlayAtlasMemory);
+        overlayAtlasLayoutReady = false;
+        overlayAtlasSlots.clear();
+        overlayAtlasShelfX = 0;
+        overlayAtlasShelfY = 0;
+        overlayAtlasShelfHeight = 0;
+        overlayAtlasScale = 0;
+        overlayAtlasFull = false;
+    }
+
+    if (releasePlanes)
+    {
+        destroyImageSet(topFilteredPlaneImage, topFilteredPlaneView, topFilteredPlaneMemory);
+        destroyImageSet(bottomFilteredPlaneImage, bottomFilteredPlaneView, bottomFilteredPlaneMemory);
+        destroyImageSet(scalefxMetricImage, scalefxMetricView, scalefxMetricMemory);
+        destroyImageSet(scalefxStrengthImage, scalefxStrengthView, scalefxStrengthMemory);
+        destroyImageSet(scalefxFlagsImage, scalefxFlagsView, scalefxFlagsMemory);
+        destroyImageSet(scalefxCandidateImage, scalefxCandidateView, scalefxCandidateMemory);
+        filteredPlaneWidth = 0;
+        filteredPlaneHeight = 0;
+        filteredPlaneLayoutReady = false;
+        scalefxImagesLayoutReady = false;
+        planeFilterCacheValid = false;
+    }
+}
+
 void VulkanOutput::flushInFlightFrames()
 {
     if (device == VK_NULL_HANDLE)
@@ -1276,13 +1381,25 @@ void VulkanOutput::flushInFlightFrames()
 
     std::scoped_lock commandLock(commandPoolLock);
     constexpr u64 kFlushFenceTimeoutNs = 5'000'000'000ull;
+    bool allFenceWaitsSucceeded = true;
     for (auto& [frame, frameResource] : resources)
     {
         (void)frame;
-        if (frameResource.submitFence != VK_NULL_HANDLE)
-            (void)vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kFlushFenceTimeoutNs);
+        if (frameResource.submitFence != VK_NULL_HANDLE
+            && vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kFlushFenceTimeoutNs) != VK_SUCCESS)
+            allFenceWaitsSucceeded = false;
         std::scoped_lock instanceLock(replacementInstanceLock);
         frameResource.replacementInstances.clear();
+    }
+    if (!allFenceWaitsSucceeded)
+    {
+        // callers destroy the texture pack backing the replacement art right
+        // after this returns; if a fence never signalled the GPU may still
+        // be sampling it, so drain the device instead
+        melonDS::Platform::Log(
+            melonDS::Platform::LogLevel::Warn,
+            "VulkanOutput: fence wait failed during replacement flush, falling back to device idle");
+        (void)vkDeviceWaitIdle(device);
     }
 }
 
@@ -1425,13 +1542,14 @@ bool VulkanOutput::ensurePlaneOverlayResources(FrameResource& resource)
             || vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS
             || vkMapMemory(device, memory, 0, size, 0, &mapped) != VK_SUCCESS)
         {
+            // destroy the buffer before freeing the memory it is bound to
+            vkDestroyBuffer(device, buffer, nullptr);
+            buffer = VK_NULL_HANDLE;
             if (memory != VK_NULL_HANDLE)
             {
                 vkFreeMemory(device, memory, nullptr);
                 memory = VK_NULL_HANDLE;
             }
-            vkDestroyBuffer(device, buffer, nullptr);
-            buffer = VK_NULL_HANDLE;
             mapped = nullptr;
             return false;
         }
@@ -1582,6 +1700,10 @@ bool VulkanOutput::acquireOverlayAtlasSlot(const melonDS::HDTexPackImage* image,
         }
         if (overlayAtlasShelfY + slotH > kOverlayAtlasSize)
         {
+            // KNOWN LIMITATION: the shelf atlas has no eviction; once full,
+            // new replacement art falls back to native detail until the
+            // pack is reloaded or replacement is toggled (both reset the
+            // atlas). At 8x this can happen with a few dozen large sprites.
             if (!overlayAtlasFull)
             {
                 overlayAtlasFull = true;
@@ -3408,15 +3530,15 @@ bool VulkanOutput::createFrameResource(Frame* frame, u32 width, u32 height)
                 vkUnmapMemory(device, memory);
                 mappedMemory = nullptr;
             }
-            if (memory != VK_NULL_HANDLE)
-            {
-                vkFreeMemory(device, memory, nullptr);
-                memory = VK_NULL_HANDLE;
-            }
             if (buffer != VK_NULL_HANDLE)
             {
                 vkDestroyBuffer(device, buffer, nullptr);
                 buffer = VK_NULL_HANDLE;
+            }
+            if (memory != VK_NULL_HANDLE)
+            {
+                vkFreeMemory(device, memory, nullptr);
+                memory = VK_NULL_HANDLE;
             }
             return false;
         }

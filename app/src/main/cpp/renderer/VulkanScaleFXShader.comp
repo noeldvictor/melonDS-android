@@ -206,7 +206,11 @@ void main()
     int outY = int(gid.y - uint(plane) * planeHeight);
 
     // center-based nearest mapping from output scale to the native 3x stage
-    // (matches the CPU resample in ScaleFXImage exactly for scale 1..4)
+    // (matches the CPU resample in ScaleFXImage exactly for scale 1..4).
+    // KNOWN APPROXIMATION: the CPU reference runs a second ScaleFX stage
+    // (9x) before resampling at scales >= 6; this chain always derives its
+    // output from the single 3x stage, so 6x-8x are a resampled 3x rather
+    // than the two-stage result.
     int stageX = ((2 * outX + 1) * 3) / int(2u * pc.scale);
     int stageY = ((2 * outY + 1) * 3) / int(2u * pc.scale);
     int x = stageX / 3;
