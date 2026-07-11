@@ -1,62 +1,58 @@
-# melonDS Android port
-Android port of [melonDS](https://melonds.kuribo64.net/), a DS and DSi emulator.
+# melonDS for AYN Thor — HD edition
 
-[<img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Get it on Google Play" height="80">](https://play.google.com/store/apps/details?id=me.magnum.melonds&pcampaignid=pcampaignidMKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1)[<img src="https://raw.githubusercontent.com/Kunzisoft/Github-badge/main/get-it-on-github.png" alt="Get it on GitHub" height="80">](https://github.com/rafaelvcaetano/melonDS-android/releases/latest)
+A dual-screen Android fork of [melonDS](https://melonds.kuribo64.net/) tuned for the AYN Thor,
+with HD texture pack support and per-layer upscaling filters.
 
-|Rom List|Dark Theme|Pocket Physics|Layout Editor|
-|---|---|---|---|
-|![Screenshot 1](./.github/images/screenshot_mobile0.png)|![Screenshot 2](./.github/images/screenshot_mobile1.png)|![Screenshot 3](./.github/images/screenshot_mobile2.png)|![Screenshot 4](./.github/images/screenshot_mobile3.png)|
+Based on [SapphireRhodonite's Vulkan dual-screen fork](https://github.com/SapphireRhodonite/melonDS-android)
+of [rafaelvcaetano's melonDS Android port](https://github.com/rafaelvcaetano/melonDS-android).
+This repository is self-contained: the emulator core (`melonDS-android-lib/`, derived from the
+[melonDS](https://github.com/melonDS-emu/melonDS) core) is part of the tree — no submodules.
 
-# Missing Features
-*  Local Multiplayer
-*  DSi SD card support
-*  Customizable button skins
-*  More display filters
+## What this fork adds
 
-# Performance
-Performance is solid on 64 bit devices with thread rendering and JIT enabled, and should run at full speed on flagship devices. Performance on older devices, specially
-32 bit devices, is very poor due to the lack of JIT support.
+### HD texture packs
+* **3D texture dump & replace** — content-hash keyed (texture hash + palette hash), compatible
+  with the desktop melonDS HD pack format, so packs can be authored and verified on PC and used
+  on device unchanged.
+* **2D sprite (OBJ) and BG tile dump & replace** — sprites and background tiles are dumped as
+  assembled art and can be replaced with scaled versions (up to 4x).
+* Packs live in `files/texturepacks/<GAMECODE>/`; dumps are written to `files/texturedumps/`.
 
-# Integration with third-party frontends
-It's possible to launch melonDS from third part frontends. For that, you will need to have the ROMs you want to launch already scanned by melonDS. Then, you can configure your
-third-party frontend with the following configuration:
-*  Package name: `me.magnum.melondualds`
-*  Activity name: `me.magnum.melonds.ui.emulator.EmulatorActivity`
-*  Parameters (choose one):
-    * Intent data (preferred) - a URI of the NDS ROM (ZIP and 7z files are supported). Ensure [read permission is granted](https://developer.android.com/reference/android/content/Intent#FLAG_GRANT_READ_URI_PERMISSION)
-    * `uri` (deprecated) - a string with the [SAF](https://developer.android.com/guide/topics/providers/create-document-provider) URI of the NDS ROM (ZIP and 7z files are supported)
-    * `PATH` (deprecated) - a string with the absolute path to the NDS ROM (ZIP and 7z files are supported)
+### Per-layer upscaling filters
+* Independent filter selection for **3D textures**, **OBJ sprites**, and **BG layers**
+  (Settings → Video): nearest, bilinear, and a set of pixel-art filters including xBR, Eagle,
+  SaI, and a faithful multi-pass **ScaleFX** port.
+* Filters run in the Vulkan compositor as a cached pre-pass — static scenes cost nothing
+  (content-hashed reuse), and 3D texture filtering is cached per texture at upload.
+* No full-screen smoothing: original pixels stay sharp unless a layer's filter says otherwise.
 
-### Pegasus metadata files
-* [melonds.metadata.txt](./.github/pegasus/melonds.metadata.txt) 
-* [melonds-nightly.metadata.txt](./.github/pegasus/melonds-nightly.metadata.txt) 
+### Dual-screen and stability work
+* Fixes for dual-display presentation on the Thor's two panels (screen-swap alternation,
+  capture-backed scenes, frame pacing under load), verified with per-display captures.
+* Renderer thread-safety and Vulkan lifecycle fixes throughout the compositor and presenter.
+* Optimized native build settings for smooth performance at 4x internal resolution.
 
-### Info regarding save files
-When launching ROMs from third-party frontends, if melonDS hasn't scanned that particular ROM previously, it won't be able to create the save file next to the ROM file if the
-option "Save next to ROM file" is enabled in the settings or the save file directory is not set. Instead, melonDS will create a save file in
-`Android/data/me.magnum.melonds/files/saves`
+## Building
 
-# Nightly Builds
+Requirements: JDK 21, Android NDK 28.x, CMake 3.22+, Rust (for librashader), Git Bash on Windows.
 
-To have access to the latest changes, you can install nightly builds that you can find [here](https://github.com/rafaelvcaetano/melonDS-android/releases/tag/nightly-release).
+```
+git clone --recurse-submodules https://github.com/noeldvictor/melonDS-android.git
+cd melonDS-android
+./gradlew :app:assembleGitHubProdDebug
+```
 
-Be aware that these builds can contain more bugs than usual and you may need to clear your app data to get it to work properly after updates.
+The emulator core is part of this repository; the remaining submodules are third-party
+libraries (oboe, faad2, enet).
 
-# Building
-To build the project you will need Android SDK, NDK and CMake.
+The APK lands in `app/build/outputs/apk/gitHubProd/debug/`. On Windows, set `JAVA_HOME`,
+`ANDROID_NDK_HOME`, and ensure `cargo` is on the path (or set `CARGO`).
 
-## Build steps:
-1.  Clone the project, including submodules with:
-    
-    `git clone --recurse-submodules https://github.com/rafaelvcaetano/melonDS-android.git`
-2.  Install the Android SDK, NDK and CMake
-3.  Build with:
-    1.  Unix: `./gradlew :app:assembleGitHubProdDebug`
-    2.  Windows: `gradlew.bat :app:assembleGitHubProdDebug`
-4.  The generated APK can be found at `app/gitHubProd/debug`
+## Credits
 
-If you want to create a release build, you will need to modify your `local.properties` file to include the following fields:  
-*  `MELONDS_KEYSTORE=<path_to_your_keystore>`
-*  `MELONDS_KEYSTORE_PASSWORD=<keystore_password>`
-*  `MELONDS_KEY_ALIAS=<name_of_your_key_alias>`
-*  `MELONDS_KEY_PASSWORD=<key_alias_password>`
+* [melonDS](https://github.com/melonDS-emu/melonDS) by Arisotura and the melonDS team
+* [melonDS Android port](https://github.com/rafaelvcaetano/melonDS-android) by rafaelvcaetano
+* [Vulkan dual-screen fork](https://github.com/SapphireRhodonite/melonDS-android) by SapphireRhodonite
+* HD pack format inspired by the texture replacement systems of Dolphin and DuckStation
+
+melonDS is free software licensed under the GPLv3; this fork retains that license.
