@@ -48,8 +48,8 @@ u64 HashVRAMRange(const u8* vram, u32 vrammask, u64 hash, u32 addr, u32 size)
     return XXH64(&vram[addr], size, hash);
 }
 
-// desktop prerender parity: 5-bit channels expand through the 6-bit DS space
-// (v5*2, green folds in the palette A1 bit) and quantize as round(v6*255/63)
+// software-renderer parity: 5-bit channels expand through the 6-bit DS space
+// (v5*2, palette bit 15 ignored) and quantize as round(v6*255/63)
 u32 Expand6To8(u32 v6)
 {
     return (v6 * 510 + 63) / 126;
@@ -58,7 +58,7 @@ u32 Expand6To8(u32 v6)
 u32 Pal555ToRGBA8(u16 entry, bool opaque)
 {
     u32 r6 = (entry & 0x1F) << 1;
-    u32 g6 = (((entry >> 5) & 0x1F) << 1) + (entry >> 15);
+    u32 g6 = ((entry >> 5) & 0x1F) << 1;
     u32 b6 = ((entry >> 10) & 0x1F) << 1;
     return Expand6To8(r6) | (Expand6To8(g6) << 8) | (Expand6To8(b6) << 16)
         | (opaque ? 0xFF000000u : 0u);
