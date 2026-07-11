@@ -67,9 +67,27 @@ bool isPacked3dLayerSlot(uint packedValue)
     return ((packedValue >> 24u) & 0xFFu) == 0x40u;
 }
 
-bool packedTapIsUnsafe(uint packedValue)
+// producer families for tap rejection: 0 = 3D/empty, 1 = OBJ (incl. semi
+// and bitmap OBJ), 2 = BG/backdrop
+uint packedProducerClass(uint packedValue)
 {
-    return isPacked3dPlaceholder(packedValue) || isPacked3dLayerSlot(packedValue);
+    uint flags = (packedValue >> 24u) & 0xFFu;
+    if ((flags & 0xC0u) == 0x40u || isPacked3dPlaceholder(packedValue))
+        return 0u;
+    if ((flags & 0x90u) != 0u)
+        return 1u;
+    if ((flags & 0x2Fu) != 0u)
+        return 2u;
+    return 0u;
+}
+
+bool packedTapIsUnsafe(uint packedValue, uint centerValue)
+{
+    if (isPacked3dPlaceholder(packedValue) || isPacked3dLayerSlot(packedValue))
+        return true;
+    // never blend across producer classes: a sprite edge must not pull BG
+    // or backdrop colors (or vice versa) into pixels labelled as its own
+    return packedProducerClass(packedValue) != packedProducerClass(centerValue);
 }
 
 // The packed alpha byte carries the winning producer of each pixel:
@@ -100,11 +118,11 @@ vec4 passThroughColor(uint packedValue)
 }
 
 // taps are normalized rgb with alpha pinned to 1.0; unsafe taps (3D
-// placeholder or 3D layer slot data) reuse the center color so control
-// values never leak into the filters
+// placeholder, 3D layer slot data, or a different producer class than the
+// center) reuse the center color so foreign values never leak in
 vec4 tapColor(uint packedValue, uint centerValue)
 {
-    uint source = packedTapIsUnsafe(packedValue) ? centerValue : packedValue;
+    uint source = packedTapIsUnsafe(packedValue, centerValue) ? centerValue : packedValue;
     return vec4(
         float(source & 0xFFu) * (1.0 / 63.0),
         float((source >> 8u) & 0xFFu) * (1.0 / 63.0),

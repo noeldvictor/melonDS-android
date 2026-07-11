@@ -62,6 +62,20 @@ bool packedTapIsUnsafe(uint packedValue)
     return isPacked3dPlaceholder(packedValue) || isPacked3dLayerSlot(packedValue);
 }
 
+// producer families for cross-class rejection: 0 = 3D/empty, 1 = OBJ (incl.
+// semi and bitmap OBJ), 2 = BG/backdrop
+uint packedProducerClass(uint packedValue)
+{
+    uint flags = (packedValue >> 24u) & 0xFFu;
+    if ((flags & 0xC0u) == 0x40u || isPacked3dPlaceholder(packedValue))
+        return 0u;
+    if ((flags & 0x90u) != 0u)
+        return 1u;
+    if ((flags & 0x2Fu) != 0u)
+        return 2u;
+    return 0u;
+}
+
 // clamped fetch inside one plane half; plane selects the packed column block
 uint fetchPlane(int plane, int x, int y)
 {
@@ -79,6 +93,10 @@ float scalefxMetric(uint a, uint b)
     bool tb = packedTapIsUnsafe(b);
     if (ta || tb)
         return (ta && tb) ? 0.0 : 1.0;
+    // texels from different producers never merge into one color class, so
+    // sprite/BG boundaries stay hard edges instead of exchanging colors
+    if (packedProducerClass(a) != packedProducerClass(b))
+        return 1.0;
 
     float ra = float(a & 0xFFu) * (1.0 / 63.0);
     float ga = float((a >> 8u) & 0xFFu) * (1.0 / 63.0);
@@ -249,7 +267,8 @@ void main()
         ivec2(0, 0), ivec2(-1, 0), ivec2(-2, 0), ivec2(1, 0), ivec2(2, 0),
         ivec2(0, -1), ivec2(0, -2), ivec2(0, 1), ivec2(0, 2));
     uint source = fetchPlane(plane, x + offsets[sp].x, y + offsets[sp].y);
-    if (packedTapIsUnsafe(source))
+    if (packedTapIsUnsafe(source)
+        || packedProducerClass(source) != packedProducerClass(centerValue))
         source = centerValue;
 
     // color from the winning candidate, producer flags from the center pixel
