@@ -61,6 +61,10 @@ public:
         return !SpriteEntries.empty() || !SpriteWildcard.empty()
             || !BGEntries.empty() || !BGWildcard.empty();
     }
+    bool Has3DEntries() const
+    {
+        return !TexEntries.empty() || !TexWildcard.empty();
+    }
 
     // 3D textures. hasPal is false for fmt 7 (direct bitmap).
     const HDTexPackImage* LookupTexture(u32 width, u32 height, u64 texHash,

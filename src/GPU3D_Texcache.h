@@ -161,7 +161,9 @@ public:
     template <typename BeforeMutationT>
     void SetTexPack(HDTexPack* pack, BeforeMutationT&& beforeMutation)
     {
-        u32 packScale = (pack && pack->LoadActive()) ? pack->Scale() : 1;
+        // only force scaled 3D storage when the pack actually replaces 3D
+        // textures; a sprite/BG-only pack must not multiply 3D memory use
+        u32 packScale = (pack && pack->LoadActive() && pack->Has3DEntries()) ? pack->Scale() : 1;
         if (TexPack == pack && TexLoader.GetTexPackScale() == packScale)
             return;
 
