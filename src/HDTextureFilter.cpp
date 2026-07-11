@@ -45,9 +45,14 @@ u8 BlendChannel(u8 a, u8 b, int weight)
     return static_cast<u8>((static_cast<int>(a) * (256 - weight) + static_cast<int>(b) * weight + 128) >> 8);
 }
 
-u8 ClampChannel(int value)
+u8 ClampChannel6(int value)
 {
-    return static_cast<u8>(std::clamp(value, 0, 255));
+    return static_cast<u8>(std::clamp(value, 0, 63));
+}
+
+u8 ClampChannel5(int value)
+{
+    return static_cast<u8>(std::clamp(value, 0, 31));
 }
 
 u32 Blend(u32 a, u32 b, int weight)
@@ -282,11 +287,13 @@ int SmoothStepWeight(int value, int low, int high)
 
 u32 Sharpen(u32 color, u32 reference, int weight)
 {
+    // clamp to the RGB6A5 texel domain so downstream interpolation never
+    // sees channel values outside what the renderer can encode
     weight = std::clamp(weight, 0, 256);
-    return Pack(ClampChannel(Channel(color, 0) + (((static_cast<int>(Channel(color, 0)) - Channel(reference, 0)) * weight + 128) >> 8)),
-                ClampChannel(Channel(color, 8) + (((static_cast<int>(Channel(color, 8)) - Channel(reference, 8)) * weight + 128) >> 8)),
-                ClampChannel(Channel(color, 16) + (((static_cast<int>(Channel(color, 16)) - Channel(reference, 16)) * weight + 128) >> 8)),
-                ClampChannel(Channel(color, 24) + (((static_cast<int>(Channel(color, 24)) - Channel(reference, 24)) * weight + 128) >> 8)));
+    return Pack(ClampChannel6(Channel(color, 0) + (((static_cast<int>(Channel(color, 0)) - Channel(reference, 0)) * weight + 128) >> 8)),
+                ClampChannel6(Channel(color, 8) + (((static_cast<int>(Channel(color, 8)) - Channel(reference, 8)) * weight + 128) >> 8)),
+                ClampChannel6(Channel(color, 16) + (((static_cast<int>(Channel(color, 16)) - Channel(reference, 16)) * weight + 128) >> 8)),
+                ClampChannel5(Channel(color, 24) + (((static_cast<int>(Channel(color, 24)) - Channel(reference, 24)) * weight + 128) >> 8)));
 }
 
 u32 Anime4KLiteTexel(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h, u32 i, int subx, int suby)
