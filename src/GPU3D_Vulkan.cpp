@@ -12251,9 +12251,14 @@ void VulkanRenderer3D::buildGraphicsTriangleList(GPU& gpu)
                     if (hdTexelScale > 1u)
                     {
                         // bits 12+ of the size fields carry the HD texel scale and
-                        // filter mode into both raster shader families
+                        // filter mode into both raster shader families; layers
+                        // holding nearest-expanded native texels sample nearest
+                        // (mode 15) so unmatched textures stay pixel-accurate
+                        const u32 hdMode = Texcache.GetLoader().IsTextureLayerHDContent(textureHandle, textureLayer)
+                            ? static_cast<u32>(Texcache.GetHDTextureFilterMode())
+                            : 15u;
                         texWidth |= hdTexelScale << 12u;
-                        texHeight |= static_cast<u32>(Texcache.GetHDTextureFilterMode()) << 12u;
+                        texHeight |= hdMode << 12u;
                     }
                 }
             }
@@ -13222,9 +13227,14 @@ void VulkanRenderer3D::buildTriangleList(GPU& gpu)
                     if (hdTexelScale > 1u)
                     {
                         // bits 12+ of the size fields carry the HD texel scale and
-                        // filter mode into both raster shader families
+                        // filter mode into both raster shader families; layers
+                        // holding nearest-expanded native texels sample nearest
+                        // (mode 15) so unmatched textures stay pixel-accurate
+                        const u32 hdMode = Texcache.GetLoader().IsTextureLayerHDContent(textureHandle, textureLayer)
+                            ? static_cast<u32>(Texcache.GetHDTextureFilterMode())
+                            : 15u;
                         texWidth |= hdTexelScale << 12u;
-                        texHeight |= static_cast<u32>(Texcache.GetHDTextureFilterMode()) << 12u;
+                        texHeight |= hdMode << 12u;
                     }
                 }
             }

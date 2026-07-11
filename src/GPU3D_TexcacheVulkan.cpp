@@ -222,6 +222,7 @@ TexcacheVulkanLoader::TextureHandle TexcacheVulkanLoader::GenerateTexture(u32 wi
     textureArray.Layers = layers;
     textureArray.Scale = storageScale;
     textureArray.LayerOpaque.assign(layers, 0u);
+    textureArray.LayerHDContent.assign(layers, 0u);
 
     VkImageCreateInfo imageCreateInfo{};
     imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -441,6 +442,9 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
         HDTextureFilter::UpscaleTexture(texels, width, height, textureArray.Scale, HDTextureFilterMode, UploadBuffer);
         texels = UploadBuffer.data();
     }
+    if (layer < textureArray.LayerHDContent.size())
+        textureArray.LayerHDContent[layer] =
+            (textureArray.Scale > 1 && HDTextureFilterMode != 0) ? 1u : 0u;
 
     UploadLayer(textureArray, layer, texels);
 }
@@ -483,6 +487,9 @@ void TexcacheVulkanLoader::UploadReplacement(TextureHandle handle, u32 width, u3
             }
         }
     }
+
+    if (layer < textureArray.LayerHDContent.size())
+        textureArray.LayerHDContent[layer] = 1u;
 
     UploadLayer(textureArray, layer, UploadBuffer.data());
 }
@@ -665,6 +672,22 @@ bool TexcacheVulkanLoader::IsTextureLayerOpaque(TextureHandle handle, u32 layer)
         return false;
 
     return textureArray.LayerOpaque[layer] != 0u;
+}
+
+bool TexcacheVulkanLoader::IsTextureLayerHDContent(TextureHandle handle, u32 layer) const
+{
+    if (State == nullptr)
+        return false;
+
+    auto it = State->TextureArrays.find(handle);
+    if (it == State->TextureArrays.end())
+        return false;
+
+    const TextureArray& textureArray = it->second;
+    if (layer >= textureArray.LayerHDContent.size())
+        return false;
+
+    return textureArray.LayerHDContent[layer] != 0u;
 }
 
 }

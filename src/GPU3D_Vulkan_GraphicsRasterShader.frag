@@ -527,7 +527,11 @@ Color6A5 sampleTexture(uint polyAttr)
         vec2 hdCoord = (texcoord * float(scale)) - vec2(0.5);
         ivec2 hdBase = ivec2(floor(hdCoord));
         vec2 hdFrac = hdCoord - vec2(hdBase);
-        if (hdFilterMode == 10u)
+        if (hdFilterMode == 15u)
+            // nearest-expanded native content: pick the nearest HD texel,
+            // which reproduces native nearest sampling exactly
+            hdFrac = step(vec2(0.5), hdFrac);
+        else if (hdFilterMode == 10u)
             hdFrac = hdFrac * hdFrac * hdFrac * (hdFrac * (hdFrac * 6.0 - 15.0) + 10.0);
         else if (hdFilterMode == 2u)
             hdFrac = hdFrac * hdFrac * (vec2(3.0) - (vec2(2.0) * hdFrac));

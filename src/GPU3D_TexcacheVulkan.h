@@ -37,6 +37,10 @@ public:
     void DeleteTexture(TextureHandle handle);
     bool GetTextureDescriptor(TextureHandle handle, VkDescriptorImageInfo* outImageInfo) const;
     bool IsTextureLayerOpaque(TextureHandle handle, u32 layer) const;
+    // true when the layer holds genuinely high-res content (a pack
+    // replacement or a CPU-filtered upscale); false for native texels that
+    // were only nearest-expanded to fit pack-forced storage scaling
+    bool IsTextureLayerHDContent(TextureHandle handle, u32 layer) const;
 
 private:
     struct TextureArray
@@ -55,6 +59,7 @@ private:
         VkDeviceMemory StagingMemory = VK_NULL_HANDLE;
         VkDeviceSize StagingSize = 0;
         std::vector<u8> LayerOpaque;
+        std::vector<u8> LayerHDContent;
     };
 
     struct SharedState

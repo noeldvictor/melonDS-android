@@ -318,6 +318,10 @@ uint hdSmootherWeight16(int frac)
 
 uint hdTextureWeight16(int frac, uint filterMode)
 {
+    if (filterMode == 15u)
+        // nearest-expanded native content: pick the nearest HD texel,
+        // which reproduces native nearest sampling exactly
+        return (frac >= 8) ? 256u : 0u;
     if (filterMode == 10u)
         return hdSmootherWeight16(frac);
     if (filterMode == 2u)
