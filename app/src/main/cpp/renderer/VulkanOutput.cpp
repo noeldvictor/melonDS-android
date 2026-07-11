@@ -7243,7 +7243,18 @@ bool VulkanOutput::dispatchCompositor(
     );
 
     if (!submitFrameCommand(frame, resource, true))
+    {
+        // the recorded filter passes and atlas uploads never executed:
+        // invalidate the states committed during recording so the next
+        // frame re-records instead of trusting stale images
+        planeFilterCacheValid = false;
+        for (auto& [slotImage, slot] : overlayAtlasSlots)
+        {
+            (void)slotImage;
+            slot.uploaded = false;
+        }
         return false;
+    }
 
     resource.hasContent = true;
     resource.previousTopSourcePending = false;
