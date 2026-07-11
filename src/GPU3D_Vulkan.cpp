@@ -624,6 +624,8 @@ void VulkanRenderer3D::Reset(GPU& gpu)
 void VulkanRenderer3D::ResetActiveBackend(GPU& gpu)
 {
     (void)gpu;
+    if (Initialized && ActiveBackendMode == BackendMode::GraphicsHardware)
+        (void)waitForTextureCacheMutationSafePoint();
     Texcache.Reset();
     HasCpuFrame = false;
     FrameIdentical = false;
@@ -1395,6 +1397,8 @@ void VulkanRenderer3D::Stop(const GPU& gpu)
 void VulkanRenderer3D::StopActiveBackend(const GPU& gpu)
 {
     (void)gpu;
+    if (Initialized && ActiveBackendMode == BackendMode::GraphicsHardware)
+        (void)waitForTextureCacheMutationSafePoint();
     Texcache.Reset();
     destroyVulkan();
     InitFailed = false;
@@ -1519,13 +1523,21 @@ void VulkanRenderer3D::SetBackendMode(BackendMode mode) noexcept
 
 void VulkanRenderer3D::SetTexPack(HDTexPack* pack)
 {
-    Texcache.SetTexPack(pack);
+    // live textures may still be referenced by submitted work; reach the
+    // same safe point the invalidation path uses before they are destroyed
+    Texcache.SetTexPack(pack, [this]() {
+        if (Initialized && ActiveBackendMode == BackendMode::GraphicsHardware)
+            (void)waitForTextureCacheMutationSafePoint();
+    });
     refreshHDTextureSampling();
 }
 
 void VulkanRenderer3D::SetHDTextureFilter(int scale, int mode)
 {
-    Texcache.SetHDTextureFilter(scale, mode);
+    Texcache.SetHDTextureFilter(scale, mode, [this]() {
+        if (Initialized && ActiveBackendMode == BackendMode::GraphicsHardware)
+            (void)waitForTextureCacheMutationSafePoint();
+    });
     refreshHDTextureSampling();
 }
 

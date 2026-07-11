@@ -156,24 +156,40 @@ public:
         return Update(gpu, []() {});
     }
 
-    void SetTexPack(HDTexPack* pack)
+    // beforeMutation runs before any live texture is destroyed, mirroring
+    // Update(): renderers use it to reach a GPU-idle safe point first.
+    template <typename BeforeMutationT>
+    void SetTexPack(HDTexPack* pack, BeforeMutationT&& beforeMutation)
     {
         u32 packScale = (pack && pack->LoadActive()) ? pack->Scale() : 1;
         if (TexPack == pack && TexLoader.GetTexPackScale() == packScale)
             return;
 
+        std::forward<BeforeMutationT>(beforeMutation)();
         TexPack = pack;
         TexLoader.SetTexPackScale(packScale);
         Reset();
     }
 
-    bool SetHDTextureFilter(int scale, int mode)
+    void SetTexPack(HDTexPack* pack)
+    {
+        SetTexPack(pack, []() {});
+    }
+
+    template <typename BeforeMutationT>
+    bool SetHDTextureFilter(int scale, int mode, BeforeMutationT&& beforeMutation)
     {
         if (!TexLoader.SetHDTextureFilter(scale, mode))
             return false;
 
+        std::forward<BeforeMutationT>(beforeMutation)();
         Reset();
         return true;
+    }
+
+    bool SetHDTextureFilter(int scale, int mode)
+    {
+        return SetHDTextureFilter(scale, mode, []() {});
     }
 
     u32 GetHDTextureScale() const
