@@ -230,8 +230,10 @@ void HDPack2D::WalkSprites(GPU& gpu, int num, HDTexPack* pack, bool dump, bool l
 
         u32 sprmode = (attrib[0] >> 10) & 0x3;
 
-        s32 xpos = (s32)(attrib[1] << 23) >> 23;
-        s32 ypos = (s32)(attrib[0] << 24) >> 24;
+        // sign-extend the 9-bit X / 8-bit Y fields without shifting other
+        // attribute bits into the sign position (undefined behaviour)
+        s32 xpos = (s32)(attrib[1] & 0x1FF) - (s32)((attrib[1] & 0x100) << 1);
+        s32 ypos = (s32)(attrib[0] & 0xFF) - (s32)((attrib[0] & 0x80) << 1);
 
         u32 sizeparam = (attrib[0] >> 14) | ((attrib[1] & 0xC000) >> 12);
         s32 width = spritewidth[sizeparam];
