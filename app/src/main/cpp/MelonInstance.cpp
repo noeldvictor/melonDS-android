@@ -1599,8 +1599,10 @@ u32 MelonInstance::runFrame()
     retroAchievementsManager->FrameUpdate();
 
     // 2D sprite/BG tile dumping and replacement lookup ride the frame the
-    // core just produced; the walker throttles its own dump cadence
-    if (hdTexPack)
+    // core just produced; the walker throttles its own dump cadence. Only
+    // the Vulkan compositor consumes 2D replacements, so without it the
+    // walker runs only when the user explicitly enabled dumping.
+    if (hdTexPack && (currentRenderer == Renderer::Vulkan || hdTexPack->DumpActive()))
         hdPack2D.ProcessFrame(nds->GPU, hdTexPack.get());
     else if (!hdPack2D.Instances.empty())
         hdPack2D.Instances.clear();
@@ -4215,12 +4217,18 @@ void MelonInstance::applyTexturePack(const EmulatorConfiguration& config)
     //   texturepacks/<GAMECODE>/textures/*.png  -> replacements
     //   texturedumps/<GAMECODE>/                -> dumped textures
     // Content-hash naming matches the desktop melonDS HD pack format. The
-    // settings toggles enable loading/dumping; a pre-existing directory keeps
-    // working as an opt-in fallback.
+    // settings toggles enable loading and dumping; a pre-existing per-game
+    // pack directory also opts in to loading.
     melonDS::HDTexPack* pack = nullptr;
 
+    // only the Vulkan and compute renderers consume the pack; keeping it
+    // alive under Software/OpenGL would leave the 2D walker scanning and
+    // dumping every frame with no consumer
+    const bool rendererConsumesPack =
+        currentRenderer == Renderer::Vulkan || currentRenderer == Renderer::Compute;
+
     auto cart = nds->NDSCartSlot.GetCart();
-    if (cart)
+    if (cart && rendererConsumesPack)
     {
         std::string gameCode(cart->GetHeader().GameCode, 4);
         for (char& ch : gameCode)
@@ -4231,10 +4239,13 @@ void MelonInstance::applyTexturePack(const EmulatorConfiguration& config)
         std::string dumpDir = base + "/texturedumps/" + gameCode;
 
         std::error_code ec;
+        // a pre-existing per-game pack directory keeps working as an opt-in
+        // fallback for loading; dumping is gated strictly by the preference
+        // so one dump session can't silently keep writing to disk for every
+        // game afterwards
         bool loadEnabled = config.loadTexturePacks
             || std::filesystem::is_directory(std::filesystem::u8path(packDir), ec);
-        bool dumpEnabled = config.dumpTextures
-            || std::filesystem::is_directory(std::filesystem::u8path(base + "/texturedumps"), ec);
+        bool dumpEnabled = config.dumpTextures;
 
         if (loadEnabled || dumpEnabled)
         {
@@ -4251,14 +4262,15 @@ void MelonInstance::applyTexturePack(const EmulatorConfiguration& config)
             }
             pack = hdTexPack.get();
         }
-        else if (hdTexPack)
-        {
-            if (vulkanOutput)
-                vulkanOutput->flushInFlightFrames();
-            hdPack2D.Instances.clear();
-            hdTexPack.reset();
-            hdTexPackState.clear();
-        }
+    }
+
+    if (pack == nullptr && hdTexPack)
+    {
+        if (vulkanOutput)
+            vulkanOutput->flushInFlightFrames();
+        hdPack2D.Instances.clear();
+        hdTexPack.reset();
+        hdTexPackState.clear();
     }
 
     auto& renderer3d = nds->GPU.GetRenderer3D();
@@ -4861,6 +4873,25 @@ void MelonInstance::clearLatchedSoftPackedFrameSnapshot()
     vulkanTemporal3dHistoryGateFrames = 0;
     vulkanTemporal3dNotReadyFrames = 0;
     vulkanTemporal3dHistoryDebugLogsRemaining = areRendererDebugBgObjLogsEnabled() ? 120 : 0;
+
+    // the per-line hold history belongs to the frames being cleared: after a
+    // reset, state load or resync it must not donate pixels from the
+    // previous game state to the first qualifying dropout line
+    heldPlanesInitialized = false;
+    heldTopPlane0.fill(0);
+    heldTopPlane1.fill(0);
+    heldTopControl.fill(0);
+    heldBottomPlane0.fill(0);
+    heldBottomPlane1.fill(0);
+    heldBottomControl.fill(0);
+    heldTopLineAge.fill(0);
+    heldBottomLineAge.fill(0);
+    heldTopColorStreak.fill(0);
+    heldBottomColorStreak.fill(0);
+    heldTopHeldStreak.fill(0);
+    heldBottomHeldStreak.fill(0);
+    heldTopRecentHold.fill(0);
+    heldBottomRecentHold.fill(0);
 }
 
 bool MelonInstance::updateVulkanTemporal3dHistoryGate()
@@ -8254,7 +8285,20 @@ bool MelonInstance::latchSoftPackedFrameSnapshot(
                     const u32 p1 = plane1[rowBase + x];
                     if (!active && (p0 != 0u || p1 != 0u || control[rowBase + x] != 0u))
                         active = true;
-                    if (((p0 & 0x00FFFFFFu) != 0u && p0 != 0x20000000u)
+                    // a pixel a BG or OBJ producer actually won is content
+                    // even when its color is black: fades, flashes and blank
+                    // scenes legitimately render black through 2D producers
+                    // and must not be bridged with stale art. The dropout
+                    // signature this hold exists for carries only 3D
+                    // slot/control markers (placeholder words), never
+                    // BG/OBJ-flagged pixels.
+                    const u32 f0 = p0 >> 24;
+                    const u32 f1 = p1 >> 24;
+                    const bool producerPixel =
+                        (f0 & 0x1Fu) != 0u || (f0 & 0xC0u) == 0xC0u
+                        || (f1 & 0x1Fu) != 0u || (f1 & 0xC0u) == 0xC0u;
+                    if (producerPixel
+                        || ((p0 & 0x00FFFFFFu) != 0u && p0 != 0x20000000u)
                         || ((p1 & 0x00FFFFFFu) != 0u && p1 != 0x20000000u))
                     {
                         hasColors = true;
