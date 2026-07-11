@@ -106,6 +106,8 @@ private:
 
     static FrameQueuePolicy sanitizePolicy(FrameQueuePolicy policy);
     void rebuildFreeQueueLocked();
+    void retireTrackedFrameLocked(Frame*& slot);
+    bool releaseOrphanedHeldFrameLocked(Frame* frame);
     void dropPendingFramesToBacklogLocked(u64 maxBacklogDepth, bool treatAsFastForwardSkip);
     void updateBacklogStatsLocked();
     void recordPresentedFrameAgeLocked(Frame* frame, u64 nowNs);
@@ -119,6 +121,11 @@ private:
     std::deque<Frame*> presentQueue{};
     Frame* previousFrame = nullptr;
     Frame* pendingPresentFrame = nullptr;
+    // ownership handshake with the presentation thread: the frame most
+    // recently handed out for presentation stays out of freeQueue until the
+    // presenter releases it via commit/defer, even across a resync
+    Frame* presenterHeldFrame = nullptr;
+    Frame* orphanedHeldFrame = nullptr;
     bool suppressPreviousFrameReuse = false;
     u64 nextFrameId = 1;
     FrameQueueStats stats{};

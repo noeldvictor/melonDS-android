@@ -19,6 +19,39 @@ FrameQueuePolicy FrameQueue::sanitizePolicy(FrameQueuePolicy policy)
     return policy;
 }
 
+// Retires a frame the queue no longer tracks (pending/previous slot). If the
+// presentation thread still holds it, park it as orphaned instead of recycling:
+// re-entering freeQueue while the presenter is recording or presenting it lets
+// the render thread overwrite a frame that is still in flight.
+void FrameQueue::retireTrackedFrameLocked(Frame*& slot)
+{
+    Frame* frame = slot;
+    slot = nullptr;
+    if (frame == nullptr)
+        return;
+
+    frame->queuedAtNs = 0;
+    if (frame == presenterHeldFrame)
+    {
+        orphanedHeldFrame = frame;
+        return;
+    }
+    freeQueue.push(frame);
+}
+
+// Returns true when the released frame was orphaned by a resync; it only
+// re-enters freeQueue here, once the presenter is done with it.
+bool FrameQueue::releaseOrphanedHeldFrameLocked(Frame* frame)
+{
+    if (frame == nullptr || frame != orphanedHeldFrame)
+        return false;
+
+    orphanedHeldFrame = nullptr;
+    frame->queuedAtNs = 0;
+    freeQueue.push(frame);
+    return true;
+}
+
 Frame* FrameQueue::getRenderFrame(const FrameQueuePolicy& requestedPolicy)
 {
     std::unique_lock lock(frameLock);
@@ -78,6 +111,11 @@ Frame* FrameQueue::getPresentFrame(
     std::unique_lock lock(frameLock);
     const FrameQueuePolicy policy = sanitizePolicy(requestedPolicy);
 
+    // a new acquisition by the presentation thread abandons any prior hold
+    if (orphanedHeldFrame != nullptr && orphanedHeldFrame == presenterHeldFrame)
+        releaseOrphanedHeldFrameLocked(orphanedHeldFrame);
+    presenterHeldFrame = nullptr;
+
     if (policy.UseLegacyOpenGlQueue)
     {
         if (presentQueue.empty())
@@ -89,7 +127,10 @@ Frame* FrameQueue::getPresentFrame(
             if (!hasNewFrame)
             {
                 if (previousFrame != nullptr)
+                {
                     stats.PreviousFrameReused++;
+                    presenterHeldFrame = previousFrame;
+                }
                 return previousFrame;
             }
         }
@@ -117,6 +158,7 @@ Frame* FrameQueue::getPresentFrame(
 
         presentQueue.clear();
         previousFrame = frame;
+        presenterHeldFrame = frame;
         recordPresentedFrameAgeLocked(frame, nowNs);
         updateBacklogStatsLocked();
         return frame;
@@ -132,7 +174,10 @@ Frame* FrameQueue::getPresentFrame(
             if (suppressPreviousFrameReuse || !policy.AllowPreviousFrameReuse)
                 return nullptr;
             if (previousFrame != nullptr)
+            {
                 stats.PreviousFrameReused++;
+                presenterHeldFrame = previousFrame;
+            }
             return previousFrame;
         }
     }
@@ -161,6 +206,7 @@ Frame* FrameQueue::getPresentFrame(
 
     presentQueue.clear();
     previousFrame = frame;
+    presenterHeldFrame = frame;
     recordPresentedFrameAgeLocked(frame, nowNs);
     updateBacklogStatsLocked();
     return frame;
@@ -173,8 +219,16 @@ Frame* FrameQueue::getPresentCandidate(
     std::unique_lock lock(frameLock);
     const FrameQueuePolicy policy = sanitizePolicy(requestedPolicy);
 
+    // a new acquisition by the presentation thread abandons any prior hold
+    if (orphanedHeldFrame != nullptr && orphanedHeldFrame == presenterHeldFrame)
+        releaseOrphanedHeldFrameLocked(orphanedHeldFrame);
+    presenterHeldFrame = nullptr;
+
     if (pendingPresentFrame != nullptr)
+    {
+        presenterHeldFrame = pendingPresentFrame;
         return pendingPresentFrame;
+    }
 
     if (presentQueue.empty())
     {
@@ -187,14 +241,20 @@ Frame* FrameQueue::getPresentCandidate(
         }
 
         if (pendingPresentFrame != nullptr)
+        {
+            presenterHeldFrame = pendingPresentFrame;
             return pendingPresentFrame;
+        }
 
         if (!hasNewFrame)
         {
             if (suppressPreviousFrameReuse || !policy.AllowPreviousFrameReuse)
                 return nullptr;
             if (previousFrame != nullptr)
+            {
                 stats.PreviousFrameReused++;
+                presenterHeldFrame = previousFrame;
+            }
             return previousFrame;
         }
     }
@@ -214,6 +274,7 @@ Frame* FrameQueue::getPresentCandidate(
         presentQueue.pop_front();
     }
     pendingPresentFrame = frame;
+    presenterHeldFrame = frame;
     stats.PresentFramesReturned++;
     suppressPreviousFrameReuse = false;
 
@@ -242,6 +303,7 @@ Frame* FrameQueue::getReusablePreviousFrame(const FrameQueuePolicy& requestedPol
         return nullptr;
 
     stats.PreviousFrameReused++;
+    presenterHeldFrame = previousFrame;
     return previousFrame;
 }
 
@@ -259,6 +321,11 @@ void FrameQueue::commitPresentedFrame(Frame* frame, const FrameQueuePolicy& requ
 {
     std::unique_lock lock(frameLock);
     if (frame == nullptr)
+        return;
+
+    if (frame == presenterHeldFrame)
+        presenterHeldFrame = nullptr;
+    if (releaseOrphanedHeldFrameLocked(frame))
         return;
 
     const FrameQueuePolicy policy = sanitizePolicy(requestedPolicy);
@@ -312,7 +379,15 @@ void FrameQueue::commitPresentedFrame(Frame* frame, const FrameQueuePolicy& requ
 void FrameQueue::deferPresentedFrame(Frame* frame, const FrameQueuePolicy& requestedPolicy)
 {
     std::unique_lock lock(frameLock);
-    if (frame == nullptr || frame != pendingPresentFrame)
+    if (frame == nullptr)
+        return;
+
+    if (frame == presenterHeldFrame)
+        presenterHeldFrame = nullptr;
+    if (releaseOrphanedHeldFrameLocked(frame))
+        return;
+
+    if (frame != pendingPresentFrame)
         return;
 
     const FrameQueuePolicy policy = sanitizePolicy(requestedPolicy);
@@ -463,19 +538,8 @@ void FrameQueue::requestPresentationResync()
     }
 
     presentQueue.clear();
-    if (pendingPresentFrame != nullptr)
-    {
-        pendingPresentFrame->queuedAtNs = 0;
-        freeQueue.push(pendingPresentFrame);
-        pendingPresentFrame = nullptr;
-    }
-
-    if (previousFrame != nullptr)
-    {
-        previousFrame->queuedAtNs = 0;
-        freeQueue.push(previousFrame);
-        previousFrame = nullptr;
-    }
+    retireTrackedFrameLocked(pendingPresentFrame);
+    retireTrackedFrameLocked(previousFrame);
 
     // A resync invalidates the presentation contract for all in-flight frames:
     // scale, backend, packed buffers, and 3D source image may all have changed.
@@ -496,12 +560,7 @@ void FrameQueue::requestFastForwardPresentationTransition()
     }
 
     presentQueue.clear();
-    if (pendingPresentFrame != nullptr)
-    {
-        pendingPresentFrame->queuedAtNs = 0;
-        freeQueue.push(pendingPresentFrame);
-        pendingPresentFrame = nullptr;
-    }
+    retireTrackedFrameLocked(pendingPresentFrame);
 
     suppressPreviousFrameReuse = false;
     updateBacklogStatsLocked();
@@ -520,6 +579,8 @@ void FrameQueue::clear()
     presentQueue.clear();
     previousFrame = nullptr;
     pendingPresentFrame = nullptr;
+    presenterHeldFrame = nullptr;
+    orphanedHeldFrame = nullptr;
     suppressPreviousFrameReuse = false;
     stats = FrameQueueStats{};
     rebuildFreeQueueLocked();
