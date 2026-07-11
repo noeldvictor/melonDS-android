@@ -566,12 +566,17 @@ u32 FirstStageHeavyTexel(const u32* src, u32 width, u32 height, int midX, int mi
     return HeavyFilterCorner(a, b, c, d, e, f, g, h, i, subx, suby, mode);
 }
 
-u32 Recursive4xHeavyTexel(const u32* src, u32 width, u32 height, int x, int y, u32 subx, u32 suby, int mode)
+u32 Recursive4xHeavyTexel(const u32* src, u32 width, u32 height, int x, int y, u32 subx, u32 suby, u32 scale, int mode)
 {
-    int midX = (x * 2) + static_cast<int>(subx / 2);
-    int midY = (y * 2) + static_cast<int>(suby / 2);
-    int secondSubX = static_cast<int>(subx % 2);
-    int secondSubY = static_cast<int>(suby % 2);
+    // the two chained 2x stages produce a 4x phase grid; map the requested
+    // subtexel to its nearest phase center so any scale >= 3 stays inside
+    // the source texel (identity at 4x, no neighbour bleed at 8x)
+    const u32 phaseX = std::min(3u, (subx * 4u + 2u) / scale);
+    const u32 phaseY = std::min(3u, (suby * 4u + 2u) / scale);
+    int midX = (x * 2) + static_cast<int>(phaseX / 2);
+    int midY = (y * 2) + static_cast<int>(phaseY / 2);
+    int secondSubX = static_cast<int>(phaseX % 2);
+    int secondSubY = static_cast<int>(phaseY % 2);
 
     u32 a = FirstStageHeavyTexel(src, width, height, midX - 1, midY - 1, mode);
     u32 b = FirstStageHeavyTexel(src, width, height, midX, midY - 1, mode);
@@ -1090,7 +1095,7 @@ void UpscaleTexture(const u32* src, u32 width, u32 height, u32 scale, int mode, 
                 dst[x + y * dstWidth] = (scale >= 3)
                     ? Recursive4xHeavyTexel(src, width, height,
                                             static_cast<int>(srcX), static_cast<int>(srcY),
-                                            subX, subY, mode)
+                                            subX, subY, scale, mode)
                     : HeavyFilterTexel(src, width, height,
                                        static_cast<int>(srcX), static_cast<int>(srcY),
                                        subX, subY, scale, mode);
