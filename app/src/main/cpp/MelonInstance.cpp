@@ -1281,7 +1281,7 @@ bool MelonInstance::bootFirmware()
 
 bool MelonInstance::precompileVulkanPipelines(const VulkanSurfaceConfig& retroArchConfig)
 {
-    if (currentConfiguration->renderer != Renderer::Vulkan)
+    if (configurationSnapshot()->renderer != Renderer::Vulkan)
         return true;
 
     const bool shouldPrewarmRetroArch =
@@ -1327,7 +1327,8 @@ bool MelonInstance::precompileVulkanPipelines(const VulkanSurfaceConfig& retroAr
         return failPrecompile("missing output");
 
     auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
-    auto vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+    const auto configSnapshot = configurationSnapshot();
+    auto vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*configSnapshot->renderSettings);
     const int vulkanScale = std::max(1, vulkanRenderSettings.scale);
     const u32 validationWidth = static_cast<u32>(256 * vulkanScale);
     const u32 validationHeight = static_cast<u32>((192 + 1) * 2 * vulkanScale);
@@ -1374,12 +1375,12 @@ bool MelonInstance::precompileVulkanPipelines(const VulkanSurfaceConfig& retroAr
 void MelonInstance::start()
 {
     auto cart = nds->NDSCartSlot.GetCart();
-    if (nds->ConsoleType == 1 && cart != nullptr && cart->GetHeader().IsDSiWare() && !currentConfiguration->showBootScreen)
+    if (nds->ConsoleType == 1 && cart != nullptr && cart->GetHeader().IsDSiWare() && !configurationSnapshot()->showBootScreen)
     {
         auto dsi = (DSi*) nds;
         DSiSupport::SetupDSiDirectBoot(dsi);
     }
-    else if (!currentConfiguration->showBootScreen || nds->NeedsDirectBoot())
+    else if (!configurationSnapshot()->showBootScreen || nds->NeedsDirectBoot())
     {
         // This seems to be unused, but it's required
         std::string romName;
@@ -1389,7 +1390,7 @@ void MelonInstance::start()
 
     vulkanRuntimeFailureHandled = false;
     vulkanPrepareFailureCount = 0;
-    if (currentConfiguration->renderer != Renderer::Vulkan)
+    if (configurationSnapshot()->renderer != Renderer::Vulkan)
         screenshotRenderer->init();
 }
 
@@ -1402,7 +1403,7 @@ void MelonInstance::reset()
     // If there is a cart inserted, check if direct boot is required
     if (nds->GetNDSCart())
     {
-        if (!currentConfiguration->showBootScreen || nds->NeedsDirectBoot())
+        if (!configurationSnapshot()->showBootScreen || nds->NeedsDirectBoot())
         {
             // This seems to be unused, but it's required
             std::string romName;
@@ -1421,7 +1422,8 @@ void MelonInstance::reset()
 
 u32 MelonInstance::runFrame()
 {
-    const bool measuringVulkan = currentConfiguration->renderer == Renderer::Vulkan;
+    const auto configSnapshot = configurationSnapshot();
+    const bool measuringVulkan = configSnapshot->renderer == Renderer::Vulkan;
     const u64 runFrameStartNs = measuringVulkan ? PerfNowNs() : 0;
     u64 ndsRunStartNs = 0;
     u64 ndsRunEndNs = 0;
@@ -1452,7 +1454,7 @@ u32 MelonInstance::runFrame()
     }
     else if (currentRenderer == Renderer::Compute)
     {
-        auto computeRenderSettings = static_cast<ComputeRenderSettings&>(*currentConfiguration->renderSettings);
+        auto computeRenderSettings = static_cast<ComputeRenderSettings&>(*configSnapshot->renderSettings);
         int scale = computeRenderSettings.scale;
         screenWidth = 256 * scale;
         screenHeight = (192 + 1) * scale;
@@ -2025,7 +2027,10 @@ bool MelonInstance::presentVulkanFrame(
         return false;
 
     auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
-    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+    // snapshot keeps the configuration alive for the whole present even if
+    // the configuration thread swaps it mid-frame
+    const auto configSnapshot = configurationSnapshot();
+    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*configSnapshot->renderSettings);
     const int renderScale = std::max(renderer3D.GetScaleFactor(), 1);
     const bool graphicsHardwareActive =
         renderer3D.GetActiveBackendMode() == VulkanRenderer3D::BackendMode::GraphicsHardware;
@@ -3961,10 +3966,11 @@ bool MelonInstance::ensurePreparedVulkanDebugSnapshot(Frame* frame, VulkanRender
 
 void MelonInstance::updateVulkanFastForwardRenderScale()
 {
+    const auto config = configurationSnapshot();
     if (currentRenderer != Renderer::Vulkan)
         return;
 
-    auto& vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+    auto& vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*config->renderSettings);
     auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
     const int desiredScale = getEffectiveVulkanRenderScale(vulkanRenderSettings);
     if (renderer3D.GetScaleFactor() == desiredScale)
@@ -3995,7 +4001,10 @@ void MelonInstance::updateConfiguration(std::shared_ptr<EmulatorConfiguration> n
 
     rewindManager.UpdateRewindSettings(newConfiguration->rewindEnabled, newConfiguration->rewindLengthSeconds, newConfiguration->rewindCaptureSpacingSeconds);
 
-    currentConfiguration = newConfiguration;
+    {
+        std::scoped_lock lock(configurationLock);
+        currentConfiguration = std::move(newConfiguration);
+    }
     isRenderConfigurationDirty = true;
 }
 
@@ -4200,7 +4209,7 @@ std::vector<long> MelonInstance::getRuntimeSubsetIds()
 }
 
 
-void MelonInstance::applyTexturePack()
+void MelonInstance::applyTexturePack(const EmulatorConfiguration& config)
 {
     // Texture packs live under the app's internal files dir:
     //   texturepacks/<GAMECODE>/textures/*.png  -> replacements
@@ -4222,9 +4231,9 @@ void MelonInstance::applyTexturePack()
         std::string dumpDir = base + "/texturedumps/" + gameCode;
 
         std::error_code ec;
-        bool loadEnabled = currentConfiguration->loadTexturePacks
+        bool loadEnabled = config.loadTexturePacks
             || std::filesystem::is_directory(std::filesystem::u8path(packDir), ec);
-        bool dumpEnabled = currentConfiguration->dumpTextures
+        bool dumpEnabled = config.dumpTextures
             || std::filesystem::is_directory(std::filesystem::u8path(base + "/texturedumps"), ec);
 
         if (loadEnabled || dumpEnabled)
@@ -4264,7 +4273,8 @@ void MelonInstance::applyTexturePack()
 
 void MelonInstance::updateRenderer()
 {
-    Renderer newRenderer = currentConfiguration->renderer;
+    const auto config = configurationSnapshot();
+    Renderer newRenderer = config->renderer;
 
     if (newRenderer != currentRenderer)
     {
@@ -4290,7 +4300,7 @@ void MelonInstance::updateRenderer()
                     nds->Stop(Platform::StopReason::BadExceptionRegion);
                 }
 
-                currentConfiguration->renderer = currentRenderer;
+                config->renderer = currentRenderer;
                 return;
             }
 
@@ -4315,7 +4325,7 @@ void MelonInstance::updateRenderer()
             case Renderer::Vulkan:
             {
                 auto vulkanRenderer = VulkanRenderer3D::New();
-                auto vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+                auto vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*config->renderSettings);
 
                 if (vulkanRenderer)
                 {
@@ -4350,7 +4360,7 @@ void MelonInstance::updateRenderer()
                     if (currentRenderer != Renderer::Vulkan)
                         vulkanOutput = nullptr;
 
-                    currentConfiguration->renderer = currentRenderer;
+                    config->renderer = currentRenderer;
                     return;
                 }
 
@@ -4366,7 +4376,7 @@ void MelonInstance::updateRenderer()
         if (!nextRenderer)
         {
             Platform::Log(Platform::LogLevel::Error, "Failed to create requested renderer backend");
-            currentConfiguration->renderer = currentRenderer;
+            config->renderer = currentRenderer;
             return;
         }
 
@@ -4374,19 +4384,19 @@ void MelonInstance::updateRenderer()
         currentRenderer = newRenderer;
     }
 
-    applyTexturePack();
+    applyTexturePack(*config);
 
     switch (newRenderer)
     {
         case Renderer::Software:
         {
-            auto softwareRenderSettings = static_cast<SoftwareRenderSettings&>(*currentConfiguration->renderSettings);
+            auto softwareRenderSettings = static_cast<SoftwareRenderSettings&>(*config->renderSettings);
             static_cast<SoftRenderer&>(nds->GPU.GetRenderer3D()).SetThreaded(softwareRenderSettings.threadedRendering, nds->GPU);
             break;
         }
         case Renderer::OpenGl:
         {
-            auto glRenderSettings = static_cast<OpenGlRenderSettings&>(*currentConfiguration->renderSettings);
+            auto glRenderSettings = static_cast<OpenGlRenderSettings&>(*config->renderSettings);
             auto& renderer3d = static_cast<GLRenderer&>(nds->GPU.GetRenderer3D());
             renderer3d.SetRenderSettings(glRenderSettings.betterPolygons, glRenderSettings.scale);
             renderer3d.SetCoverageFixSettings(
@@ -4400,7 +4410,7 @@ void MelonInstance::updateRenderer()
         }
         case Renderer::Vulkan:
         {
-            auto vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+            auto vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*config->renderSettings);
             auto& renderer3d = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
             renderer3d.SetBackendMode(getConfiguredVulkanBackendMode(vulkanRenderSettings));
             renderer3d.SetRenderSettings(
@@ -4447,7 +4457,7 @@ void MelonInstance::updateRenderer()
         }
         case Renderer::Compute:
         {
-            auto computeRenderSettings = static_cast<ComputeRenderSettings&>(*currentConfiguration->renderSettings);
+            auto computeRenderSettings = static_cast<ComputeRenderSettings&>(*config->renderSettings);
             auto& renderer3d = static_cast<ComputeRenderer&>(nds->GPU.GetRenderer3D());
             renderer3d.SetRenderSettings(computeRenderSettings.scale,computeRenderSettings.highResCoordinates);
             renderer3d.SetHDTextureFilter(computeRenderSettings.scale, computeRenderSettings.hdTextureFilterMode);
@@ -4502,7 +4512,8 @@ bool MelonInstance::updateVulkanScreenshot(Frame* frame, int scale, bool clearOn
 
     vulkanReadbackFrame.resize(readbackPixels);
     auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
-    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+    const auto configSnapshot = configurationSnapshot();
+    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*configSnapshot->renderSettings);
     VulkanCompositionInputs compositionInputs{};
     if (!vulkanOutput->buildCompositionInputs(
             frame,
@@ -4554,12 +4565,13 @@ std::vector<u32> MelonInstance::captureCurrentCompositedDimensionsForDebug()
 
 std::vector<u32> MelonInstance::captureCurrentCompositedFrameForDebug()
 {
+    const auto configSnapshot = configurationSnapshot();
     if (!areRendererDebugToolsEnabled()
         || currentRenderer != Renderer::Vulkan
         || vulkanOutput == nullptr
         || nds == nullptr
-        || currentConfiguration == nullptr
-        || currentConfiguration->renderSettings == nullptr
+        || configSnapshot == nullptr
+        || configSnapshot->renderSettings == nullptr
         || lastCompletedVulkanFrame == nullptr
         || lastCompletedVulkanScale < 1)
         return {};
@@ -4570,7 +4582,7 @@ std::vector<u32> MelonInstance::captureCurrentCompositedFrameForDebug()
         return {};
 
     auto& renderer3D = static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D());
-    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+    const auto& vulkanRenderSettings = static_cast<const VulkanRenderSettings&>(*configSnapshot->renderSettings);
     VulkanCompositionInputs compositionInputs{};
     if (!vulkanOutput->buildCompositionInputs(
             frame,
@@ -4623,7 +4635,8 @@ void MelonInstance::logVulkanPerformanceIfNeeded()
     int vulkanRenderScale = 1;
     if (currentRenderer == Renderer::Vulkan)
     {
-        auto& vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*currentConfiguration->renderSettings);
+        const auto configSnapshot = configurationSnapshot();
+        auto& vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*configSnapshot->renderSettings);
         vulkanOutputScale = getConfiguredVulkanScale(vulkanRenderSettings);
         vulkanRenderScale = std::max(static_cast<VulkanRenderer3D&>(nds->GPU.GetRenderer3D()).GetScaleFactor(), 1);
     }

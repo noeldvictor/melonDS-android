@@ -194,8 +194,13 @@ private:
         std::vector<DenseScreenBurstFrame> frames;
     };
 
+    std::shared_ptr<EmulatorConfiguration> configurationSnapshot() const
+    {
+        std::scoped_lock lock(configurationLock);
+        return currentConfiguration;
+    }
     void updateRenderer();
-    void applyTexturePack();
+    void applyTexturePack(const EmulatorConfiguration& config);
     void updateVulkanFastForwardRenderScale();
     void handleVulkanRuntimeFailure(const char* reason);
     bool updateVulkanScreenshot(Frame* frame, int scale, bool clearOnFailure);
@@ -234,7 +239,12 @@ private:
     std::atomic<float> slot2AnalogX = 0.0f;
     std::atomic<float> slot2AnalogY = 0.0f;
 
+    // written by the configuration thread, read by the emulation and
+    // presentation threads; take a snapshot copy per use via
+    // configurationSnapshot() so a concurrent swap can't destroy the
+    // configuration mid-dereference
     std::shared_ptr<EmulatorConfiguration> currentConfiguration;
+    mutable std::mutex configurationLock;
     FrameQueue frameQueue;
     std::unique_ptr<VulkanOutput> vulkanOutput;
     std::unique_ptr<VulkanSurfacePresenter> vulkanSurfacePresenter;
@@ -300,7 +310,7 @@ private:
     std::unique_ptr<ScreenshotRenderer> screenshotRenderer;
     RewindManager rewindManager;
     Renderer currentRenderer;
-    bool isRenderConfigurationDirty;
+    std::atomic<bool> isRenderConfigurationDirty;
     bool vulkanRuntimeConfigLogged;
     bool vulkanRuntimeFailureHandled;
     int vulkanPrepareFailureCount;

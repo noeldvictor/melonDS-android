@@ -1281,6 +1281,7 @@ void VulkanOutput::flushInFlightFrames()
         (void)frame;
         if (frameResource.submitFence != VK_NULL_HANDLE)
             (void)vkWaitForFences(device, 1, &frameResource.submitFence, VK_TRUE, kFlushFenceTimeoutNs);
+        std::scoped_lock instanceLock(replacementInstanceLock);
         frameResource.replacementInstances.clear();
     }
 }
@@ -1666,6 +1667,9 @@ void VulkanOutput::recordPlaneOverlayPasses(FrameResource& resource, const Vulka
         bool isSprite;
     };
     std::vector<PreparedInstance> prepared;
+    // hold the lock across instance iteration: flushInFlightFrames may clear
+    // the vector from another thread when the backing pack is torn down
+    std::unique_lock instanceLock(replacementInstanceLock);
     prepared.reserve(resource.replacementInstances.size());
 
     // packed "top" planes hold whichever engine the swap put on the
@@ -1705,6 +1709,7 @@ void VulkanOutput::recordPlaneOverlayPasses(FrameResource& resource, const Vulka
     for (auto it = resource.replacementInstances.rbegin(); it != resource.replacementInstances.rend(); ++it)
         if (it->RequireMask == 0x90)
             addInstance(*it);
+    instanceLock.unlock();
 
     if (prepared.empty())
         return;
@@ -2192,6 +2197,7 @@ VkPipeline VulkanOutput::getScaleFXPipeline(u32 pass)
 
 void VulkanOutput::recordScaleFXChain(FrameResource& resource, u32 screen,
                                       u32 applyObj, u32 applyBg, u32 writeOthers,
+                                      bool debugTint,
                                       const VulkanCompositionInputs& inputs)
 {
     const u32 scale = std::max(inputs.scale, 1u);
@@ -2246,7 +2252,7 @@ void VulkanOutput::recordScaleFXChain(FrameResource& resource, u32 screen,
     pushConstants.applyObj = applyObj;
     pushConstants.applyBg = applyBg;
     pushConstants.writeOthers = writeOthers;
-    pushConstants.debugTint = areRendererDebugFilterTintEnabled() ? 1u : 0u;
+    pushConstants.debugTint = debugTint ? 1u : 0u;
     vkCmdPushConstants(
         resource.commandBuffer,
         scalefxPipelineLayout,
@@ -2340,12 +2346,17 @@ void VulkanOutput::destroyScaleFXResources()
     scalefxImagesLayoutReady = false;
 }
 
-bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs)
+bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs,
+                                           u32 objModeIn, u32 bgModeIn, bool debugTint)
 {
     const u32 scale = std::max(inputs.scale, 1u);
-    const u32 objMode = objFilterMode < kPlaneFilterModeCount ? objFilterMode : 0u;
-    const u32 bgMode = bgFilterMode < kPlaneFilterModeCount ? bgFilterMode : 0u;
-    const bool overlayWanted = replacement2DActive && !resource.replacementInstances.empty();
+    const u32 objMode = objModeIn < kPlaneFilterModeCount ? objModeIn : 0u;
+    const u32 bgMode = bgModeIn < kPlaneFilterModeCount ? bgModeIn : 0u;
+    bool overlayWanted = false;
+    {
+        std::scoped_lock instanceLock(replacementInstanceLock);
+        overlayWanted = replacement2DActive && !resource.replacementInstances.empty();
+    }
     if ((objMode == 0u && bgMode == 0u && !overlayWanted) || scale <= 1u)
         return false;
 
@@ -2537,6 +2548,7 @@ bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const Vulkan
                     passes[passIndex].applyObj,
                     passes[passIndex].applyBg,
                     passes[passIndex].writeOthers,
+                    debugTint,
                     inputs);
                 continue;
             }
@@ -2558,7 +2570,7 @@ bool VulkanOutput::recordPlaneFilterPasses(FrameResource& resource, const Vulkan
             pushConstants.applyObj = passes[passIndex].applyObj;
             pushConstants.applyBg = passes[passIndex].applyBg;
             pushConstants.writeOthers = passes[passIndex].writeOthers;
-            pushConstants.debugTint = areRendererDebugFilterTintEnabled() ? 1u : 0u;
+            pushConstants.debugTint = debugTint ? 1u : 0u;
 
             vkCmdBindPipeline(resource.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, passPipelines[passIndex]);
             vkCmdPushConstants(
@@ -3954,7 +3966,10 @@ bool VulkanOutput::updateCompositorPackedBuffers(
 
     resource.softPackedFrameId = softPackedSnapshot.frameId;
     resource.hasPackedUpload = true;
-    resource.replacementInstances = softPackedSnapshot.replacementInstances;
+    {
+        std::scoped_lock instanceLock(replacementInstanceLock);
+        resource.replacementInstances = softPackedSnapshot.replacementInstances;
+    }
     resource.frontBufferLatched = softPackedSnapshot.frontBufferLatched;
     resource.captureBackedClass4Only = softPackedSnapshot.captureBackedClass4Only;
     resource.hasSoftPackedDebugData = true;
@@ -6025,10 +6040,14 @@ bool VulkanOutput::buildCompositionInputs(
     outInputs.screenSwap = resource.screenSwap ? 1u : 0u;
     outInputs.scale = static_cast<u32>(scale);
     outInputs.filtering = filtering;
-    outInputs.planeFilterRequested =
-        (objFilterMode != 0u || bgFilterMode != 0u
-         || (replacement2DActive && !resource.replacementInstances.empty()))
-        && outInputs.scale > 1u;
+    {
+        std::scoped_lock instanceLock(replacementInstanceLock);
+        outInputs.planeFilterRequested =
+            (objFilterMode.load(std::memory_order_acquire) != 0u
+             || bgFilterMode.load(std::memory_order_acquire) != 0u
+             || (replacement2DActive && !resource.replacementInstances.empty()))
+            && outInputs.scale > 1u;
+    }
     outInputs.capture3dSourceValid = resource.hasPreparedCapture3dSource && resource.capture3dBuffer != VK_NULL_HANDLE;
     const bool topUsesCurrentCapture3d = topUsesRegularCapture3d || topUsesVramCapture3d;
     const bool bottomUsesCurrentCapture3d = bottomUsesRegularCapture3d || bottomUsesVramCapture3d;
@@ -6610,10 +6629,21 @@ bool VulkanOutput::dispatchCompositor(
     // pass the whole pre-pass chain (and the ScaleFX multi-pass) is skipped
     // and the existing filtered images are reused - static scenes such as
     // menus and dialogs stop paying the filter cost entirely.
-    const bool overlayWantedForFrame =
-        replacement2DActive && !resource.replacementInstances.empty();
+    // snapshot the cross-thread filter state once: the recorded passes and
+    // the cache key must describe the same modes even if the emulation
+    // thread changes them mid-compose
+    const u32 objModeForFrame = objFilterMode.load(std::memory_order_acquire);
+    const u32 bgModeForFrame = bgFilterMode.load(std::memory_order_acquire);
+    const bool tintForFrame = areRendererDebugFilterTintEnabled();
+    bool overlayWantedForFrame = false;
+    size_t replacementInstanceCountForFrame = 0;
+    {
+        std::scoped_lock instanceLock(replacementInstanceLock);
+        replacementInstanceCountForFrame = resource.replacementInstances.size();
+        overlayWantedForFrame = replacement2DActive && replacementInstanceCountForFrame != 0;
+    }
     const bool planeFilterWanted =
-        (objFilterMode != 0u || bgFilterMode != 0u || overlayWantedForFrame)
+        (objModeForFrame != 0u || bgModeForFrame != 0u || overlayWantedForFrame)
         && inputs.scale > 1u;
     bool planeFilterActive = false;
     if (planeFilterWanted)
@@ -6634,8 +6664,9 @@ bool VulkanOutput::dispatchCompositor(
                 && filteredPlaneLayoutReady
                 && topFilteredPlaneImage != VK_NULL_HANDLE
                 && planeFilterCacheScale == inputs.scale
-                && planeFilterCacheObjMode == objFilterMode
-                && planeFilterCacheBgMode == bgFilterMode
+                && planeFilterCacheObjMode == objModeForFrame
+                && planeFilterCacheBgMode == bgModeForFrame
+                && planeFilterCacheTint == tintForFrame
                 && planeFilterCacheTopHash == topHash
                 && planeFilterCacheBottomHash == bottomHash;
         }
@@ -6647,13 +6678,14 @@ bool VulkanOutput::dispatchCompositor(
         }
         else
         {
-            planeFilterActive = recordPlaneFilterPasses(resource, inputs);
+            planeFilterActive = recordPlaneFilterPasses(resource, inputs, objModeForFrame, bgModeForFrame, tintForFrame);
             if (planeFilterActive && cacheUsable)
             {
                 planeFilterCacheValid = true;
                 planeFilterCacheScale = inputs.scale;
-                planeFilterCacheObjMode = objFilterMode;
-                planeFilterCacheBgMode = bgFilterMode;
+                planeFilterCacheObjMode = objModeForFrame;
+                planeFilterCacheBgMode = bgModeForFrame;
+                planeFilterCacheTint = tintForFrame;
                 planeFilterCacheTopHash = topHash;
                 planeFilterCacheBottomHash = bottomHash;
             }
@@ -6675,10 +6707,6 @@ bool VulkanOutput::dispatchCompositor(
 
         // the filter pre-pass silently degrades to raw plane sampling when
         // its pipelines or images are unavailable; surface that state
-        const bool planeFilterWanted =
-            (objFilterMode != 0u || bgFilterMode != 0u
-             || (replacement2DActive && !resource.replacementInstances.empty()))
-            && inputs.scale > 1u;
         const u64 nowNs = PerfNowNs();
         if (planeFilterWanted && !planeFilterActive
             && nowNs - lastPlaneFilterUnavailableLogNs >= 1'000'000'000ull)
@@ -6687,10 +6715,10 @@ bool VulkanOutput::dispatchCompositor(
             melonDS::Platform::Log(
                 melonDS::Platform::LogLevel::Warn,
                 "VulkanOutput: plane filter pass unavailable (obj=%u bg=%u scale=%u overlays=%zu)",
-                objFilterMode,
-                bgFilterMode,
+                objModeForFrame,
+                bgModeForFrame,
                 inputs.scale,
-                resource.replacementInstances.size());
+                replacementInstanceCountForFrame);
         }
 
         if (statsWindowStartNs == 0)

@@ -1,6 +1,7 @@
 #ifndef VULKANOUTPUT_H
 #define VULKANOUTPUT_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -235,11 +236,13 @@ public:
 
     bool ensureFrameResources(Frame* frame, u32 width, u32 height);
     // Per-producer 2D filter modes, applied through small per-mode pre-pass
-    // pipelines that are created lazily when a mode is first used.
+    // pipelines that are created lazily when a mode is first used. Written
+    // by the emulation thread, read by the presentation thread, so the modes
+    // are atomics and every compose snapshots them once per frame.
     void setPacked2DFilterModes(u32 objMode, u32 bgMode)
     {
-        objFilterMode = objMode;
-        bgFilterMode = bgMode;
+        objFilterMode.store(objMode, std::memory_order_release);
+        bgFilterMode.store(bgMode, std::memory_order_release);
     }
     // Enables the HD 2D replacement overlay (sprites/BG tiles from a texture
     // pack). Resets the replacement atlas cache: the pack that backs the
@@ -491,12 +494,14 @@ private:
     bool ensurePlaneFilterResources(u32 scale);
     void destroyPlaneFilterResources();
     VkPipeline getPlaneFilterPipeline(u32 mode);
-    bool recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs);
+    bool recordPlaneFilterPasses(FrameResource& resource, const VulkanCompositionInputs& inputs,
+                                 u32 objMode, u32 bgMode, bool debugTint);
     bool ensureScaleFXResources(FrameResource& resource);
     void destroyScaleFXResources();
     VkPipeline getScaleFXPipeline(u32 pass);
     void recordScaleFXChain(FrameResource& resource, u32 screen,
                             u32 applyObj, u32 applyBg, u32 writeOthers,
+                            bool debugTint,
                             const VulkanCompositionInputs& inputs);
     bool ensurePlaneOverlayResources(FrameResource& resource);
     void destroyPlaneOverlayResources();
@@ -617,8 +622,8 @@ private:
     VkImageView cachedAccumulateTopSourceView{VK_NULL_HANDLE};
     VkImageView cachedAccumulateBottomSourceView{VK_NULL_HANDLE};
 
-    u32 objFilterMode{0};
-    u32 bgFilterMode{0};
+    std::atomic<u32> objFilterMode{0};
+    std::atomic<u32> bgFilterMode{0};
     u64 lastEmptyPackedComposeLogNs{0};
     u64 lastPlaneFilterUnavailableLogNs{0};
     u64 statsWindowStartNs{0};
@@ -640,6 +645,7 @@ private:
     u32 planeFilterCacheBgMode{0};
     u64 planeFilterCacheTopHash{0};
     u64 planeFilterCacheBottomHash{0};
+    bool planeFilterCacheTint{false};
 
     static constexpr u32 kPlaneFilterModeCount = 14;
     VkDescriptorSetLayout planeFilterDescriptorSetLayout{VK_NULL_HANDLE};
@@ -708,10 +714,13 @@ private:
     u32 overlayAtlasScale{0};
     bool overlayAtlasFull{false};
     u64 lastOverlayAtlasFullLogNs{0};
-    std::vector<u32> overlayResampleScratch;
 
     std::unordered_map<Frame*, FrameResource> resources;
     std::mutex commandPoolLock;
+    // guards FrameResource::replacementInstances: written by the emulation
+    // thread (prepare) and cleared by flushInFlightFrames while the
+    // presentation thread reads them during compose
+    mutable std::mutex replacementInstanceLock;
     Frame* lastPreparedFrame{nullptr};
     Frame* lastTopRendererSourceFrame{nullptr};
     Frame* lastBottomRendererSourceFrame{nullptr};
