@@ -646,6 +646,12 @@ void VulkanRenderer3D::ResetActiveBackend(GPU& gpu)
     HasCurrentCaptureScreenSwapHint = false;
     CurrentRenderScreenSwap = false;
     CaptureLineExportCount = 0;
+    ExactCaptureRestoreCount = 0;
+    ExactCaptureRestoreOtherSwapCount = 0;
+    ExactCaptureBankedMismatchCount = 0;
+    ExactCaptureRestoreMissCount = 0;
+    ExactCaptureFallbackFillCount = 0;
+    ExactCaptureClearCount = 0;
     EarlySubmitAttemptCount = 0;
     EarlySubmitHitCount = 0;
     EarlySubmitMissCount = 0;
@@ -724,7 +730,7 @@ void VulkanRenderer3D::RenderFrameActiveBackend(GPU& gpu)
         if (nowNs - LastHDSamplingStatsLogNs >= 1'000'000'000ull)
         {
             LastHDSamplingStatsLogNs = nowNs;
-            Platform::Log(Platform::LogLevel::Warn,
+            Platform::Log(Platform::LogLevel::Debug,
                           "GPU3D_Vulkan[Stats]: hdSampling=%d texScale=%d filterMode=%d capFallback(restore=%llu otherSwap=%llu banked=%llu miss=%llu fill=%llu clear=%llu)",
                           PipelinesUseHDSampling ? 1 : 0,
                           Texcache.GetHDTextureScale(),
@@ -1419,6 +1425,12 @@ void VulkanRenderer3D::StopActiveBackend(const GPU& gpu)
     HasCurrentCaptureScreenSwapHint = false;
     CurrentRenderScreenSwap = false;
     CaptureLineExportCount = 0;
+    ExactCaptureRestoreCount = 0;
+    ExactCaptureRestoreOtherSwapCount = 0;
+    ExactCaptureBankedMismatchCount = 0;
+    ExactCaptureRestoreMissCount = 0;
+    ExactCaptureFallbackFillCount = 0;
+    ExactCaptureClearCount = 0;
     EarlySubmitAttemptCount = 0;
     EarlySubmitHitCount = 0;
     EarlySubmitMissCount = 0;
