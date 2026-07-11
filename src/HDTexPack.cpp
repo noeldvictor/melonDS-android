@@ -55,6 +55,13 @@ u64 MapKey(u32 width, u32 height, u64 hash1, u64 hash2, u32 disc, bool hasPal)
     return XXH64(&f, sizeof(f), 0x484454455850414BULL); // "HDTEXPAK"
 }
 
+// DumpedKeys spans all asset kinds while MapKey does not encode the kind;
+// an 8x8 4bpp sprite and BG tile with identical bytes must still dump both
+u64 DumpKey(u64 mapKey, const char* kind)
+{
+    return XXH64(kind, strlen(kind), mapKey);
+}
+
 bool ParseHash16(const std::string& s, u64& out, bool& wildcard, bool& none)
 {
     wildcard = false; none = false;
@@ -308,7 +315,7 @@ void HDTexPack::DumpTexture(u32 width, u32 height, u64 texHash,
     if (!DumpEnabled) return;
 
     u64 key = MapKey(width, height, texHash, hasPal ? palHash : 0, fmt, hasPal);
-    if (!DumpedKeys.insert(key).second) return;
+    if (!DumpedKeys.insert(DumpKey(key, "tex1")).second) return;
 
     std::string palStr = hasPal ? Hash16(palHash) : "none";
     char nameBuf[96];
@@ -347,7 +354,7 @@ void HDTexPack::DumpSprite(u32 width, u32 height, u64 tileHash,
     u64 key = MapKey(width, height, tileHash, hasPal ? palHash : 0, disc, hasPal);
     std::string palStr = hasPal ? Hash16(palHash) : "none";
 
-    if (DumpedKeys.insert(key).second)
+    if (DumpedKeys.insert(DumpKey(key, "obj1")).second)
     {
         char nameBuf[96];
         snprintf(nameBuf, sizeof(nameBuf), "obj1_%ux%u_%s_%s_%s",
@@ -385,7 +392,7 @@ void HDTexPack::DumpBGTile(u64 tileHash, u64 palHash, bool hasPal, u32 bpp, cons
     u64 key = MapKey(8, 8, tileHash, hasPal ? palHash : 0, bpp, hasPal);
     std::string palStr = hasPal ? Hash16(palHash) : "none";
 
-    if (DumpedKeys.insert(key).second)
+    if (DumpedKeys.insert(DumpKey(key, "bg1")).second)
     {
         char nameBuf[96];
         snprintf(nameBuf, sizeof(nameBuf), "bg1_8x8_%s_%s_%u",
