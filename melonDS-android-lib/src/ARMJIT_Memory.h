@@ -147,6 +147,10 @@ public:
     std::atomic<u32> FastMemLastDTCMFaultAddr {0};
     std::atomic<u32> FastMemLastDTCMFaultState {0};
     std::atomic<u32> FastMemLastDTCMFaultBase {0};
+    // pages repaired after faulting in mapped-RW state (see FaultHandler)
+    std::atomic<u64> FastMemMappedRepairs {0};
+    u32 LastMappedFaultPage = 0xFFFFFFFF;
+    u64 LastMappedFaultNs = 0;
 
     int ClassifyAddress9(u32 addr) const noexcept;
     int ClassifyAddress7(u32 addr) const noexcept;

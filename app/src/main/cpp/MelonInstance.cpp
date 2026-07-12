@@ -4717,9 +4717,10 @@ void MelonInstance::logVulkanPerformanceIfNeeded()
         // growth means fastmem keeps degrading accesses to the slow path
         Platform::Log(
             Platform::LogLevel::Warn,
-            "CorePerf[Fastmem]: faults=%llu mapFixups=%llu slowRewrites=%llu slowBlockLoads=%llu slowBlockStores=%llu patchedBlockXfers=%llu",
+            "CorePerf[Fastmem]: faults=%llu mapFixups=%llu mappedRepairs=%llu slowRewrites=%llu slowBlockLoads=%llu slowBlockStores=%llu patchedBlockXfers=%llu",
             static_cast<unsigned long long>(nds->JIT.Memory.FastMemFaults.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(nds->JIT.Memory.FastMemMapFixups.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(nds->JIT.Memory.FastMemMappedRepairs.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(nds->JIT.Memory.FastMemSlowRewrites.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(melonDS::JitSlowBlockLoads.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(melonDS::JitSlowBlockStores.load(std::memory_order_relaxed)),

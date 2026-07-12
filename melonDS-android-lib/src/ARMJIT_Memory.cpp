@@ -836,8 +836,40 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
 
         u8* memStatus = nds.CurCPU == 0 ? nds.JIT.Memory.MappingStatus9 : nds.JIT.Memory.MappingStatus7;
 
-        if (memStatus[faultDesc.EmulatedFaultAddr >> PageShift] == memstate_Unmapped)
+        const u32 faultPage = faultDesc.EmulatedFaultAddr >> PageShift;
+        if (memStatus[faultPage] == memstate_Unmapped)
+        {
             rewriteToSlowPath = !nds.JIT.Memory.MapAtAddress(faultDesc.EmulatedFaultAddr);
+        }
+        else if (memStatus[faultPage] == memstate_MappedRW)
+        {
+            // a fault on a page marked mapped read-write means the status
+            // byte and the host mapping desynced (observed for DTCM inside
+            // the main RAM mirror after remaps). Restore the mapping
+            // instead of degrading the site to the slow path forever. The
+            // desync can recur, so the same page may legitimately need
+            // repairing again later; only an immediate refault of the same
+            // page (within 2ms) means the repair does not take, in which
+            // case the access is rewritten as before.
+            bool repairable = true;
+#ifndef _WIN32
+            struct timespec faultTime;
+            clock_gettime(CLOCK_MONOTONIC, &faultTime);
+            const u64 faultNowNs = (u64)faultTime.tv_sec * 1000000000ull + (u64)faultTime.tv_nsec;
+            repairable = faultPage != nds.JIT.Memory.LastMappedFaultPage
+                || faultNowNs - nds.JIT.Memory.LastMappedFaultNs > 2000000ull;
+            nds.JIT.Memory.LastMappedFaultNs = faultNowNs;
+#else
+            repairable = faultPage != nds.JIT.Memory.LastMappedFaultPage;
+#endif
+            nds.JIT.Memory.LastMappedFaultPage = faultPage;
+            if (repairable)
+            {
+                rewriteToSlowPath = !nds.JIT.Memory.MapAtAddress(faultDesc.EmulatedFaultAddr);
+                if (!rewriteToSlowPath)
+                    nds.JIT.Memory.FastMemMappedRepairs.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
 
         if (rewriteToSlowPath)
         {
