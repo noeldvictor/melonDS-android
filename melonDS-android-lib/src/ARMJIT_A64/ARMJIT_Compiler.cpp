@@ -84,6 +84,99 @@ void UpdateModeTrampoline(ARM* arm, u32 oldmode, u32 newmode)
     arm->UpdateMode(oldmode, newmode);
 }
 
+static void CP15WriteTrampoline(ARMv5* cpu, u32 id, u32 val)
+{
+    cpu->CP15Write(id, val);
+}
+
+static u32 CP15ReadTrampoline(ARMv5* cpu, u32 id)
+{
+    return cpu->CP15Read(id);
+}
+
+void Compiler::A_Comp_MCR_MRC()
+{
+    // The instruction decoder already turned wrong-coprocessor accesses into
+    // ak_UNK, so an ARM9 block only sees cp15 here. ARM7 (cp14 log stub) and
+    // rd == 15 keep the exact interpreter fallback.
+    const bool mrc = CurInstr.Instr & (1 << 20);
+    const int rd = CurInstr.A_Reg(12);
+
+    if (Num != 0 || rd == 15)
+    {
+        SaveCycles();
+        SaveCPSR();
+        RegCache.Flush();
+        MOV(X0, RCPU);
+        QuickCallFunction(X1, mrc ? ARMInterpreter::A_MRC : ARMInterpreter::A_MCR);
+        LoadCycles();
+        LoadCPSR();
+        return;
+    }
+
+    const u32 id = (((CurInstr.Instr >> 16) & 0xF) << 8)
+        | ((CurInstr.Instr & 0xF) << 4)
+        | ((CurInstr.Instr >> 5) & 0x7);
+
+    // user mode raises UNK through the interpreter; that path needs every
+    // mapped register coherent in memory (exception entry rebanks R8-R14),
+    // so sync all of them around the call without disturbing the mappings
+    ANDI2R(W0, RCPSR, 0x1F);
+    CMP(W0, 0x10);
+    FixupBranch privileged = B(CC_NEQ);
+
+    SaveCycles();
+    SaveCPSR();
+    {
+        BitSet32 loadedRegs(RegCache.LoadedRegs);
+        for (int reg : loadedRegs)
+            SaveReg(reg, RegCache.Mapping[reg]);
+    }
+    MOV(X0, RCPU);
+    QuickCallFunction(X1, mrc ? ARMInterpreter::A_MRC : ARMInterpreter::A_MCR);
+    {
+        BitSet32 loadedRegs(RegCache.LoadedRegs);
+        for (int reg : loadedRegs)
+            LoadReg(reg, RegCache.Mapping[reg]);
+    }
+    LoadCycles();
+    LoadCPSR();
+    FixupBranch done = B();
+
+    SetJumpTarget(privileged);
+    // hot path: call the cp15 accessor directly, keeping the register cache
+    // mapped; only live caller-saved registers spill around the call
+    if (mrc)
+    {
+        ARM64Reg rdMapped = MapReg(rd);
+        MOVI2R(W1, id);
+        MOV(X0, RCPU);
+        PushRegs(false, false);
+        QuickCallFunction(X2, CP15ReadTrampoline);
+        PopRegs(false, false);
+        MOV(rdMapped, W0);
+    }
+    else
+    {
+        MOV(W2, MapReg(rd));
+        MOVI2R(W1, id);
+        MOV(X0, RCPU);
+        PushRegs(false, false);
+        QuickCallFunction(X3, CP15WriteTrampoline);
+        PopRegs(false, false);
+    }
+
+    // interpreter accounting: MCR = CI(1+1), MRC = CI(2+1); emitted as a
+    // runtime add so the user-mode path (interpreter-accounted) never
+    // double-counts through ConstantCycles
+    IrregularCycles = true;
+    {
+        s32 cycles = ((R15 & 0x2) ? 0 : CurInstr.CodeCycles) + (mrc ? 3 : 2);
+        ADD(RCycles, RCycles, cycles);
+    }
+    SetJumpTarget(done);
+}
+
 void Compiler::A_Comp_MSR()
 {
     Comp_AddCycles_C();
@@ -606,7 +699,7 @@ const Compiler::CompileFunc A_Comp[ARMInstrInfo::ak_Count] =
     // Branch
     F(BranchImm), F(BranchImm), F(BranchImm), F(BranchXchangeReg), F(BranchXchangeReg),
     // Special
-    NULL, F(MSR), F(MSR), F(MRS), NULL, NULL, NULL,
+    NULL, F(MSR), F(MSR), F(MRS), F(MCR_MRC), F(MCR_MRC), NULL,
     &Compiler::Nop
 };
 #undef F

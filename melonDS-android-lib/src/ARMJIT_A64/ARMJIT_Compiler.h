@@ -160,6 +160,7 @@ public:
 
     void A_Comp_MRS();
     void A_Comp_MSR();
+    void A_Comp_MCR_MRC();
 
     void T_Comp_ShiftImm();
     void T_Comp_AddSub_();
