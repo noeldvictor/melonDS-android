@@ -177,9 +177,17 @@ void SlowWrite7(u32 addr, u32 val)
         NDS::Current->ARM7Write8(addr, val);
 }
 
+std::atomic<u64> JitSlowBlockLoads {0};
+std::atomic<u64> JitSlowBlockStores {0};
+u64 JitFallbackCountsARM[ARMInstrInfo::ak_Count] = {};
+u64 JitFallbackCountsThumb[ARMInstrInfo::tk_Count] = {};
+const u32 JitFallbackCountsARMSize = ARMInstrInfo::ak_Count;
+const u32 JitFallbackCountsThumbSize = ARMInstrInfo::tk_Count;
+
 template <bool Write, int ConsoleType>
 void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
+    (Write ? JitSlowBlockStores : JitSlowBlockLoads).fetch_add(1, std::memory_order_relaxed);
     addr &= ~0x3;
     for (u32 i = 0; i < num; i++)
     {
@@ -194,6 +202,7 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 template <bool Write, int ConsoleType>
 void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
 {
+    (Write ? JitSlowBlockStores : JitSlowBlockLoads).fetch_add(1, std::memory_order_relaxed);
     addr &= ~0x3;
     for (u32 i = 0; i < num; i++)
     {

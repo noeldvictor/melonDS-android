@@ -36,8 +36,21 @@
 
 #include "ARMJIT_Compiler.h"
 
+#include <atomic>
+
 namespace melonDS
 {
+
+// JIT diagnostics. Slow block-transfer executions split by direction so the
+// LDM/POP fast-path win is measurable; interpreter-fallback executions per
+// instruction kind so hot missing JIT ops are identifiable. The fallback
+// arrays are written by JIT-emitted code on the emulation thread only.
+extern std::atomic<u64> JitSlowBlockLoads;
+extern std::atomic<u64> JitSlowBlockStores;
+extern u64 JitFallbackCountsARM[];
+extern u64 JitFallbackCountsThumb[];
+extern const u32 JitFallbackCountsARMSize;
+extern const u32 JitFallbackCountsThumbSize;
 class ARM;
 
 class JitBlock;

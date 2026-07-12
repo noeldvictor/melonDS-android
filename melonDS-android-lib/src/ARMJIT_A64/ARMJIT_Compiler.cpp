@@ -742,6 +742,11 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         {
             if (comp == NULL)
             {
+                // count interpreter-fallback executions per kind (diagnostic)
+                MOVP2R(X0, &JitFallbackCountsThumb[CurInstr.Info.Kind]);
+                LDR(INDEX_UNSIGNED, X1, X0, 0);
+                ADDI2R(X1, X1, 1);
+                STR(INDEX_UNSIGNED, X1, X0, 0);
                 MOV(X0, RCPU);
                 QuickCallFunction(X1, InterpretTHUMB[CurInstr.Info.Kind]);
             }
@@ -759,6 +764,10 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
                     (this->*comp)();
                 else
                 {
+                    MOVP2R(X0, &JitFallbackCountsARM[CurInstr.Info.Kind]);
+                    LDR(INDEX_UNSIGNED, X1, X0, 0);
+                    ADDI2R(X1, X1, 1);
+                    STR(INDEX_UNSIGNED, X1, X0, 0);
                     MOV(X0, RCPU);
                     QuickCallFunction(X1, ARMInterpreter::A_BLX_IMM);
                 }
@@ -777,6 +786,11 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
                 if (comp == NULL)
                 {
+                    // count interpreter-fallback executions per kind (diagnostic)
+                    MOVP2R(X0, &JitFallbackCountsARM[CurInstr.Info.Kind]);
+                    LDR(INDEX_UNSIGNED, X1, X0, 0);
+                    ADDI2R(X1, X1, 1);
+                    STR(INDEX_UNSIGNED, X1, X0, 0);
                     MOV(X0, RCPU);
                     QuickCallFunction(X1, InterpretARM[CurInstr.Info.Kind]);
                 }
