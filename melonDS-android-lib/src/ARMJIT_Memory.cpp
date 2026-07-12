@@ -472,6 +472,7 @@ void ARMJIT_Memory::Mapping::Unmap(int region, melonDS::NDS& nds) noexcept
 #ifndef __SWITCH__
     u32 dtcmEnd = dtcmStart + dtcmSize;
     if (Num == 0
+        && region != memregion_DTCM
         && dtcmEnd >= Addr
         && dtcmStart < Addr + Size)
     {
@@ -539,7 +540,9 @@ void ARMJIT_Memory::RemapDTCM(u32 newBase, u32 newSize) noexcept
     // by unmapping DTCM first and then map the holes
     u32 oldDTCMBase = NDS.ARM9.DTCMBase;
     u32 oldDTCMSize = ~NDS.ARM9.DTCMMask + 1;
-    u32 oldDTCMEnd = oldDTCMBase + NDS.ARM9.DTCMMask;
+    // DTCMMask is a high address mask, not size-1, so base+DTCMMask underflows to
+    // base-size. Use the half-open end (base+size) the overlap tests expect.
+    u32 oldDTCMEnd = oldDTCMBase + oldDTCMSize;
 
     u32 newEnd = newBase + newSize;
 
@@ -662,7 +665,15 @@ bool ARMJIT_Memory::MapAtAddress(u32 addr) noexcept
     u32 dtcmSize = ~NDS.ARM9.DTCMMask + 1;
     u32 dtcmEnd = dtcmStart + dtcmSize;
 #ifndef __SWITCH__
+    // The DTCM "hole" carve-out is only for OTHER ARM9 regions that overlap the
+    // DTCM window (DTCM has its own mapping that must show through). When mapping
+    // the DTCM region itself, mirror == the DTCM window exactly, so both inner
+    // MapIntoRange calls are skipped and ZERO host pages get mapped -- yet the
+    // status loop below (skipDTCM false for region==DTCM) marks them MappedRW.
+    // That leaves every DTCM page RW-but-unmapped, faulting on every fastmem
+    // access. Guard the carve-out so the DTCM region maps its whole window.
     if (num == 0
+        && region != memregion_DTCM
         && dtcmEnd >= mirrorStart
         && dtcmStart < mirrorStart + mirrorSize)
     {
