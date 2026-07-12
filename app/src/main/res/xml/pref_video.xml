@@ -78,6 +78,13 @@
             app:iconSpaceReserved="false"
             android:defaultValue="false" />
 
+    <SwitchPreference
+            android:key="enable_filter_disk_cache"
+            android:title="@string/filter_disk_cache"
+            android:summary="@string/filter_disk_cache_summary"
+            app:iconSpaceReserved="false"
+            android:defaultValue="true" />
+
     <me.magnum.melonds.ui.settings.preferences.StoragePickerPreference
             android:key="video_retroarch_shader_root"
             android:title="@string/video_retroarch_shader_root_title"

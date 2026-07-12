@@ -117,6 +117,7 @@ typedef struct
     bool hgEngineFixEnabled;
     bool loadTexturePacks;
     bool dumpTextures;
+    bool enableFilterDiskCache;
     int consoleType;
     AudioSettings audioSettings;
     int rewindEnabled;

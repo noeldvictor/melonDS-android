@@ -360,6 +360,10 @@
     <string name="load_texture_packs">Load texture packs</string>
     <string name="load_texture_packs_summary">Replace textures using packs placed in texturepacks/&lt;GAMECODE&gt; in the app directory.</string>
     <string name="dump_textures">Dump textures</string>
+    <string name="filter_disk_cache">Filter disk cache</string>
+    <string name="filter_disk_cache_summary">Store filtered 3D textures on disk so revisited scenes skip the CPU filter</string>
+    <string name="filter_disk_cache_summary_with_size">Store filtered 3D textures on disk so revisited scenes skip the CPU filter.
+Location: %1$s (currently %2$d MB, capped at 256 MB)</string>
     <string name="dump_textures_summary">Write the textures used by the game to texturedumps/&lt;GAMECODE&gt; in the app directory.</string>
     <string name="internal_resolution">Internal resolution</string>
     <string name="renderer">Renderer</string>

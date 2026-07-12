@@ -179,6 +179,7 @@ class SharedPreferencesSettingsRepository(
         val bgLayerFilterMode: Int,
         val loadTexturePacks: Boolean,
         val dumpTextures: Boolean,
+        val enableFilterDiskCache: Boolean = true,
     )
     private data class RenderConfigurationInputs(
         val core: CoreRenderConfigurationInputs,
@@ -258,19 +259,24 @@ class SharedPreferencesSettingsRepository(
         }
 
         val hdFilterInputsFlow = combine(
-            getHdTextureFilterMode(),
-            getObjSpriteFilterMode(),
-            getBgLayerFilterMode(),
-            isTexturePackLoadEnabled(),
-            isTextureDumpEnabled(),
-        ) { hdTextureFilterMode, objSpriteFilterMode, bgLayerFilterMode, loadTexturePacks, dumpTextures ->
-            HdFilterConfigurationInputs(
-                hdTextureFilterMode,
-                objSpriteFilterMode,
-                bgLayerFilterMode,
-                loadTexturePacks,
-                dumpTextures,
-            )
+            combine(
+                getHdTextureFilterMode(),
+                getObjSpriteFilterMode(),
+                getBgLayerFilterMode(),
+                isTexturePackLoadEnabled(),
+                isTextureDumpEnabled(),
+            ) { hdTextureFilterMode, objSpriteFilterMode, bgLayerFilterMode, loadTexturePacks, dumpTextures ->
+                HdFilterConfigurationInputs(
+                    hdTextureFilterMode,
+                    objSpriteFilterMode,
+                    bgLayerFilterMode,
+                    loadTexturePacks,
+                    dumpTextures,
+                )
+            },
+            isFilterDiskCacheEnabled(),
+        ) { inputs, filterDiskCache ->
+            inputs.copy(enableFilterDiskCache = filterDiskCache)
         }
 
         val renderInputsFlow = combine(fullCoreRenderInputsFlow, coverageFixInputsFlow, hdFilterInputsFlow) { core, coverageFix, hdFilter ->
@@ -312,6 +318,7 @@ class SharedPreferencesSettingsRepository(
                 renderInputs.hdFilter.bgLayerFilterMode,
                 renderInputs.hdFilter.loadTexturePacks,
                 renderInputs.hdFilter.dumpTextures,
+                renderInputs.hdFilter.enableFilterDiskCache,
                 if (effectiveFiltering == VideoFiltering.RETROARCH) retroArchShader else EmptyRetroArchShaderConfiguration,
             )
         }.conflate().shareIn(preferencesCoroutineScope, SharingStarted.Lazily, replay = 1)
@@ -1183,6 +1190,12 @@ class SharedPreferencesSettingsRepository(
     private fun isTextureDumpEnabled(): Flow<Boolean> {
         return getOrCreatePreferenceSharedFlow("enable_texture_dumping") {
             preferences.getBoolean("enable_texture_dumping", false)
+        }
+    }
+
+    private fun isFilterDiskCacheEnabled(): Flow<Boolean> {
+        return getOrCreatePreferenceSharedFlow("enable_filter_disk_cache") {
+            preferences.getBoolean("enable_filter_disk_cache", true)
         }
     }
 

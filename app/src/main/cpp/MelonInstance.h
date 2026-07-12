@@ -231,6 +231,8 @@ private:
     std::unique_ptr<RetroAchievements::RetroAchievementsManager> retroAchievementsManager;
     std::unique_ptr<melonDS::HDTexPack> hdTexPack;
     std::string hdTexPackState;
+    std::unique_ptr<melonDS::HDTexPack> hdTexFilterCache;
+    std::string hdTexFilterCacheState;
     melonDS::HDPack2D hdPack2D;
     std::unique_ptr<SaveManager> ndsSave;
     std::unique_ptr<SaveManager> gbaSave;

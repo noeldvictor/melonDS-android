@@ -88,6 +88,26 @@ class VideoPreferencesFragment : BasePreferenceFragment(), PreferenceFragmentTit
         setPreferencesFromResource(R.xml.pref_video, rootKey)
         adrenoVulkanDriverManager = AdrenoVulkanDriverManager(requireContext(), settingsRepository)
 
+        // surface the filter disk cache location and current size in the
+        // preference summary; the size scan runs off the main thread
+        findPreference<SwitchPreference>("enable_filter_disk_cache")?.let { cachePreference ->
+            val cacheRoot = java.io.File(requireContext().filesDir, "filtercache")
+            lifecycleScope.launch {
+                val sizeMb = withContext(Dispatchers.IO) {
+                    if (cacheRoot.exists()) {
+                        cacheRoot.walkTopDown().filter { it.isFile }.sumOf { it.length() } / (1024L * 1024L)
+                    } else {
+                        0L
+                    }
+                }
+                cachePreference.summary = getString(
+                    R.string.filter_disk_cache_summary_with_size,
+                    cacheRoot.absolutePath,
+                    sizeMb,
+                )
+            }
+        }
+
         val launchedInGame = requireActivity().intent.getBooleanExtra(SettingsActivity.KEY_IN_GAME, false)
         val rendererPreference = findPreference<InGameLockedListPreference>("video_renderer")!!
         val internalResolutionPreference = findPreference<InGameLockedListPreference>("video_internal_resolution")!!

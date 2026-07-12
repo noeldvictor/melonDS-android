@@ -212,6 +212,7 @@ MelonDSAndroid::EmulatorConfiguration MelonDSAndroidConfiguration::buildEmulator
     MelonDSAndroid::Renderer videoRenderer = static_cast<MelonDSAndroid::Renderer>(env->GetIntField(videoRendererEnum, env->GetFieldID(videoRendererEnumClass, "renderer", "I")));
     jboolean loadTexturePacks = env->GetBooleanField(rendererConfigurationObject, env->GetFieldID(renderConfigurationClass, "loadTexturePacks", "Z"));
     jboolean dumpTextures = env->GetBooleanField(rendererConfigurationObject, env->GetFieldID(renderConfigurationClass, "dumpTextures", "Z"));
+    jboolean enableFilterDiskCache = env->GetBooleanField(rendererConfigurationObject, env->GetFieldID(renderConfigurationClass, "enableFilterDiskCache", "Z"));
     jstring dsBios7String = dsBios7Uri ? (jstring) env->CallObjectMethod(dsBios7Uri, uriToStringMethod) : nullptr;
     jstring dsBios9String = dsBios9Uri ? (jstring) env->CallObjectMethod(dsBios9Uri, uriToStringMethod) : nullptr;
     jstring dsFirmwareString = dsFirmwareUri ? (jstring) env->CallObjectMethod(dsFirmwareUri, uriToStringMethod) : nullptr;
@@ -245,6 +246,7 @@ MelonDSAndroid::EmulatorConfiguration MelonDSAndroidConfiguration::buildEmulator
     finalEmulatorConfiguration.hgEngineFixEnabled = hgEngineFixEnabled;
     finalEmulatorConfiguration.loadTexturePacks = loadTexturePacks;
     finalEmulatorConfiguration.dumpTextures = dumpTextures;
+    finalEmulatorConfiguration.enableFilterDiskCache = enableFilterDiskCache;
     finalEmulatorConfiguration.consoleType = consoleType;
     finalEmulatorConfiguration.audioSettings = MelonDSAndroid::AudioSettings {
         .soundEnabled = (bool) soundEnabled,

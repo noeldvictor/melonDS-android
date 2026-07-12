@@ -4299,6 +4299,79 @@ void MelonInstance::applyTexturePack(const EmulatorConfiguration& config)
 
     if (vulkanOutput)
         vulkanOutput->setReplacement2DActive(pack != nullptr && pack->LoadActive() && pack->Has2DEntries());
+
+    // Persistent filter disk cache: one self-populating pack per
+    // filter/scale/game at files/filtercache/<filter>_x<scale>_<GAMECODE>,
+    // loading and dumping into the same directory. Filter names and the
+    // pack key/filename format match the desktop implementation, so cache
+    // folders are cross-platform compatible in principle. Independent of
+    // the texturedumps/texturepacks directories, so pack dumping and the
+    // filter cache can coexist.
+    melonDS::HDTexPack* filterCache = nullptr;
+    if (cart && currentRenderer == Renderer::Vulkan && config.enableFilterDiskCache)
+    {
+        auto& vulkanRenderSettings = static_cast<VulkanRenderSettings&>(*config.renderSettings);
+        const int filterMode = vulkanRenderSettings.hdTextureFilterMode;
+        const int filterScale = getConfiguredVulkanScale(vulkanRenderSettings);
+        if (filterMode >= 1 && filterMode <= 13 && filterScale > 1)
+        {
+            static const char* kFilterNames[] = {
+                "off", "linear", "smoothstep", "scale2x", "hq2x-lite", "2xsai-lite",
+                "supereagle-lite", "mmpx-lite", "anime4k-lite", "super2xsai-strong",
+                "supereagle-smooth", "crisp-gradient", "crisp-edge-aa", "scalefx"
+            };
+
+            std::string gameCode(cart->GetHeader().GameCode, 4);
+            for (char& ch : gameCode)
+                if (ch < 0x21 || ch > 0x7E || ch == '/' || ch == '\\' || ch == ':') ch = '_';
+
+            const int cacheScale = std::min(filterScale, 4);
+            char sub[96];
+            snprintf(sub, sizeof(sub), "filtercache/%s_x%d_%s",
+                     kFilterNames[filterMode], cacheScale, gameCode.c_str());
+            std::string dir = MelonDSAndroid::internalFilesDir + "/" + sub;
+
+            if (!hdTexFilterCache || hdTexFilterCacheState != dir)
+            {
+                // size budget: an unbounded cache is unacceptable on a
+                // handheld. Over budget, keep serving hits but stop dumping
+                // new entries for this session (no eviction this round).
+                constexpr unsigned long long kFilterCacheBudgetBytes = 256ull * 1024 * 1024;
+                unsigned long long folderBytes = 0;
+                {
+                    std::error_code ec;
+                    for (auto it = std::filesystem::recursive_directory_iterator(std::filesystem::u8path(dir), ec);
+                         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+                    {
+                        if (it->is_regular_file(ec))
+                            folderBytes += it->file_size(ec);
+                    }
+                }
+                bool dumpAllowed = folderBytes <= kFilterCacheBudgetBytes;
+                if (!dumpAllowed)
+                    Platform::Log(
+                        Platform::LogLevel::Warn,
+                        "HDTexPack: filter cache %s is over budget (%llu MiB), serving hits only",
+                        dir.c_str(),
+                        folderBytes / (1024ull * 1024ull));
+
+                hdTexFilterCache = std::make_unique<melonDS::HDTexPack>(dir, dir, true, dumpAllowed);
+                hdTexFilterCacheState = dir;
+            }
+            filterCache = hdTexFilterCache.get();
+        }
+    }
+
+    if (auto* vulkan = dynamic_cast<VulkanRenderer3D*>(&renderer3d))
+        vulkan->SetFilterCache(filterCache);
+    else if (auto* compute = dynamic_cast<ComputeRenderer*>(&renderer3d))
+        compute->SetFilterCache(nullptr);
+
+    if (filterCache == nullptr && hdTexFilterCache)
+    {
+        hdTexFilterCache.reset();
+        hdTexFilterCacheState.clear();
+    }
 }
 
 void MelonInstance::updateRenderer()

@@ -20,6 +20,7 @@ data class RendererConfiguration(
     val bgLayerFilterMode: Int,
     val loadTexturePacks: Boolean,
     val dumpTextures: Boolean,
+    @JvmField val enableFilterDiskCache: Boolean,
     val retroArchShader: RetroArchShaderConfiguration,
 ) {
 
