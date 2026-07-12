@@ -312,6 +312,7 @@ private:
     Renderer currentRenderer;
     std::atomic<bool> isRenderConfigurationDirty;
     bool vulkanRuntimeConfigLogged;
+    bool jitStateLogged = false;
     bool vulkanRuntimeFailureHandled;
     int vulkanPrepareFailureCount;
     u64 vulkanSoftPackedMissingWindow = 0;

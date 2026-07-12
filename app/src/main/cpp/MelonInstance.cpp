@@ -1596,6 +1596,21 @@ u32 MelonInstance::runFrame()
         ndsRunEndNs = PerfNowNs();
         vulkanNdsRunCpuWindow.Add(ndsRunEndNs - ndsRunStartNs);
     }
+#ifdef JIT_ENABLED
+    if (!jitStateLogged)
+    {
+        // one-time report of the ACTUAL JIT/fastmem state: the settings only
+        // record what was requested, the core may have degraded silently
+        jitStateLogged = true;
+        Platform::Log(
+            Platform::LogLevel::Warn,
+            "CoreJit[State]: jit=%d fastmem=%d fastmemSupported=%d pageSize=%u",
+            nds->IsJITEnabled() ? 1 : 0,
+            nds->JIT.FastMemoryEnabled() ? 1 : 0,
+            melonDS::ARMJIT_Memory::IsFastMemSupported() ? 1 : 0,
+            melonDS::ARMJIT_Memory::PageSize);
+    }
+#endif
     retroAchievementsManager->FrameUpdate();
 
     // 2D sprite/BG tile dumping and replacement lookup ride the frame the
@@ -4695,6 +4710,55 @@ void MelonInstance::logVulkanPerformanceIfNeeded()
         droppedFrameAgeAvgMs,
         PerfNsToMs(queueStats.DroppedFrameAgeMaxNs)
     );
+#ifdef JIT_ENABLED
+    if (nds && nds->IsJITEnabled())
+    {
+        // cumulative fastmem fault-handler activity: sustained slowRewrites
+        // growth means fastmem keeps degrading accesses to the slow path
+        Platform::Log(
+            Platform::LogLevel::Warn,
+            "CorePerf[Fastmem]: faults=%llu mapFixups=%llu slowRewrites=%llu slowBlockLoads=%llu slowBlockStores=%llu",
+            static_cast<unsigned long long>(nds->JIT.Memory.FastMemFaults.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(nds->JIT.Memory.FastMemMapFixups.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(nds->JIT.Memory.FastMemSlowRewrites.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(melonDS::JitSlowBlockLoads.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(melonDS::JitSlowBlockStores.load(std::memory_order_relaxed)));
+
+        // top interpreter-fallback kinds (cumulative execution counts); kind
+        // indices map to ARMInstrInfo enums
+        u64 topCounts[4] = {};
+        u32 topKinds[4] = {};
+        const auto collectTop = [&](const melonDS::u64* counts, melonDS::u32 size) {
+            for (int i = 0; i < 4; i++) { topCounts[i] = 0; topKinds[i] = 0; }
+            for (melonDS::u32 k = 0; k < size; k++)
+            {
+                melonDS::u64 c = counts[k];
+                for (int i = 0; i < 4; i++)
+                {
+                    if (c > topCounts[i])
+                    {
+                        for (int j = 3; j > i; j--) { topCounts[j] = topCounts[j-1]; topKinds[j] = topKinds[j-1]; }
+                        topCounts[i] = c; topKinds[i] = k;
+                        break;
+                    }
+                }
+            }
+        };
+
+        char fallbackLine[256];
+        int len = 0;
+        collectTop(melonDS::JitFallbackCountsARM, melonDS::JitFallbackCountsARMSize);
+        len += snprintf(fallbackLine + len, sizeof(fallbackLine) - len, "arm(");
+        for (int i = 0; i < 4 && topCounts[i] != 0; i++)
+            len += snprintf(fallbackLine + len, sizeof(fallbackLine) - len, "%sk%u=%llu", i ? " " : "", topKinds[i], static_cast<unsigned long long>(topCounts[i]));
+        len += snprintf(fallbackLine + len, sizeof(fallbackLine) - len, ") thumb(");
+        collectTop(melonDS::JitFallbackCountsThumb, melonDS::JitFallbackCountsThumbSize);
+        for (int i = 0; i < 4 && topCounts[i] != 0; i++)
+            len += snprintf(fallbackLine + len, sizeof(fallbackLine) - len, "%sk%u=%llu", i ? " " : "", topKinds[i], static_cast<unsigned long long>(topCounts[i]));
+        snprintf(fallbackLine + len, sizeof(fallbackLine) - len, ")");
+        Platform::Log(Platform::LogLevel::Warn, "CorePerf[JitFallback]: %s", fallbackLine);
+    }
+#endif
     Platform::Log(
         Platform::LogLevel::Warn,
         "VulkanPerf[InstancePhases]: setup cpu avg=%.3fms p95=%.3fms max=%.3fms nds cpu avg=%.3fms p95=%.3fms max=%.3fms post cpu avg=%.3fms p95=%.3fms max=%.3fms",
