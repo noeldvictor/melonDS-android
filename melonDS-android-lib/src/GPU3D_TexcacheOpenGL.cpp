@@ -57,6 +57,22 @@ void TexcacheOpenGLLoader::UploadTexture(GLuint handle, u32 width, u32 height, u
         GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, uploadData);
 }
 
+void TexcacheOpenGLLoader::FilterTexture(const u32* src, u32 width, u32 height, std::vector<u32>& dst)
+{
+    const u32 storageScale = GetStorageScale();
+    HDTextureFilter::UpscaleTexture(src, width, height, storageScale, HDTextureFilterMode, dst);
+}
+
+void TexcacheOpenGLLoader::UploadPrefiltered(GLuint handle, u32 width, u32 height, u32 layer, const u32* data)
+{
+    const u32 storageScale = GetStorageScale();
+    glBindTexture(GL_TEXTURE_2D_ARRAY, handle);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY,
+        0, 0, 0, layer,
+        width * storageScale, height * storageScale, 1,
+        GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, data);
+}
+
 void TexcacheOpenGLLoader::UploadReplacement(GLuint handle, u32 width, u32 height, u32 layer, const HDTexPackImage& img)
 {
     const u32 storageScale = GetStorageScale();

@@ -194,6 +194,26 @@ public:
         return SetHDTextureFilter(scale, mode, []() {});
     }
 
+    // Persistent disk cache of filtered textures: a self-populating pack
+    // keyed by the same content hashes, one directory per filter/scale/game.
+    // First sight of a texture filters and stores it; later sessions load
+    // the stored image instead of re-running the filter.
+    template <typename BeforeMutationT>
+    void SetFilterCache(HDTexPack* cache, BeforeMutationT&& beforeMutation)
+    {
+        if (FilterCache == cache)
+            return;
+
+        std::forward<BeforeMutationT>(beforeMutation)();
+        FilterCache = cache;
+        Reset();
+    }
+
+    void SetFilterCache(HDTexPack* cache)
+    {
+        SetFilterCache(cache, []() {});
+    }
+
     u32 GetHDTextureScale() const
     {
         // effective stored-texel scale: filter scale and/or texture-pack scale
@@ -395,9 +415,41 @@ public:
         entry.Texture = storagePlace;
 
         if (replacement)
+        {
             TexLoader.UploadReplacement(storagePlace.TextureID, width, height, storagePlace.Layer, *replacement);
+        }
+        else if (FilterCache && TexLoader.GetHDTextureFilterMode() != 0 && TexLoader.GetStorageScale() > 1)
+        {
+            u64 packTexHash = entry.TextureHash[0];
+            if (entry.TextureRAMSize[1])
+                packTexHash = XXH64(entry.TextureHash, sizeof(u64)*2, 0);
+            bool hasPal = (fmt != 7);
+            u64 packPalHash = 0;
+            if (fmt == 5)
+                packPalHash = CompressedUsedPalHash(gpu, slot1addr, entry.TexPalStart, width, height);
+            else if (hasPal)
+                packPalHash = entry.TexPalHash;
+
+            const u32 storageScale = TexLoader.GetStorageScale();
+            const HDTexPackImage* cached =
+                FilterCache->LookupTexture(width, height, packTexHash, packPalHash, hasPal, fmt);
+            if (cached && cached->Width == width * storageScale && cached->Height == height * storageScale)
+            {
+                TexLoader.UploadReplacement(storagePlace.TextureID, width, height, storagePlace.Layer, *cached);
+            }
+            else
+            {
+                TexLoader.FilterTexture(DecodingBuffer, width, height, FilteredBuffer);
+                FilterCache->DumpTexture(width, height, packTexHash, packPalHash, hasPal, fmt,
+                                         FilteredBuffer.data(), storageScale);
+                TexLoader.UploadPrefiltered(storagePlace.TextureID, width, height, storagePlace.Layer,
+                                            FilteredBuffer.data());
+            }
+        }
         else
+        {
             TexLoader.UploadTexture(storagePlace.TextureID, width, height, storagePlace.Layer, DecodingBuffer);
+        }
         //printf("using storage place %d %d | %d %d (%d)\n", width, height, storagePlace.TexArrayIdx, storagePlace.LayerIdx, array.ImageDescriptor);
 
         textureHandle = storagePlace.TextureID;
@@ -441,6 +493,7 @@ private:
     std::unordered_map<u64, TexCacheEntry> Cache;
 
     HDTexPack* TexPack = nullptr;
+    HDTexPack* FilterCache = nullptr;
 
     TexLoaderT TexLoader;
 
@@ -448,6 +501,7 @@ private:
     std::vector<TexHandleT> TexArrays[8][8];
 
     u32 DecodingBuffer[1024*1024];
+    std::vector<u32> FilteredBuffer;
 };
 
 }

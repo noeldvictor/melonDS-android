@@ -310,9 +310,11 @@ void HDTexPack::AppendManifest(const char* subdir, const std::string& line)
 }
 
 void HDTexPack::DumpTexture(u32 width, u32 height, u64 texHash,
-                            u64 palHash, bool hasPal, u32 fmt, const u32* rgb6a5)
+                            u64 palHash, bool hasPal, u32 fmt, const u32* rgb6a5,
+                            u32 scale)
 {
     if (!DumpEnabled) return;
+    if (scale < 1) scale = 1;
 
     u64 key = MapKey(width, height, texHash, hasPal ? palHash : 0, fmt, hasPal);
     if (!DumpedKeys.insert(DumpKey(key, "tex1")).second) return;
@@ -322,17 +324,18 @@ void HDTexPack::DumpTexture(u32 width, u32 height, u64 texHash,
     snprintf(nameBuf, sizeof(nameBuf), "tex1_%ux%u_%s_%s_%u",
              width, height, Hash16(texHash).c_str(), palStr.c_str(), fmt);
 
-    std::vector<u32> rgba((size_t)width * height);
+    const u32 pw = width * scale, ph = height * scale;
+    std::vector<u32> rgba((size_t)pw * ph);
     for (size_t i = 0; i < rgba.size(); i++)
         rgba[i] = RGB6A5ToRGBA8(rgb6a5[i]);
 
-    WriteDumpPNG("textures", nameBuf, width, height, rgba.data());
+    WriteDumpPNG("textures", nameBuf, pw, ph, rgba.data());
 
     char line[256];
     snprintf(line, sizeof(line),
-             "{\"kind\":\"tex1\",\"w\":%u,\"h\":%u,\"texhash\":\"%s\",\"palhash\":%s%s%s,\"fmt\":%u}",
+             "{\"kind\":\"tex1\",\"w\":%u,\"h\":%u,\"texhash\":\"%s\",\"palhash\":%s%s%s,\"fmt\":%u,\"scale\":%u}",
              width, height, Hash16(texHash).c_str(),
-             hasPal ? "\"" : "", hasPal ? palStr.c_str() : "null", hasPal ? "\"" : "", fmt);
+             hasPal ? "\"" : "", hasPal ? palStr.c_str() : "null", hasPal ? "\"" : "", fmt, scale);
     AppendManifest("textures", line);
 }
 

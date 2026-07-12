@@ -53,6 +53,7 @@ public:
 
     void SetupAccelFrame() override;
     void SetTexPack(HDTexPack* pack) { Texcache.SetTexPack(pack); }
+    void SetFilterCache(HDTexPack* cache) { Texcache.SetFilterCache(cache); }
     // texture sampling uses normalized coordinates, so scaled storage needs
     // no shader-side changes here
     void SetHDTextureFilter(int scale, int mode) { Texcache.SetHDTextureFilter(scale, mode); }

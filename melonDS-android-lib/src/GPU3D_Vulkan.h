@@ -56,6 +56,7 @@ public:
     void PrepareCaptureFrame() override;
     void BeginCaptureFrame() override;
     void SetTexPack(HDTexPack* pack);
+    void SetFilterCache(HDTexPack* cache);
     void SetHDTextureFilter(int scale, int mode);
     void SetCaptureScreenSwapHint(bool screenSwap) override;
     [[nodiscard]] bool UsesStructured2DMetadata() const noexcept override { return ActiveBackendMode == BackendMode::GraphicsHardware; }

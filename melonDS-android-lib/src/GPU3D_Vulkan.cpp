@@ -1544,6 +1544,14 @@ void VulkanRenderer3D::SetTexPack(HDTexPack* pack)
     refreshHDTextureSampling();
 }
 
+void VulkanRenderer3D::SetFilterCache(HDTexPack* cache)
+{
+    Texcache.SetFilterCache(cache, [this]() {
+        if (Initialized && ActiveBackendMode == BackendMode::GraphicsHardware)
+            (void)waitForTextureCacheMutationSafePoint();
+    });
+}
+
 void VulkanRenderer3D::SetHDTextureFilter(int scale, int mode)
 {
     Texcache.SetHDTextureFilter(scale, mode, [this]() {

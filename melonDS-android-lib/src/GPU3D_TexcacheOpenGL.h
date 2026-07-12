@@ -25,6 +25,8 @@ public:
     }
 
     void SetTexPackScale(u32 scale);
+    void FilterTexture(const u32* src, u32 width, u32 height, std::vector<u32>& dst);
+    void UploadPrefiltered(GLuint handle, u32 width, u32 height, u32 layer, const u32* data);
     [[nodiscard]] u32 GetTexPackScale() const { return TexPackScale; }
 
     GLuint GenerateTexture(u32 width, u32 height, u32 layers);

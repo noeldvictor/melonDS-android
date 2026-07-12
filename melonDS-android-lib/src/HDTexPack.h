@@ -69,9 +69,12 @@ public:
     // 3D textures. hasPal is false for fmt 7 (direct bitmap).
     const HDTexPackImage* LookupTexture(u32 width, u32 height, u64 texHash,
                                         u64 palHash, bool hasPal, u32 fmt) const;
-    // rgb6a5: native-res decoded texels (r6,g6,b6,a5 in the low bits of each byte).
+    // rgb6a5 spans width*scale x height*scale texels; scale > 1 dumps a
+    // pre-filtered image that loads back as a scaled entry (scale 1 = plain
+    // native-res dump).
     void DumpTexture(u32 width, u32 height, u64 texHash,
-                     u64 palHash, bool hasPal, u32 fmt, const u32* rgb6a5);
+                     u64 palHash, bool hasPal, u32 fmt, const u32* rgb6a5,
+                     u32 scale = 1);
 
     // 2D OBJ sprites. bppTag: "4", "8" or "bmp".
     const HDTexPackImage* LookupSprite(u32 width, u32 height, u64 tileHash,

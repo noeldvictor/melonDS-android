@@ -34,6 +34,10 @@ public:
     TextureHandle GenerateTexture(u32 width, u32 height, u32 layers);
     void UploadTexture(TextureHandle handle, u32 width, u32 height, u32 layer, void* data);
     void UploadReplacement(TextureHandle handle, u32 width, u32 height, u32 layer, const HDTexPackImage& img);
+    // run the active filter over native-size texels into dst (storage scale)
+    void FilterTexture(const u32* src, u32 width, u32 height, std::vector<u32>& dst);
+    // upload already-filtered texels sized width*height*storageScale^2
+    void UploadPrefiltered(TextureHandle handle, u32 width, u32 height, u32 layer, const u32* data);
     void DeleteTexture(TextureHandle handle);
     bool GetTextureDescriptor(TextureHandle handle, VkDescriptorImageInfo* outImageInfo) const;
     bool IsTextureLayerOpaque(TextureHandle handle, u32 layer) const;

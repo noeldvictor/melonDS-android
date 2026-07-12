@@ -451,6 +451,36 @@ void TexcacheVulkanLoader::UploadTexture(TextureHandle handle, u32 width, u32 he
     UploadLayer(textureArray, layer, texels);
 }
 
+void TexcacheVulkanLoader::FilterTexture(const u32* src, u32 width, u32 height, std::vector<u32>& dst)
+{
+    const u32 storageScale = GetStorageScale();
+    HDTextureFilter::UpscaleTexture(src, width, height, storageScale, HDTextureFilterMode, dst);
+}
+
+void TexcacheVulkanLoader::UploadPrefiltered(TextureHandle handle, u32 width, u32 height, u32 layer, const u32* data)
+{
+    if (data == nullptr)
+        return;
+
+    if (!EnsureVulkanState())
+        return;
+
+    auto it = State->TextureArrays.find(handle);
+    if (it == State->TextureArrays.end())
+        return;
+
+    TextureArray& textureArray = it->second;
+    if (layer >= textureArray.Layers)
+        return;
+    if (textureArray.Width != width || textureArray.Height != height)
+        return;
+
+    if (layer < textureArray.LayerHDContent.size())
+        textureArray.LayerHDContent[layer] = textureArray.Scale > 1 ? 1u : 0u;
+
+    UploadLayer(textureArray, layer, data);
+}
+
 void TexcacheVulkanLoader::UploadReplacement(TextureHandle handle, u32 width, u32 height, u32 layer, const HDTexPackImage& img)
 {
     if (!EnsureVulkanState())
