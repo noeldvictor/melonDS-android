@@ -627,6 +627,13 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         }
 
         ABI_PushRegisters({30});
+        // this code is only reachable through a fault-patched call site;
+        // count executions so degraded sites are distinguishable from block
+        // transfers compiled without a fast path (X1/X2 are dead here)
+        MOVP2R(X1, &JitPatchedBlockTransfers);
+        LDR(INDEX_UNSIGNED, X2, X1, 0);
+        ADDI2R(X2, X2, 1);
+        STR(INDEX_UNSIGNED, X2, X1, 0);
     }
 
     int i = 0;

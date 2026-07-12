@@ -4717,12 +4717,72 @@ void MelonInstance::logVulkanPerformanceIfNeeded()
         // growth means fastmem keeps degrading accesses to the slow path
         Platform::Log(
             Platform::LogLevel::Warn,
-            "CorePerf[Fastmem]: faults=%llu mapFixups=%llu slowRewrites=%llu slowBlockLoads=%llu slowBlockStores=%llu",
+            "CorePerf[Fastmem]: faults=%llu mapFixups=%llu slowRewrites=%llu slowBlockLoads=%llu slowBlockStores=%llu patchedBlockXfers=%llu",
             static_cast<unsigned long long>(nds->JIT.Memory.FastMemFaults.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(nds->JIT.Memory.FastMemMapFixups.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(nds->JIT.Memory.FastMemSlowRewrites.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(melonDS::JitSlowBlockLoads.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(melonDS::JitSlowBlockStores.load(std::memory_order_relaxed)));
+            static_cast<unsigned long long>(melonDS::JitSlowBlockStores.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(melonDS::JitPatchedBlockTransfers));
+
+        {
+            char rewriteLine[224];
+            int rwlen = 0;
+            bool rwfirst = true;
+            for (melonDS::u32 r = 0; r < melonDS::ARMJIT_Memory::memregions_Count; r++)
+            {
+                const unsigned long long v = static_cast<unsigned long long>(
+                    nds->JIT.Memory.FastMemRewriteRegions[r].load(std::memory_order_relaxed));
+                if (v == 0)
+                    continue;
+                rwlen += snprintf(rewriteLine + rwlen, sizeof(rewriteLine) - rwlen, "%sr%u=%llu",
+                                  rwfirst ? "" : " ", r, v);
+                rwfirst = false;
+            }
+            if (rwfirst)
+                snprintf(rewriteLine, sizeof(rewriteLine), "none");
+            Platform::Log(Platform::LogLevel::Warn, "CorePerf[RewriteRegions]: %s", rewriteLine);
+            Platform::Log(
+                Platform::LogLevel::Warn,
+                "CorePerf[RewriteStates]: unmapped=%llu rw=%llu prot=%llu lastDtcm(addr=%08X state=%u base=%08X)",
+                static_cast<unsigned long long>(nds->JIT.Memory.FastMemRewriteStates[0].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(nds->JIT.Memory.FastMemRewriteStates[1].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(nds->JIT.Memory.FastMemRewriteStates[2].load(std::memory_order_relaxed)),
+                nds->JIT.Memory.FastMemLastDTCMFaultAddr.load(std::memory_order_relaxed),
+                nds->JIT.Memory.FastMemLastDTCMFaultState.load(std::memory_order_relaxed),
+                nds->JIT.Memory.FastMemLastDTCMFaultBase.load(std::memory_order_relaxed));
+        }
+
+        // slow block-transfer split by target region class (indices are
+        // ARMJIT_Memory::memregion_* values)
+        {
+            char regionLine[224];
+            int rlen = 0;
+            rlen += snprintf(regionLine + rlen, sizeof(regionLine) - rlen, "arm9(");
+            bool first = true;
+            for (melonDS::u32 r = 0; r < melonDS::ARMJIT_Memory::memregions_Count; r++)
+            {
+                if (melonDS::JitSlowBlockRegions9[r] == 0)
+                    continue;
+                rlen += snprintf(regionLine + rlen, sizeof(regionLine) - rlen, "%sr%u=%llu",
+                                 first ? "" : " ", r,
+                                 static_cast<unsigned long long>(melonDS::JitSlowBlockRegions9[r]));
+                first = false;
+            }
+            rlen += snprintf(regionLine + rlen, sizeof(regionLine) - rlen, ") arm7(");
+            first = true;
+            for (melonDS::u32 r = 0; r < melonDS::ARMJIT_Memory::memregions_Count; r++)
+            {
+                if (melonDS::JitSlowBlockRegions7[r] == 0)
+                    continue;
+                rlen += snprintf(regionLine + rlen, sizeof(regionLine) - rlen, "%sr%u=%llu",
+                                 first ? "" : " ", r,
+                                 static_cast<unsigned long long>(melonDS::JitSlowBlockRegions7[r]));
+                first = false;
+            }
+            snprintf(regionLine + rlen, sizeof(regionLine) - rlen, ")");
+            Platform::Log(Platform::LogLevel::Warn, "CorePerf[SlowBlockRegions]: %s", regionLine);
+        }
 
         // top interpreter-fallback kinds (cumulative execution counts); kind
         // indices map to ARMInstrInfo enums

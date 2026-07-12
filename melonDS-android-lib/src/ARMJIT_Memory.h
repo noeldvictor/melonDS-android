@@ -139,6 +139,14 @@ public:
     std::atomic<u64> FastMemFaults {0};
     std::atomic<u64> FastMemMapFixups {0};
     std::atomic<u64> FastMemSlowRewrites {0};
+    // slow-path rewrites split by the region class of the faulting address
+    std::atomic<u64> FastMemRewriteRegions[memregions_Count] {};
+    // mapping status of the faulting page at rewrite time (0/1/2) and a
+    // snapshot of the most recent DTCM-region rewrite for diagnosis
+    std::atomic<u64> FastMemRewriteStates[4] {};
+    std::atomic<u32> FastMemLastDTCMFaultAddr {0};
+    std::atomic<u32> FastMemLastDTCMFaultState {0};
+    std::atomic<u32> FastMemLastDTCMFaultBase {0};
 
     int ClassifyAddress9(u32 addr) const noexcept;
     int ClassifyAddress7(u32 addr) const noexcept;

@@ -47,6 +47,11 @@ namespace melonDS
 // arrays are written by JIT-emitted code on the emulation thread only.
 extern std::atomic<u64> JitSlowBlockLoads;
 extern std::atomic<u64> JitSlowBlockStores;
+extern u64 JitSlowBlockRegions9[];
+extern u64 JitSlowBlockRegions7[];
+// block transfers running through a fault-degraded (patched) fast-path site,
+// as opposed to sites compiled without a fast path in the first place
+extern u64 JitPatchedBlockTransfers;
 extern u64 JitFallbackCountsARM[];
 extern u64 JitFallbackCountsThumb[];
 extern const u32 JitFallbackCountsARMSize;

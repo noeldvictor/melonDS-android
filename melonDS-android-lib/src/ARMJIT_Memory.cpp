@@ -845,6 +845,18 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
             faultDesc.FaultPC = nds.JIT.JITCompiler.RewriteMemAccess(faultDesc.FaultPC);
             nds.JIT.JitEnableExecute();
             nds.JIT.Memory.FastMemSlowRewrites.fetch_add(1, std::memory_order_relaxed);
+            const int faultRegion = nds.CurCPU == 0
+                ? nds.JIT.Memory.ClassifyAddress9(faultDesc.EmulatedFaultAddr)
+                : nds.JIT.Memory.ClassifyAddress7(faultDesc.EmulatedFaultAddr);
+            nds.JIT.Memory.FastMemRewriteRegions[faultRegion].fetch_add(1, std::memory_order_relaxed);
+            const u8 faultState = memStatus[faultDesc.EmulatedFaultAddr >> PageShift];
+            nds.JIT.Memory.FastMemRewriteStates[faultState & 3].fetch_add(1, std::memory_order_relaxed);
+            if (nds.CurCPU == 0 && faultRegion == memregion_DTCM)
+            {
+                nds.JIT.Memory.FastMemLastDTCMFaultAddr.store((u32)faultDesc.EmulatedFaultAddr, std::memory_order_relaxed);
+                nds.JIT.Memory.FastMemLastDTCMFaultState.store(faultState, std::memory_order_relaxed);
+                nds.JIT.Memory.FastMemLastDTCMFaultBase.store(nds.ARM9.DTCMBase, std::memory_order_relaxed);
+            }
         }
         else
         {

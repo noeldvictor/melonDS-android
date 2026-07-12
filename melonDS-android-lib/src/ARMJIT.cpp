@@ -179,6 +179,9 @@ void SlowWrite7(u32 addr, u32 val)
 
 std::atomic<u64> JitSlowBlockLoads {0};
 std::atomic<u64> JitSlowBlockStores {0};
+u64 JitSlowBlockRegions9[ARMJIT_Memory::memregions_Count] = {};
+u64 JitSlowBlockRegions7[ARMJIT_Memory::memregions_Count] = {};
+u64 JitPatchedBlockTransfers = 0;
 u64 JitFallbackCountsARM[ARMInstrInfo::ak_Count] = {};
 u64 JitFallbackCountsThumb[ARMInstrInfo::tk_Count] = {};
 const u32 JitFallbackCountsARMSize = ARMInstrInfo::ak_Count;
@@ -188,6 +191,7 @@ template <bool Write, int ConsoleType>
 void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
     (Write ? JitSlowBlockStores : JitSlowBlockLoads).fetch_add(1, std::memory_order_relaxed);
+    JitSlowBlockRegions9[NDS::Current->JIT.Memory.ClassifyAddress9(addr)]++;
     addr &= ~0x3;
     for (u32 i = 0; i < num; i++)
     {
@@ -203,6 +207,7 @@ template <bool Write, int ConsoleType>
 void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
 {
     (Write ? JitSlowBlockStores : JitSlowBlockLoads).fetch_add(1, std::memory_order_relaxed);
+    JitSlowBlockRegions7[NDS::Current->JIT.Memory.ClassifyAddress7(addr)]++;
     addr &= ~0x3;
     for (u32 i = 0; i < num; i++)
     {
