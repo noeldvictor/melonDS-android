@@ -501,8 +501,13 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         ? NDS.JIT.Memory.ClassifyAddress9(CurInstr.DataRegion)
         : NDS.JIT.Memory.ClassifyAddress7(CurInstr.DataRegion);
 
+    // loads take the fault-safe fast path too, mirroring the x64 backend:
+    // a fault inside the sequence rewrites it to the slow-path call, which
+    // re-runs the whole transfer from the precomputed base address in W0 and
+    // rewrites every destination register, so a partially executed load
+    // sequence is restarted safely (loads are idempotent).
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && store && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 
     {
         s32 offset = decrement
@@ -510,7 +515,14 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
             : (preinc ? 4 : 0);
 
         if (offset)
+        {
             ADDI2R(W0, MapReg(rn), offset);
+            // the slow path masks inside SlowBlockTransfer; the fast path
+            // accesses host memory directly and must mask like the x64
+            // backend so a misaligned base reads/writes the word the DS would
+            if (compileFastPath)
+                ANDI2R(W0, W0, ~3);
+        }
         else if (compileFastPath)
             ANDI2R(W0, MapReg(rn), ~3);
         else
