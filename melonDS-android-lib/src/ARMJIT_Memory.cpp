@@ -831,6 +831,7 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
 {
     if (nds.JIT.JITCompiler.IsJITFault(faultDesc.FaultPC))
     {
+        nds.JIT.Memory.FastMemFaults.fetch_add(1, std::memory_order_relaxed);
         bool rewriteToSlowPath = true;
 
         u8* memStatus = nds.CurCPU == 0 ? nds.JIT.Memory.MappingStatus9 : nds.JIT.Memory.MappingStatus7;
@@ -843,6 +844,11 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
             nds.JIT.JitEnableWrite();
             faultDesc.FaultPC = nds.JIT.JITCompiler.RewriteMemAccess(faultDesc.FaultPC);
             nds.JIT.JitEnableExecute();
+            nds.JIT.Memory.FastMemSlowRewrites.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+            nds.JIT.Memory.FastMemMapFixups.fetch_add(1, std::memory_order_relaxed);
         }
 
         return true;

@@ -23,6 +23,7 @@
 #include "MemConstants.h"
 
 #ifdef JIT_ENABLED
+#  include <atomic>
 #  include <mutex>
 #  include "TinyVector.h"
 #  include "ARM.h"
@@ -131,6 +132,13 @@ public:
 
     [[nodiscard]] u8* GetNWRAM_C() noexcept { return MemoryBase + MemBlockNWRAM_COffset; }
     [[nodiscard]] const u8* GetNWRAM_C() const noexcept { return MemoryBase + MemBlockNWRAM_COffset; }
+
+    // fastmem diagnostics, incremented from the fault handler (async-signal
+    // context, hence lock-free relaxed atomics): total JIT memory faults,
+    // faults resolved by mapping the page, and permanent slow-path rewrites
+    std::atomic<u64> FastMemFaults {0};
+    std::atomic<u64> FastMemMapFixups {0};
+    std::atomic<u64> FastMemSlowRewrites {0};
 
     int ClassifyAddress9(u32 addr) const noexcept;
     int ClassifyAddress7(u32 addr) const noexcept;
