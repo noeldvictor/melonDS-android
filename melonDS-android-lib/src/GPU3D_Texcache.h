@@ -247,6 +247,65 @@ public:
             minAddr & (sizeof(gpu.VRAMFlat_TexPal) - 1), maxAddr - minAddr);
     }
 
+    // #10 fix: hash only the palette entries the blocks actually reference,
+    // in canonical (sorted, deduplicated) address order, instead of the whole
+    // bounding span. Writes to unused entries inside the span no longer fork
+    // the pack identity. Kept alongside the legacy span hash above so
+    // LookupTexture can fall back to packs dumped under the old scheme.
+    u64 CompressedUsedPalHashSet(GPU& gpu, u32 slot1addr, u32 palBase, u32 width, u32 height)
+    {
+        u32 blocks = (width/4) * (height/4);
+        std::vector<u32> used;
+        used.reserve((size_t)blocks * 4);
+        for (u32 i = 0; i < blocks; i++)
+        {
+            u16 aux = gpu.template ReadVRAMFlat_Texture<u16>(slot1addr + i*2);
+            u32 start = palBase + (aux & 0x3FFF) * 4;
+            u32 mode = (aux >> 14) & 0x3;
+            u32 entries = (mode == 2) ? 4 : ((mode == 0) ? 3 : 2);
+            for (u32 e = 0; e < entries; e++)
+                used.push_back(start + e*2);
+        }
+        if (used.empty())
+            return 0;
+        std::sort(used.begin(), used.end());
+        used.erase(std::unique(used.begin(), used.end()), used.end());
+        u64 hash = 0;
+        for (u32 addr : used)
+        {
+            u16 v = gpu.template ReadVRAMFlat_TexPal<u16>(addr);
+            hash = XXH64(&v, sizeof(v), hash);
+        }
+        return hash;
+    }
+
+    // Palette component of the HD pack key. `legacy` reproduces the pre-fix
+    // scheme so LookupTexture can retry against packs dumped before these two
+    // format-affecting fixes:
+    //  - #2 color-0 transparency (TexParam bit 29) salts the key for the plain
+    //    paletted formats (2/3/4) where it changes the decoded alpha, so a
+    //    texture used both opaque and transparent no longer collides on one
+    //    replacement. The salt is only applied when the bit is set, so opaque
+    //    textures keep their legacy key and existing packs are not orphaned.
+    //  - #10 compressed (fmt 5) palettes hash referenced entries only (above).
+    u64 PackPalHash(GPU& gpu, u32 fmt, u32 texParam, u32 slot1addr,
+                    u32 texPalStart, u64 texPalHash, u32 width, u32 height, bool legacy)
+    {
+        if (fmt == 7)
+            return 0;
+        if (fmt == 5)
+            return legacy
+                ? CompressedUsedPalHash(gpu, slot1addr, texPalStart, width, height)
+                : CompressedUsedPalHashSet(gpu, slot1addr, texPalStart, width, height);
+        u64 h = texPalHash;
+        if (!legacy && (fmt == 2 || fmt == 3 || fmt == 4) && (texParam & (1u << 29)))
+        {
+            const u8 salt = 1;
+            h = XXH64(&salt, 1, h);
+        }
+        return h;
+    }
+
     void GetTexture(GPU& gpu, u32 texParam, u32 palBase, TexHandleT& textureHandle, u32& layer, u32*& helper)
     {
         // remove sampling and texcoord gen params
@@ -356,17 +415,18 @@ public:
                 entry.TexPalStart, entry.TexPalSize);
 
         // HD texture pack identity: encoded-bytes texel hash (both VRAM ranges
-        // for compressed textures) plus a used-range-only palette hash, so
-        // unrelated palette VRAM churn doesn't fork identities.
+        // for compressed textures) plus a referenced-entries palette hash (see
+        // PackPalHash), so unrelated palette VRAM churn doesn't fork identities.
         //
-        // KNOWN ISSUES (format-affecting; must change together with the
-        // desktop tooling since existing packs would orphan):
-        //  - the color-0 transparency bit (TexParam bit 29) is not part of
-        //    the identity, so a texture used both opaque and transparent
-        //    shares one key and its replacement one alpha interpretation
-        //  - the compressed-texture palette hash covers the bounding span of
-        //    referenced entries, so writes to unused entries inside that
-        //    span still change the key
+        // Two former format issues are now folded into PackPalHash, in lockstep
+        // with the desktop tree (identical code); LookupTexture retries the
+        // pre-fix key so packs dumped under the old scheme still resolve:
+        //  - #2 the color-0 transparency bit (TexParam bit 29) now salts the
+        //    key for the plain paletted formats (2/3/4), so a texture used both
+        //    opaque and transparent no longer shares one alpha interpretation
+        //  - #10 the compressed (fmt 5) palette hash now covers only the
+        //    entries the blocks reference, not the bounding span, so writes to
+        //    unused entries inside that span no longer fork the key
         const HDTexPackImage* replacement = nullptr;
         if (TexPack)
         {
@@ -375,16 +435,15 @@ public:
                 packTexHash = XXH64(entry.TextureHash, sizeof(u64)*2, 0);
 
             bool hasPal = (fmt != 7);
-            u64 packPalHash = 0;
-            if (fmt == 5)
-                packPalHash = CompressedUsedPalHash(gpu, slot1addr, entry.TexPalStart, width, height);
-            else if (hasPal)
-                packPalHash = entry.TexPalHash;
+            u64 packPalHash = PackPalHash(gpu, fmt, texParam, slot1addr, entry.TexPalStart, entry.TexPalHash, width, height, false);
+            u64 packPalHashLegacy = PackPalHash(gpu, fmt, texParam, slot1addr, entry.TexPalStart, entry.TexPalHash, width, height, true);
 
             if (TexPack->DumpActive())
                 TexPack->DumpTexture(width, height, packTexHash, packPalHash, hasPal, fmt, DecodingBuffer);
 
             replacement = TexPack->LookupTexture(width, height, packTexHash, packPalHash, hasPal, fmt);
+            if (!replacement && packPalHashLegacy != packPalHash)
+                replacement = TexPack->LookupTexture(width, height, packTexHash, packPalHashLegacy, hasPal, fmt);
         }
 
         auto& texArrays = TexArrays[widthLog2][heightLog2];
@@ -424,15 +483,19 @@ public:
             if (entry.TextureRAMSize[1])
                 packTexHash = XXH64(entry.TextureHash, sizeof(u64)*2, 0);
             bool hasPal = (fmt != 7);
-            u64 packPalHash = 0;
-            if (fmt == 5)
-                packPalHash = CompressedUsedPalHash(gpu, slot1addr, entry.TexPalStart, width, height);
-            else if (hasPal)
-                packPalHash = entry.TexPalHash;
+            u64 packPalHash = PackPalHash(gpu, fmt, texParam, slot1addr, entry.TexPalStart, entry.TexPalHash, width, height, false);
+            u64 packPalHashLegacy = PackPalHash(gpu, fmt, texParam, slot1addr, entry.TexPalStart, entry.TexPalHash, width, height, true);
 
             const u32 storageScale = TexLoader.GetStorageScale();
             const HDTexPackImage* cached =
                 FilterCache->LookupTexture(width, height, packTexHash, packPalHash, hasPal, fmt);
+            if ((!cached || cached->Width != width * storageScale) && packPalHashLegacy != packPalHash)
+            {
+                const HDTexPackImage* legacyCached =
+                    FilterCache->LookupTexture(width, height, packTexHash, packPalHashLegacy, hasPal, fmt);
+                if (legacyCached)
+                    cached = legacyCached;
+            }
             if (cached && cached->Width == width * storageScale && cached->Height == height * storageScale)
             {
                 TexLoader.UploadReplacement(storagePlace.TextureID, width, height, storagePlace.Layer, *cached);
